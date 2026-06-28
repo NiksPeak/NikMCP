@@ -1,0 +1,5 @@
+{
+  "port": 58741,
+  "pollHoldMs": 0,
+  "commandTimeoutMs": 30000
+}
