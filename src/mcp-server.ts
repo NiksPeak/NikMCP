@@ -5,6 +5,7 @@ import type { AppConfig } from "./config.js";
 import { enqueueAndAwait, chooseContext, isAlive } from "./queue.js";
 import { getDiag } from "./bridge.js";
 import { gateToolCall } from "./settings.js";
+import { rgbaToPng } from "./png-encoder.js";
 import type { Context, CommandResult } from "./types.js";
 
 // The Claude Code MCP client JSON-stringifies object-valued args for loosely-typed
@@ -38,18 +39,33 @@ function renderResult(r: CommandResult) {
       content: [{ type: "text" as const, text: reason }],
     };
   }
-  // Image content (capture_viewport): result = { image: base64, mimeType, ... }.
-  const res = r.result as { image?: string; mimeType?: string } | undefined;
-  if (res && typeof res === "object" && typeof res.image === "string") {
-    return {
-      content: [
-        {
-          type: "image" as const,
-          data: res.image,
-          mimeType: res.mimeType ?? "image/png",
-        },
-      ],
-    };
+  // Image content (capture_viewport): the plugin sends RAW RGBA (base64) + dims;
+  // the PNG is encoded here in Node so the heavy encode never blocks Studio's poll
+  // loop. (Legacy { image } base64-PNG shape is still accepted as a fallback.)
+  const res = r.result as
+    | { image?: string; mimeType?: string; rgba?: string; width?: number; height?: number }
+    | undefined;
+  if (res && typeof res === "object") {
+    if (typeof res.rgba === "string" && typeof res.width === "number" && typeof res.height === "number") {
+      try {
+        const png = rgbaToPng(Buffer.from(res.rgba, "base64"), res.width, res.height);
+        return {
+          content: [{ type: "image" as const, data: png.toString("base64"), mimeType: "image/png" }],
+        };
+      } catch (e) {
+        return {
+          isError: true,
+          content: [{ type: "text" as const, text: `capture_viewport: PNG encode failed: ${String(e)}` }],
+        };
+      }
+    }
+    if (typeof res.image === "string") {
+      return {
+        content: [
+          { type: "image" as const, data: res.image, mimeType: res.mimeType ?? "image/png" },
+        ],
+      };
+    }
   }
   const text = [
     r.output,
@@ -464,12 +480,18 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     {
       title: "Capture Viewport",
       description:
-        "Screenshot the viewport and return it as a PNG image. Requires Game " +
-        "Settings > Security > 'Allow Mesh / Image APIs' (EditableImage); if off, " +
-        "returns a clear enable-this message. Edit context.",
+        "Screenshot the Studio viewport and return it as a PNG image. ONLY works " +
+        "in Edit mode with the Studio viewport visible and rendering (this is a " +
+        "Roblox engine limit -- capture reads the rendered screen; playtest-view " +
+        "capture is not supported). Requires Game Settings > Security > 'Allow " +
+        "Mesh / Image APIs' (EditableImage); if off, returns a clear enable-this " +
+        "message. Always runs in the edit context.",
       inputSchema: { context: contextArg },
     },
-    async ({ context }) => call("capture_viewport", chooseContext(context), {})
+    // Pinned to edit (ignores the context arg): capture is render-bound and the
+    // server agent has no viewport, so routing to it (the "auto" default during a
+    // playtest) would hit "agent does not support command: capture_viewport".
+    async ({ context: _context }) => call("capture_viewport", "edit", {})
   );
 
   server.registerTool(

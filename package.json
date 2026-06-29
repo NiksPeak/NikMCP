@@ -1,6 +1,6 @@
 {
   "name": "nikmcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Custom Roblox Studio MCP server (dual-context): MCP stdio server + local HTTP bridge that the Studio edit plugin and F5 runtime agent poll. Drop-in superset of robloxstudio-mcp.",
   "type": "module",
   "bin": {
@@ -17,6 +17,7 @@
     "dev": "tsc -p tsconfig.json --watch",
     "build:plugin": "node scripts/build-plugin.mjs",
     "selftest": "node tests/object-arg-regression.mjs",
+    "selftest:chunk": "node tests/chunk-reassembly.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

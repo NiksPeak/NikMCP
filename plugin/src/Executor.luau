@@ -631,100 +631,81 @@ local function insertAsset(assetId: number, parentPath: string?): any
 end
 
 -- == Batch 1: viewport capture + playtest control ===========================
--- base64 of a byte string (for MCP image content).
+-- base64 of a raw byte buffer (for JSON transport of the screenshot's RGBA).
+-- Buffer-based (Boshy-style) so a multi-megapixel frame encodes fast and never
+-- stalls the poll loop. The PNG itself is encoded in Node (src/png-encoder.ts) --
+-- pure-Luau PNG encoding of a full frame was the old "capture never returns" stall.
 local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-local function base64(s: string): string
-	local out = {}
-	local n = #s
-	local i = 1
-	while i <= n do
-		local b0 = string.byte(s, i)
-		local b1 = string.byte(s, i + 1) or 0
-		local b2 = string.byte(s, i + 2) or 0
-		local triple = b0 * 65536 + b1 * 256 + b2
-		local rem = n - i + 1
-		local c0 = math.floor(triple / 262144) % 64
-		local c1 = math.floor(triple / 4096) % 64
-		local c2 = math.floor(triple / 64) % 64
-		local c3 = triple % 64
-		out[#out + 1] = string.sub(B64, c0 + 1, c0 + 1)
-		out[#out + 1] = string.sub(B64, c1 + 1, c1 + 1)
-		out[#out + 1] = rem >= 2 and string.sub(B64, c2 + 1, c2 + 1) or "="
-		out[#out + 1] = rem >= 3 and string.sub(B64, c3 + 1, c3 + 1) or "="
-		i += 3
+local B64BYTES = buffer.create(64)
+for i = 0, 63 do
+	buffer.writeu8(B64BYTES, i, string.byte(B64, i + 1))
+end
+local PAD = string.byte("=")
+
+local function base64Buffer(buf: buffer): string
+	local len = buffer.len(buf)
+	local fullTriples = math.floor(len / 3)
+	local remaining = len - fullTriples * 3
+	local outLen = (fullTriples + (remaining > 0 and 1 or 0)) * 4
+	local out = buffer.create(outLen)
+	local si, di = 0, 0
+	for _ = 1, fullTriples do
+		local b0 = buffer.readu8(buf, si)
+		local b1 = buffer.readu8(buf, si + 1)
+		local b2 = buffer.readu8(buf, si + 2)
+		buffer.writeu8(out, di, buffer.readu8(B64BYTES, bit32.rshift(b0, 2)))
+		buffer.writeu8(out, di + 1, buffer.readu8(B64BYTES, bit32.bor(bit32.lshift(bit32.band(b0, 3), 4), bit32.rshift(b1, 4))))
+		buffer.writeu8(out, di + 2, buffer.readu8(B64BYTES, bit32.bor(bit32.lshift(bit32.band(b1, 15), 2), bit32.rshift(b2, 6))))
+		buffer.writeu8(out, di + 3, buffer.readu8(B64BYTES, bit32.band(b2, 63)))
+		si += 3
+		di += 4
 	end
-	return table.concat(out)
+	if remaining == 2 then
+		local b0 = buffer.readu8(buf, si)
+		local b1 = buffer.readu8(buf, si + 1)
+		buffer.writeu8(out, di, buffer.readu8(B64BYTES, bit32.rshift(b0, 2)))
+		buffer.writeu8(out, di + 1, buffer.readu8(B64BYTES, bit32.bor(bit32.lshift(bit32.band(b0, 3), 4), bit32.rshift(b1, 4))))
+		buffer.writeu8(out, di + 2, buffer.readu8(B64BYTES, bit32.lshift(bit32.band(b1, 15), 2)))
+		buffer.writeu8(out, di + 3, PAD)
+	elseif remaining == 1 then
+		local b0 = buffer.readu8(buf, si)
+		buffer.writeu8(out, di, buffer.readu8(B64BYTES, bit32.rshift(b0, 2)))
+		buffer.writeu8(out, di + 1, buffer.readu8(B64BYTES, bit32.lshift(bit32.band(b0, 3), 4)))
+		buffer.writeu8(out, di + 2, PAD)
+		buffer.writeu8(out, di + 3, PAD)
+	end
+	return buffer.tostring(out)
 end
 
--- PNG encoder: 8-bit RGBA, no row filter, zlib STORED (uncompressed) blocks.
-local crcTable: { number }? = nil
-local function crc32(s: string): number
-	if not crcTable then
-		local t = {}
-		for i = 0, 255 do
-			local c = i
-			for _ = 1, 8 do
-				if c % 2 == 1 then
-					c = bit32.bxor(0xEDB88320, bit32.rshift(c, 1))
-				else
-					c = bit32.rshift(c, 1)
-				end
+-- EditableImage:ReadPixelsBuffer has a per-call size ceiling; read in <=1024x1024
+-- tiles and stitch into one tightly-packed RGBA buffer (Boshy-style). Needed for
+-- frames larger than 1024 on either axis.
+local function readPixelsTiled(img: any, w: number, h: number): buffer
+	local TILE = 1024
+	local full = buffer.create(w * h * 4)
+	local fullRowBytes = w * 4
+	local ty = 0
+	while ty < h do
+		local tileH = math.min(TILE, h - ty)
+		local tx = 0
+		while tx < w do
+			local tileW = math.min(TILE, w - tx)
+			local tileBuf = img:ReadPixelsBuffer(Vector2.new(tx, ty), Vector2.new(tileW, tileH))
+			local tileRowBytes = tileW * 4
+			for row = 0, tileH - 1 do
+				buffer.copy(full, (ty + row) * fullRowBytes + tx * 4, tileBuf, row * tileRowBytes, tileRowBytes)
 			end
-			t[i] = c
+			tx += TILE
 		end
-		crcTable = t
+		ty += TILE
 	end
-	local tbl = crcTable :: { number }
-	local crc = 0xFFFFFFFF
-	for i = 1, #s do
-		crc = bit32.bxor(bit32.rshift(crc, 8), tbl[bit32.band(bit32.bxor(crc, string.byte(s, i)), 0xFF)])
-	end
-	return bit32.bxor(crc, 0xFFFFFFFF)
+	return full
 end
 
-local function adler32(s: string): number
-	local a, b = 1, 0
-	for i = 1, #s do
-		a = (a + string.byte(s, i)) % 65521
-		b = (b + a) % 65521
-	end
-	return b * 65536 + a
-end
-
-local function pngChunk(typ: string, data: string): string
-	return string.pack(">I4", #data) .. typ .. data .. string.pack(">I4", crc32(typ .. data))
-end
-
-local function encodePNG(width: number, height: number, rgba: string): string
-	local sig = string.char(137, 80, 78, 71, 13, 10, 26, 10)
-	local ihdr = string.pack(">I4I4", width, height) .. string.char(8, 6, 0, 0, 0)
-	-- filtered scanlines: filter byte 0 then the row's RGBA bytes
-	local rowLen = width * 4
-	local rows = table.create(height)
-	for y = 0, height - 1 do
-		rows[y + 1] = "\0" .. string.sub(rgba, y * rowLen + 1, y * rowLen + rowLen)
-	end
-	local raw = table.concat(rows)
-	local zlib = { string.char(0x78, 0x01) }
-	local pos = 1
-	local total = #raw
-	if total == 0 then
-		zlib[#zlib + 1] = string.char(1) .. string.pack("<I2I2", 0, 0xFFFF)
-	end
-	while pos <= total do
-		local len = math.min(65535, total - pos + 1)
-		local final = (pos + len - 1 >= total) and 1 or 0
-		zlib[#zlib + 1] = string.char(final)
-		zlib[#zlib + 1] = string.pack("<I2I2", len, bit32.band(bit32.bnot(len), 0xFFFF))
-		zlib[#zlib + 1] = string.sub(raw, pos, pos + len - 1)
-		pos += len
-	end
-	zlib[#zlib + 1] = string.pack(">I4", adler32(raw))
-	return sig .. pngChunk("IHDR", ihdr) .. pngChunk("IDAT", table.concat(zlib)) .. pngChunk("IEND", "")
-end
-
--- Real screenshot via EditableImage. Requires Game Settings > Security >
--- "Allow Mesh / Image APIs"; if off, returns a clear enable-this message.
+-- Real screenshot via CaptureService + EditableImage. Returns RAW RGBA (base64) +
+-- dimensions; Node encodes the PNG. Capture ONLY works in Edit mode with the Studio
+-- viewport visible and rendering (engine limit -- it reads the rendered screen) and
+-- requires Game Settings > Security > "Allow Mesh / Image APIs".
 local function captureViewport(): any
 	local capturedId: string? = nil
 	local okCap = pcall(function()
@@ -734,14 +715,19 @@ local function captureViewport(): any
 			done = true
 		end)
 		local waited = 0
-		while not done and waited < 5 do
-			task.wait(0.05)
-			waited += 0.05
+		while not done and waited < 10 do
+			task.wait(0.1)
+			waited += 0.1
 		end
 	end)
 	if not okCap or not capturedId then
-		-- (b) the screenshot step itself failed/timed out
-		return { ok = false, err = "capture_viewport: screenshot capture failed or timed out (CaptureService:CaptureScreenshot)." }
+		-- the screenshot step itself failed/timed out (callback never fired)
+		return {
+			ok = false,
+			err = "capture_viewport: screenshot timed out (CaptureService:CaptureScreenshot never returned). "
+				.. "Capture only works in Edit mode with the Studio viewport visible and rendering -- "
+				.. "make sure the 3D viewport is focused and not hidden behind a playtest or another tab.",
+		}
 	end
 	-- Pass the capture content id string directly; only wrap with Content.fromUri
 	-- when that library exists (older Studio builds lack it).
@@ -754,7 +740,7 @@ local function captureViewport(): any
 		img = AssetService:CreateEditableImageAsync(imgArg)
 	end)
 	if not okImg or not img then
-		-- (a) image-handle creation failed -- most commonly the Mesh/Image API toggle
+		-- image-handle creation failed -- most commonly the Mesh/Image API toggle
 		return {
 			ok = false,
 			err = "capture_viewport: could not create an EditableImage from the screenshot. If "
@@ -762,23 +748,18 @@ local function captureViewport(): any
 				.. "(raw error: " .. tostring(errImg) .. ")",
 		}
 	end
+	-- Read pixels in Luau (tiled), base64 the raw RGBA, and hand it to Node to PNG-encode.
 	local okEnc, resultOrErr = pcall(function()
-		-- Derive bounds from the EditableImage's real Size and the ACTUAL buffer
-		-- length, never the capture resolution. ReadPixelsBuffer returns uint8 RGBA
-		-- (4 bytes/pixel, 0..255), top-to-bottom -- which already matches the encoder,
-		-- so the bytes are passed straight through (no f32 conversion -- treating it
-		-- as float32 read 4x past the end -> "buffer access out of bounds").
 		local size = img.Size
 		local w, h = math.floor(size.X), math.floor(size.Y)
-		local pixBuf = img:ReadPixelsBuffer(Vector2.zero, size)
-		local available = buffer.len(pixBuf)
-		-- clamp so a smaller-than-expected buffer can never read out of bounds
-		local channels = math.min(w * h * 4, available)
-		local rgba = buffer.readstring(pixBuf, 0, channels)
-		return { image = base64(encodePNG(w, h, rgba)), mimeType = "image/png", width = w, height = h }
+		local rgba = readPixelsTiled(img, w, h)
+		return { rgba = base64Buffer(rgba), width = w, height = h }
+	end)
+	pcall(function()
+		(img :: any):Destroy()
 	end)
 	if not okEnc then
-		return { ok = false, err = "capture_viewport: encode failed: " .. tostring(resultOrErr) }
+		return { ok = false, err = "capture_viewport: read pixels failed: " .. tostring(resultOrErr) }
 	end
 	return { ok = true, result = resultOrErr }
 end

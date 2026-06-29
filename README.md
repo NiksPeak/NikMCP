@@ -104,7 +104,7 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `search_assets` | read | — | **unsupported from a plugin** (needs Open Cloud / web catalog API); clear error |
 | `list_library` | read | — | **unsupported from a plugin** (needs Open Cloud); clear error |
 | `upload_decal` | write | — | **unsupported from a plugin** (needs Open Cloud Assets API key); clear error |
-| `capture_viewport` | experimental | edit | **real PNG** via `CaptureService` + EditableImage; needs Game Settings > Security > **Allow Mesh / Image APIs** (else a clear enable-this message) |
+| `capture_viewport` | experimental | edit (pinned) | **real PNG** via `CaptureService` + EditableImage; plugin sends raw RGBA, Node encodes the PNG. **Edit mode only, viewport must be visible & rendering** (engine limit -- it reads the rendered screen; playtest-view capture is **not** supported, same constraint as boshyxd). Needs Game Settings > Security > **Allow Mesh / Image APIs** (else a clear enable-this message) |
 | `playtest_control` | experimental | edit | start/stop the in-Studio sim (`mode='run'` → `RunService:Run()/Stop()`); `mode='play'` (Play Solo / players) unsupported |
 | `get_playtest_output` | experimental | edit | drain/peek the playtest log buffer captured since start |
 | `simulate_keyboard_input` / `simulate_mouse_input` | experimental | — | `VirtualInputManager` is **RobloxScriptSecurity-restricted**; returns a clear reason when blocked |
@@ -206,7 +206,10 @@ own build so you test uncommitted changes:
   (it does no harm when on, and edit-mode keeps working with it on).
 - For `run_luau` in the **server** (F5) context: **`ServerScriptService.LoadStringEnabled = true`**
   (the agent uses `loadstring`; if off it returns a clean compile error).
-- For `capture_viewport`: **Allow Mesh / Image APIs = ON** (Game Settings → Security).
+- For `capture_viewport`: **Allow Mesh / Image APIs = ON** (Game Settings → Security), and be in
+  **Edit mode with the 3D viewport visible and rendering** (focused, not hidden behind a playtest or
+  another tab). Capture reads the rendered screen, so playtest-view capture isn't supported — this is a
+  Roblox engine limit, not a NikMCP one (boshyxd's `capture_screenshot` has the same constraint).
 
 ## F5 playtest flow
 

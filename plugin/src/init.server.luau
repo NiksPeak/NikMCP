@@ -137,6 +137,47 @@ local function urlFor(port: number): string
 	return ("http://127.0.0.1:%d"):format(port) -- always IPv4; localhost -> ::1 is refused on Windows
 end
 
+-- POST a finished command result back to the bridge. HttpService:PostAsync HARD-REJECTS
+-- any request body > 1024 KB pre-flight (verified live), so an oversized result -- e.g. a
+-- capture_viewport raw-RGBA payload (~3.7 MB) -- can never transmit in one POST and the
+-- caller would hang to the Node timeout. Split anything over the slice size into ordered
+-- parts sent to /response-chunk and reassembled bridge-side. Generic: any large result
+-- (capture, big get_descendants, large get_script_source) takes this path automatically.
+-- ponytail: 700 KB slice clears the 1024 KB cap with margin for the {id,seq,total} envelope;
+-- base64/structured-JSON payloads barely expand when re-escaped. A pathologically
+-- quote/backslash-dense >700 KB slice could approach the cap -- shrink CHUNK_SIZE if that
+-- ever shows up (capture, the real driver, is base64 = zero expansion).
+local CHUNK_SIZE = 700 * 1024
+local function postResult(base: string, result: any)
+	local payload = HttpService:JSONEncode(result)
+	if #payload <= CHUNK_SIZE then
+		pcall(function()
+			HttpService:PostAsync(
+				base .. "/response",
+				payload,
+				Enum.HttpContentType.ApplicationJson,
+				false,
+				authHeaders()
+			)
+		end)
+		return
+	end
+	local total = math.ceil(#payload / CHUNK_SIZE)
+	for seq = 0, total - 1 do
+		local part = string.sub(payload, seq * CHUNK_SIZE + 1, (seq + 1) * CHUNK_SIZE)
+		local body = HttpService:JSONEncode({ id = result.id, seq = seq, total = total, part = part })
+		pcall(function()
+			HttpService:PostAsync(
+				base .. "/response-chunk",
+				body,
+				Enum.HttpContentType.ApplicationJson,
+				false,
+				authHeaders()
+			)
+		end)
+	end
+end
+
 -- POST the current settings to ONE bridge (its own /settings). tokenOverride
 -- forces a specific token header (used when disabling auth: the server still
 -- requires the OLD token for that one request before it clears it).
@@ -471,15 +512,7 @@ local function startConnection(port: number)
 					})
 				end
 				result.id = cmd.id
-				pcall(function()
-					HttpService:PostAsync(
-						base .. "/response",
-						HttpService:JSONEncode(result),
-						Enum.HttpContentType.ApplicationJson,
-						false,
-						authHeaders()
-					)
-				end)
+				postResult(base, result) -- chunks the POST if the result exceeds the 1024 KB PostAsync cap
 				conn.commandsProven = true
 				if port == selectedPort then
 					status:setCommands(true)

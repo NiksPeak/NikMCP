@@ -246,7 +246,12 @@ end
 function StatusWidget.new(plugin: Plugin)
 	local self = setmetatable({}, StatusWidget)
 
-	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, true, false, 300, 440, 240, 360)
+	-- InitialEnabled=false + overrideRestore=false: start HIDDEN and respect the
+	-- user's last placement (restored if saved). This stops the dock from forcing
+	-- itself open on every plugin reload -- including when entering a playtest,
+	-- where it used to overlay gameplay. It opens only when Nik clicks the toolbar
+	-- button (StatusWidget:toggle is the only place that sets widget.Enabled).
+	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 300, 440, 240, 360)
 	local widget = plugin:CreateDockWidgetPluginGui("RobloxStudioMCP_Status", info)
 	widget.Title = "Nik Studio MCP"
 
@@ -311,6 +316,25 @@ function StatusWidget.new(plugin: Plugin)
 		pcPad.PaddingBottom = UDim.new(0, 6)
 	end
 
+	-- Small serif build stamp, tucked into the top-left just under the tab strip and
+	-- above the header (the empty strip in the body's top padding). Additive overlay
+	-- parented to root -- not part of any UIListLayout -- so existing layout/bindings
+	-- are untouched. Same muted color as the header subtitle (Theme.subtext). Keep the
+	-- text in sync with package.json "version".
+	local version = Instance.new("TextLabel")
+	version.Name = "VersionTag"
+	version.Position = UDim2.fromOffset(12, 39)
+	version.Size = UDim2.fromOffset(120, 9)
+	version.BackgroundTransparency = 1
+	version.Font = Enum.Font.Merriweather -- readable serif at small sizes
+	version.Text = "version 0.1.1"
+	version.TextColor3 = Theme.subtext
+	version.TextXAlignment = Enum.TextXAlignment.Left
+	version.TextYAlignment = Enum.TextYAlignment.Top
+	version.TextScaled = true
+	textConstraint(version, 9, 7)
+	version.Parent = root
+
 	self.widget = widget
 	self.connState = "Disconnected" -- the SELECTED port's state (drives pill + rows)
 	self.ports = {}
@@ -349,7 +373,7 @@ function StatusWidget.new(plugin: Plugin)
 	title.Size = UDim2.new(1, -120, 0, 22)
 	title.BackgroundTransparency = 1
 	title.Font = Enum.Font.GothamBold
-	title.Text = "Nik Studio MCP"
+	title.Text = "Nik Studios MCP"
 	title.TextColor3 = Theme.text
 	title.TextXAlignment = Enum.TextXAlignment.Left
 	title.TextScaled = true
