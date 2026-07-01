@@ -83,7 +83,6 @@ Settings.TOOLS = {
 	{ name = "import_build", group = "scene", label = "Import build" },
 	{ name = "generate_build", group = "scene", label = "Generate build" },
 	{ name = "create_keyframe_sequence", group = "scene", label = "Create keyframe sequence" },
-	{ name = "upload_animation", group = "scene", label = "Upload animation (Open Cloud)" },
 	{ name = "create_sound", group = "scene", label = "Create sound" },
 	{ name = "set_lighting", group = "scene", label = "Set lighting" },
 	{ name = "import_scene", group = "scene", label = "Import scene" },

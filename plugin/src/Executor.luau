@@ -1999,10 +1999,19 @@ local function createKeyframeSequence(p: any): any
 	if kfCount < 1 or kfCount > 240 then
 		return { ok = false, err = "keyframes count out of range (1-240): " .. tostring(kfCount) }
 	end
-	local parent = resolvePath(p.parentPath)
-	if not parent then
-		return { ok = false, err = "path not found: " .. tostring(p.parentPath) }
+	-- Destination is a shared folder so the built sequence is easy to find and
+	-- MANUALLY upload (right-click -> Save to Roblox, or open in the Animation
+	-- Editor). Default base = ServerStorage; parentPath overrides the base if given.
+	local baseParent
+	if type(p.parentPath) == "string" and p.parentPath ~= "" then
+		baseParent = resolvePath(p.parentPath)
+		if not baseParent then
+			return { ok = false, err = "path not found: " .. tostring(p.parentPath) }
+		end
+	else
+		baseParent = game:GetService("ServerStorage")
 	end
+	local folderName = (type(p.folderName) == "string" and p.folderName ~= "") and p.folderName or "GeneratedAnimations"
 	-- Validate EVERYTHING before creating anything (no partial writes).
 	for i, kf in ipairs(kfs) do
 		if type(kf) ~= "table" then
@@ -2085,7 +2094,14 @@ local function createKeyframeSequence(p: any): any
 			end
 			keyframe.Parent = seq
 		end
-		seq.Parent = parent
+		-- Get-or-create the collection folder under the base, then park the KFS in it.
+		local folder = baseParent:FindFirstChild(folderName)
+		if not folder or not folder:IsA("Folder") then
+			folder = Instance.new("Folder")
+			folder.Name = folderName
+			folder.Parent = baseParent
+		end
+		seq.Parent = folder
 		local regId, regErr
 		if p.registerPreview ~= false then
 			local okReg, idOrErr = pcall(function()
@@ -2097,78 +2113,20 @@ local function createKeyframeSequence(p: any): any
 				regErr = tostring(idOrErr)
 			end
 		end
-		return { seq = seq, poseCount = poseTotal, regId = regId, regErr = regErr }
+		return { seq = seq, folder = folder, poseCount = poseTotal, regId = regId, regErr = regErr }
 	end)
 	if not ok then
 		return { ok = false, err = tostring(ret) }
 	end
 	local seq = ret.seq
 	local result: any = { path = seq:GetFullName(), keyframeCount = kfCount, poseCount = ret.poseCount }
-	local output = "created KeyframeSequence under " .. parent:GetFullName()
+	local output = "created KeyframeSequence in " .. ret.folder:GetFullName() .. " (ready for manual upload)"
 	if ret.regId then
 		result.tempAnimationId = ret.regId
 	elseif ret.regErr then
 		output = output .. " (preview registration failed: " .. ret.regErr .. ")"
 	end
 	return { ok = true, output = output, result = result }
-end
-
--- == Task 21: upload_animation (serialize KFS for Node-side Open Cloud upload) =
--- Read-only: serialize a Pose (recursively, so sub-poses nest) into the same JSON
--- shape task 20 consumes. Enum values are emitted as both name (readability) and
--- numeric .Value (authoritative for the Node rbxmx token write -- no magic numbers).
-local function serializePose(pose: Pose): any
-	local node: any = {
-		part = pose.Name,
-		cframe = Serializer.serialize(pose.CFrame),
-		weight = pose.Weight,
-		easingStyle = pose.EasingStyle.Name,
-		easingStyleValue = pose.EasingStyle.Value,
-		easingDirection = pose.EasingDirection.Name,
-		easingDirectionValue = pose.EasingDirection.Value,
-	}
-	local subs = {}
-	for _, child in ipairs(pose:GetChildren()) do
-		if child:IsA("Pose") then
-			table.insert(subs, serializePose(child))
-		end
-	end
-	if #subs > 0 then
-		node.subPoses = subs
-	end
-	return node
-end
-
-local function serializeKeyframeSequence(p: any): any
-	local inst = resolvePath(p.path)
-	if not inst then
-		return { ok = false, err = "path not found: " .. tostring(p.path) }
-	end
-	if not inst:IsA("KeyframeSequence") then
-		return { ok = false, err = "upload_animation: " .. tostring(p.path) .. " is not a KeyframeSequence" }
-	end
-	local kfs = inst :: KeyframeSequence
-	local keyframes = {}
-	for _, kf in ipairs(kfs:GetChildren()) do
-		if kf:IsA("Keyframe") then
-			local poses = {}
-			for _, child in ipairs(kf:GetChildren()) do
-				if child:IsA("Pose") then
-					table.insert(poses, serializePose(child))
-				end
-			end
-			table.insert(keyframes, { time = kf.Time, name = kf.Name, poses = poses })
-		end
-	end
-	return {
-		ok = true,
-		result = {
-			loop = kfs.Loop,
-			priority = kfs.Priority.Name,
-			priorityValue = kfs.Priority.Value,
-			keyframes = keyframes,
-		},
-	}
 end
 
 -- == Task 22: create_sound / set_lighting (edit-context wrappers) =============
@@ -3041,8 +2999,6 @@ function Executor.execute(cmd: { type: string, payload: any }): any
 		return generateBuild(p)
 	elseif cmd.type == "create_keyframe_sequence" then
 		return createKeyframeSequence(p)
-	elseif cmd.type == "upload_animation" then
-		return serializeKeyframeSequence(p)
 	elseif cmd.type == "create_sound" then
 		return createSound(p)
 	elseif cmd.type == "set_lighting" then

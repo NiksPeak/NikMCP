@@ -68,8 +68,6 @@ export const WRITE_TOOLS = new Set<string>([
   "create_ui_tree",
   // task 20 (animation build)
   "create_keyframe_sequence",
-  // task 21 (Open Cloud animation upload)
-  "upload_animation",
   // task 22 (animation playback + sound/lighting wrappers)
   "play_animation",
   "create_sound",

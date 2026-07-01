@@ -18,7 +18,6 @@
     "build:plugin": "node scripts/build-plugin.mjs",
     "selftest": "node tests/object-arg-regression.mjs",
     "selftest:chunk": "node tests/chunk-reassembly.mjs",
-    "selftest:upload": "node tests/upload-guards.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

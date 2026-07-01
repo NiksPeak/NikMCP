@@ -7,11 +7,6 @@ import { getDiag } from "./bridge.js";
 import { gateToolCall } from "./settings.js";
 import { rgbaToPng } from "./png-encoder.js";
 import type { Context, CommandResult } from "./types.js";
-import { readUserConfig } from "./config.js";
-import { readKey } from "./credentials.js";
-import { detectRojo, buildBinary, ROJO_INSTALL_HINT } from "./rojo.js";
-import { buildAnimRbxmx, type AnimKfs } from "./anim-rbxmx.js";
-import { validateUploadInput, resolveCreator, uploadAnimation } from "./open-cloud.js";
 
 // The Claude Code MCP client JSON-stringifies object-valued args for loosely-typed
 // (z.any) fields, so serialized datatypes like {__t:"Color3",...} or a build object
@@ -1157,13 +1152,16 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     {
       title: "Create Keyframe Sequence",
       description:
-        "Build a KeyframeSequence (nested Keyframe/Pose tree) from JSON and parent it under " +
-        "parentPath. Poses use the serializer's tagged CFrame form and are matched to a rig by " +
-        "part name at PLAYBACK time. registerPreview returns a TEMPORARY, session-only " +
-        "tempAnimationId (KeyframeSequenceProvider:RegisterKeyframeSequence) -- NOT a permanent " +
-        "uploaded AnimationId. One undo.",
+        "Build a KeyframeSequence (nested Keyframe/Pose tree) from JSON for MANUAL upload. It is " +
+        "collected in a shared folder (default ServerStorage/GeneratedAnimations, or under " +
+        "parentPath if given, or a custom folderName) so you can right-click it -> Save to Roblox " +
+        "or open it in the Animation Editor. Poses use the serializer's tagged CFrame form and are " +
+        "matched to a rig by part name at PLAYBACK time. registerPreview returns a TEMPORARY, " +
+        "session-only tempAnimationId (KeyframeSequenceProvider:RegisterKeyframeSequence) for " +
+        "in-Studio preview only -- NOT a permanent uploaded AnimationId. One undo.",
       inputSchema: {
-        parentPath: z.string(),
+        parentPath: z.string().optional(),
+        folderName: z.string().default("GeneratedAnimations"),
         name: z.string().default("Animation"),
         loop: z.boolean().default(false),
         priority: z
@@ -1174,97 +1172,16 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         context: contextArg,
       },
     },
-    async ({ parentPath, name, loop, priority, keyframes, registerPreview, context }) =>
+    async ({ parentPath, folderName, name, loop, priority, keyframes, registerPreview, context }) =>
       call("create_keyframe_sequence", chooseContext(context), {
         parentPath,
+        folderName,
         name,
         loop,
         priority,
         keyframes,
         registerPreview,
       })
-  );
-
-  // Open Cloud animation upload (task 21). Node orchestrates: serialize the KFS in
-  // Studio (edit), build .rbxmx -> binary .rbxm via rojo, then Open Cloud upload+poll.
-  // Not a simple call() passthrough -- it chains a plugin round-trip with Node-side
-  // conversion + network, failing fast (and pre-network) on each missing prerequisite.
-  server.registerTool(
-    "upload_animation",
-    {
-      title: "Upload Animation (Open Cloud)",
-      description:
-        "Turn a KeyframeSequence at `path` into a permanent, shippable AnimationId via the " +
-        "Open Cloud Assets API. Edit-context only. Requires a configured Open Cloud key + creator " +
-        "(dock Open Cloud panel or `nikmcp set-key`/`set-creator`) and `rojo` on PATH for the " +
-        "binary build step. A fresh upload may sit in moderation briefly but works for the owner " +
-        "in Studio immediately.",
-      inputSchema: {
-        path: z.string(),
-        name: z.string(),
-        description: z.string().max(1000).default(""),
-        creatorId: z.number().int().positive().optional(),
-        creatorType: z.enum(["user", "group"]).default("user"),
-        context: contextArg,
-      },
-    },
-    async ({ path, name, description, creatorId, creatorType, context }) => {
-      const reason = gateToolCall("upload_animation");
-      if (reason) return blocked(reason);
-
-      // Pure guards + prerequisites, all BEFORE any network call.
-      const input = validateUploadInput({ name, description });
-      if (!input.ok) return blocked(input.error);
-      const userCfg = readUserConfig();
-      const creator = resolveCreator({ creatorId, creatorType }, userCfg.creator);
-      if (!creator.ok) return blocked(creator.error);
-      const key = readKey();
-      if (!key) {
-        return blocked(
-          "upload_animation: no API key - run `nikmcp set-key <KEY>` or use the dock Open Cloud panel"
-        );
-      }
-      const rojoCmd = detectRojo(userCfg.rojoPath);
-      if (!rojoCmd) return blocked(ROJO_INSTALL_HINT);
-
-      // Serialize the KeyframeSequence in Studio. context:"server" routes to the
-      // playtest agent, which returns the standard "not supported" error -> surfaced.
-      let serialized: CommandResult;
-      try {
-        serialized = await enqueueAndAwait(
-          "upload_animation",
-          chooseContext(context),
-          { path },
-          cfg.commandTimeoutMs
-        );
-      } catch (e) {
-        return blocked(String((e as Error).message ?? e));
-      }
-      if (!serialized.ok) {
-        return blocked(serialized.error ?? (serialized as { err?: string }).err ?? "serialization failed");
-      }
-
-      // Build XML rbxmx, then convert to binary rbxm via rojo (Open Cloud rejects XML).
-      let rbxm: Buffer;
-      try {
-        const rbxmx = buildAnimRbxmx(serialized.result as AnimKfs);
-        rbxm = buildBinary(rojoCmd, rbxmx);
-      } catch (e) {
-        return blocked(String((e as Error).message ?? e));
-      }
-
-      const up = await uploadAnimation({
-        key,
-        creator: creator.value,
-        rbxm,
-        name: input.value.name,
-        description: input.value.description,
-        assetType: cfg.openCloudAssetType,
-        fileContentType: cfg.openCloudFileContentType,
-      });
-      if (!up.ok) return blocked(up.error);
-      return renderResult({ id: "", ok: true, result: up.value });
-    }
   );
 
   // play_animation (task 22): the FIRST server/runtime-context write tool -- it plays

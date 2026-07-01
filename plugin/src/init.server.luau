@@ -637,57 +637,6 @@ status.onSetAuth = function(enabled: boolean, token: string)
 	end
 end
 
--- Open Cloud key/creator save: POST to a connected bridge's /config/set-key over
--- localhost. The key transits localhost only and is held by the Node server -- the
--- plugin NEVER persists it (no SetSetting, never parented). We surface only the
--- masked tail the server returns.
-status.onSaveOpenCloud = function(creatorId: number?, creatorType: string, apiKey: string)
-	local port: number? = nil
-	if selectedPort and connections[selectedPort] then
-		port = selectedPort
-	else
-		for p in pairs(connections) do
-			port = p
-			break
-		end
-	end
-	if not port then
-		status:setOpenCloudResult(false, "connect to a bridge first")
-		return
-	end
-	local body = HttpService:JSONEncode({
-		creatorId = creatorId,
-		creatorType = creatorType,
-		apiKey = apiKey,
-	})
-	local ok, resp = pcall(function()
-		return HttpService:PostAsync(
-			urlFor(port) .. "/config/set-key",
-			body,
-			Enum.HttpContentType.ApplicationJson,
-			false,
-			authHeaders()
-		)
-	end)
-	if not ok then
-		status:setOpenCloudResult(false, "save failed: " .. tostring(resp))
-		return
-	end
-	local parsed: any = nil
-	local decoded = pcall(function()
-		parsed = HttpService:JSONDecode(resp)
-	end)
-	if decoded and type(parsed) == "table" and parsed.ok then
-		status:setOpenCloudResult(true, tostring(parsed.masked or "set"))
-	else
-		local errmsg = "unexpected response"
-		if type(parsed) == "table" and parsed.error then
-			errmsg = tostring(parsed.error)
-		end
-		status:setOpenCloudResult(false, errmsg)
-	end
-end
-
 -- == Connect / Disconnect primary button (acts on the SELECTED port only) =====
 status.onPrimary = function()
 	if not selectedPort then
