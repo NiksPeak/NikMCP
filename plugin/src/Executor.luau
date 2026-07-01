@@ -1964,6 +1964,371 @@ local function generateBuild(p: any): any
 	return { ok = false, err = "generate_build: unknown spec.kind '" .. tostring(spec.kind) .. "' (supported: grid, baseplate)" }
 end
 
+-- == Task 20: create_keyframe_sequence (animation build) ====================
+-- Resolve an Enum item by name; fall back to `default` for missing/bad names
+-- (per spec: never reject the whole call over one bad enum string).
+local function enumOr(enumType: Enum, name: any, default: EnumItem): EnumItem
+	if type(name) == "string" then
+		local ok, item = pcall(function()
+			return (enumType :: any)[name]
+		end)
+		if ok and typeof(item) == "EnumItem" then
+			return item
+		end
+	end
+	return default
+end
+
+-- Deserialize a tagged CFrame value; returns nil if it is not actually a CFrame.
+local function toCFrame(v: any): CFrame?
+	local ok, cf = pcall(function()
+		return Serializer.deserialize(v)
+	end)
+	if ok and typeof(cf) == "CFrame" then
+		return cf
+	end
+	return nil
+end
+
+local function createKeyframeSequence(p: any): any
+	local kfs = p.keyframes
+	if type(kfs) ~= "table" then
+		return { ok = false, err = "create_keyframe_sequence needs a 'keyframes' array" }
+	end
+	local kfCount = #kfs
+	if kfCount < 1 or kfCount > 240 then
+		return { ok = false, err = "keyframes count out of range (1-240): " .. tostring(kfCount) }
+	end
+	local parent = resolvePath(p.parentPath)
+	if not parent then
+		return { ok = false, err = "path not found: " .. tostring(p.parentPath) }
+	end
+	-- Validate EVERYTHING before creating anything (no partial writes).
+	for i, kf in ipairs(kfs) do
+		if type(kf) ~= "table" then
+			return { ok = false, err = ("keyframe[%d]: not an object"):format(i) }
+		end
+		local t = kf.time
+		if type(t) ~= "number" or t ~= t or t == math.huge or t == -math.huge or t < 0 then
+			return { ok = false, err = ("keyframe[%d]: time must be finite and >= 0"):format(i) }
+		end
+		local poses = kf.poses
+		if type(poses) ~= "table" then
+			return { ok = false, err = ("keyframe[%d]: needs a 'poses' array"):format(i) }
+		end
+		local poseCount = #poses
+		if poseCount < 1 or poseCount > 100 then
+			return { ok = false, err = ("keyframe[%d]: poses count out of range (1-100): %d"):format(i, poseCount) }
+		end
+		local names: { [string]: boolean } = {}
+		for j, pose in ipairs(poses) do
+			if type(pose) ~= "table" or type(pose.part) ~= "string" or pose.part == "" then
+				return { ok = false, err = ("keyframe[%d].pose[%d]: missing 'part' name"):format(i, j) }
+			end
+			if not toCFrame(pose.cframe) then
+				return { ok = false, err = ("keyframe[%d].pose[%d]: invalid cframe"):format(i, j) }
+			end
+			names[pose.part] = true
+		end
+		-- parentPart must reference another pose.part in the SAME keyframe.
+		for j, pose in ipairs(poses) do
+			if pose.parentPart ~= nil then
+				if type(pose.parentPart) ~= "string" or not names[pose.parentPart] then
+					return {
+						ok = false,
+						err = ("keyframe[%d].pose[%d]: parentPart '%s' not found in this keyframe"):format(
+							i,
+							j,
+							tostring(pose.parentPart)
+						),
+					}
+				end
+				if pose.parentPart == pose.part then
+					return { ok = false, err = ("keyframe[%d].pose[%d]: parentPart cannot reference itself"):format(i, j) }
+				end
+			end
+		end
+	end
+
+	local priority = enumOr(Enum.AnimationPriority, p.priority, Enum.AnimationPriority.Action)
+	-- Whole build + (optional) preview registration in ONE undo waypoint.
+	local ok, ret = recorded("create_keyframe_sequence", function()
+		local seq = Instance.new("KeyframeSequence")
+		seq.Name = (type(p.name) == "string" and p.name ~= "") and p.name or "Animation"
+		seq.Loop = p.loop == true
+		seq.Priority = priority
+		local poseTotal = 0
+		for i, kf in ipairs(kfs) do
+			local keyframe = Instance.new("Keyframe")
+			keyframe.Time = kf.time
+			keyframe.Name = (type(kf.name) == "string" and kf.name ~= "") and kf.name or ("Keyframe" .. tostring(i))
+			-- Build ALL poses before parenting any, so parentPart lookups resolve.
+			local byName: { [string]: Instance } = {}
+			local built: { { inst: Instance, parentPart: any } } = {}
+			for _, pose in ipairs(kf.poses) do
+				local pInst = Instance.new("Pose")
+				pInst.Name = pose.part
+				pInst.CFrame = toCFrame(pose.cframe) :: CFrame
+				pInst.Weight = type(pose.weight) == "number" and pose.weight or 1
+				pInst.EasingStyle = enumOr(Enum.PoseEasingStyle, pose.easingStyle, Enum.PoseEasingStyle.Linear)
+				pInst.EasingDirection = enumOr(Enum.PoseEasingDirection, pose.easingDirection, Enum.PoseEasingDirection.In)
+				byName[pose.part] = pInst
+				table.insert(built, { inst = pInst, parentPart = pose.parentPart })
+				poseTotal += 1
+			end
+			for _, b in ipairs(built) do
+				if type(b.parentPart) == "string" then
+					b.inst.Parent = byName[b.parentPart]
+				else
+					b.inst.Parent = keyframe
+				end
+			end
+			keyframe.Parent = seq
+		end
+		seq.Parent = parent
+		local regId, regErr
+		if p.registerPreview ~= false then
+			local okReg, idOrErr = pcall(function()
+				return game:GetService("KeyframeSequenceProvider"):RegisterKeyframeSequence(seq)
+			end)
+			if okReg then
+				regId = tostring(idOrErr)
+			else
+				regErr = tostring(idOrErr)
+			end
+		end
+		return { seq = seq, poseCount = poseTotal, regId = regId, regErr = regErr }
+	end)
+	if not ok then
+		return { ok = false, err = tostring(ret) }
+	end
+	local seq = ret.seq
+	local result: any = { path = seq:GetFullName(), keyframeCount = kfCount, poseCount = ret.poseCount }
+	local output = "created KeyframeSequence under " .. parent:GetFullName()
+	if ret.regId then
+		result.tempAnimationId = ret.regId
+	elseif ret.regErr then
+		output = output .. " (preview registration failed: " .. ret.regErr .. ")"
+	end
+	return { ok = true, output = output, result = result }
+end
+
+-- == Task 21: upload_animation (serialize KFS for Node-side Open Cloud upload) =
+-- Read-only: serialize a Pose (recursively, so sub-poses nest) into the same JSON
+-- shape task 20 consumes. Enum values are emitted as both name (readability) and
+-- numeric .Value (authoritative for the Node rbxmx token write -- no magic numbers).
+local function serializePose(pose: Pose): any
+	local node: any = {
+		part = pose.Name,
+		cframe = Serializer.serialize(pose.CFrame),
+		weight = pose.Weight,
+		easingStyle = pose.EasingStyle.Name,
+		easingStyleValue = pose.EasingStyle.Value,
+		easingDirection = pose.EasingDirection.Name,
+		easingDirectionValue = pose.EasingDirection.Value,
+	}
+	local subs = {}
+	for _, child in ipairs(pose:GetChildren()) do
+		if child:IsA("Pose") then
+			table.insert(subs, serializePose(child))
+		end
+	end
+	if #subs > 0 then
+		node.subPoses = subs
+	end
+	return node
+end
+
+local function serializeKeyframeSequence(p: any): any
+	local inst = resolvePath(p.path)
+	if not inst then
+		return { ok = false, err = "path not found: " .. tostring(p.path) }
+	end
+	if not inst:IsA("KeyframeSequence") then
+		return { ok = false, err = "upload_animation: " .. tostring(p.path) .. " is not a KeyframeSequence" }
+	end
+	local kfs = inst :: KeyframeSequence
+	local keyframes = {}
+	for _, kf in ipairs(kfs:GetChildren()) do
+		if kf:IsA("Keyframe") then
+			local poses = {}
+			for _, child in ipairs(kf:GetChildren()) do
+				if child:IsA("Pose") then
+					table.insert(poses, serializePose(child))
+				end
+			end
+			table.insert(keyframes, { time = kf.Time, name = kf.Name, poses = poses })
+		end
+	end
+	return {
+		ok = true,
+		result = {
+			loop = kfs.Loop,
+			priority = kfs.Priority.Name,
+			priorityValue = kfs.Priority.Value,
+			keyframes = keyframes,
+		},
+	}
+end
+
+-- == Task 22: create_sound / set_lighting (edit-context wrappers) =============
+-- Coerce "rbxassetid://<n>" | "<n>" | <number> -> a canonical content id, else nil.
+local function coerceAssetId(raw: any): string?
+	if type(raw) == "number" then
+		return "rbxassetid://" .. tostring(math.floor(raw))
+	elseif type(raw) == "string" and raw ~= "" then
+		if string.match(raw, "^%d+$") then
+			return "rbxassetid://" .. raw
+		end
+		return raw
+	end
+	return nil
+end
+
+local ROLLOFF_MODES: { [string]: boolean } =
+	{ Inverse = true, Linear = true, LinearSquare = true, InverseTapered = true }
+
+local function createSound(p: any): any
+	local parent = resolvePath(p.parentPath)
+	if not parent then
+		return { ok = false, err = "path not found: " .. tostring(p.parentPath) }
+	end
+	local soundId = coerceAssetId(p.soundId)
+	if not soundId then
+		return { ok = false, err = "create_sound: invalid soundId" }
+	end
+	local ok, ret = recorded("create_sound", function()
+		local s = Instance.new("Sound")
+		s.Name = (type(p.name) == "string" and p.name ~= "") and p.name or "Sound"
+		s.SoundId = soundId
+		local vol = type(p.volume) == "number" and p.volume or 0.5
+		s.Volume = math.clamp(vol, 0, 10)
+		if type(p.looped) == "boolean" then
+			s.Looped = p.looped
+		end
+		if type(p.playbackSpeed) == "number" then
+			s.PlaybackSpeed = p.playbackSpeed
+		end
+		if type(p.rollOffMode) == "string" and ROLLOFF_MODES[p.rollOffMode] then
+			s.RollOffMode = (Enum.RollOffMode :: any)[p.rollOffMode]
+		end
+		if type(p.rollOffMinDistance) == "number" then
+			s.RollOffMinDistance = p.rollOffMinDistance
+		end
+		if type(p.rollOffMaxDistance) == "number" then
+			s.RollOffMaxDistance = p.rollOffMaxDistance
+		end
+		s.Parent = parent
+		if p.playOnCreate == true then
+			pcall(function()
+				s:Play()
+			end)
+		end
+		return s
+	end)
+	if not ok then
+		return { ok = false, err = tostring(ret) }
+	end
+	return { ok = true, output = "created Sound under " .. parent:GetFullName(), result = { path = ret:GetFullName() } }
+end
+
+local LIGHTING_EFFECT_CLASSES: { [string]: boolean } = {
+	Atmosphere = true,
+	Sky = true,
+	BloomEffect = true,
+	ColorCorrectionEffect = true,
+	DepthOfFieldEffect = true,
+	SunRaysEffect = true,
+}
+
+local function setLighting(p: any): any
+	local Lighting = game:GetService("Lighting")
+	local props = p.properties
+	local effects = p.effects
+	if props ~= nil and type(props) ~= "table" then
+		return { ok = false, err = "set_lighting: 'properties' must be an object" }
+	end
+	if effects ~= nil and type(effects) ~= "table" then
+		return { ok = false, err = "set_lighting: 'effects' must be an object" }
+	end
+	-- Phase 1: validate ALL keys/classes before any write (no partial commit). A real
+	-- property is readable; an unknown key errors the read. Effect classes are
+	-- whitelisted; effect prop names are validated against a scratch instance.
+	local lt = Lighting :: any
+	if type(props) == "table" then
+		for key in pairs(props) do
+			local okRead = pcall(function()
+				return lt[key]
+			end)
+			if not okRead then
+				return { ok = false, err = "set_lighting: unknown Lighting property '" .. tostring(key) .. "'" }
+			end
+		end
+	end
+	if type(effects) == "table" then
+		for className, pmap in pairs(effects) do
+			if not LIGHTING_EFFECT_CLASSES[className] then
+				return { ok = false, err = "set_lighting: unknown effect class '" .. tostring(className) .. "'" }
+			end
+			if type(pmap) == "table" then
+				local sample = Lighting:FindFirstChildOfClass(className)
+				local scratch = nil
+				if not sample then
+					scratch = Instance.new(className)
+					sample = scratch
+				end
+				local st = sample :: any
+				for key in pairs(pmap) do
+					local okRead = pcall(function()
+						return st[key]
+					end)
+					if not okRead then
+						if scratch then
+							scratch:Destroy()
+						end
+						return { ok = false, err = "set_lighting: unknown " .. className .. " property '" .. tostring(key) .. "'" }
+					end
+				end
+				if scratch then
+					scratch:Destroy()
+				end
+			end
+		end
+	end
+	-- Phase 2: apply, all validated -> single undo.
+	local applied = {}
+	local effectsApplied = {}
+	local ok, ret = recorded("set_lighting", function()
+		if type(props) == "table" then
+			for key, raw in pairs(props) do
+				lt[key] = Serializer.deserialize(raw)
+				table.insert(applied, key)
+			end
+		end
+		if type(effects) == "table" then
+			for className, pmap in pairs(effects) do
+				local inst = Lighting:FindFirstChildOfClass(className)
+				if not inst then
+					inst = Instance.new(className)
+					inst.Parent = Lighting
+				end
+				local it = inst :: any
+				if type(pmap) == "table" then
+					for key, raw in pairs(pmap) do
+						it[key] = Serializer.deserialize(raw)
+					end
+				end
+				table.insert(effectsApplied, className)
+			end
+		end
+		return true
+	end)
+	if not ok then
+		return { ok = false, err = tostring(ret) }
+	end
+	return { ok = true, result = { applied = applied, effects = effectsApplied } }
+end
+
 -- Multi-root scene import. scene = { roots: [ { parentPath, build } ] } (a bare
 -- array is also accepted). mode='replace' clears each parent first (gated by confirm).
 local function importScene(p: any): any
@@ -2674,6 +3039,14 @@ function Executor.execute(cmd: { type: string, payload: any }): any
 		return importBuild(p)
 	elseif cmd.type == "generate_build" then
 		return generateBuild(p)
+	elseif cmd.type == "create_keyframe_sequence" then
+		return createKeyframeSequence(p)
+	elseif cmd.type == "upload_animation" then
+		return serializeKeyframeSequence(p)
+	elseif cmd.type == "create_sound" then
+		return createSound(p)
+	elseif cmd.type == "set_lighting" then
+		return setLighting(p)
 	elseif cmd.type == "import_scene" then
 		return importScene(p)
 	elseif cmd.type == "create_ui_tree" then

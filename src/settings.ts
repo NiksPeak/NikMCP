@@ -66,6 +66,14 @@ export const WRITE_TOOLS = new Set<string>([
   "generate_build",
   "import_scene",
   "create_ui_tree",
+  // task 20 (animation build)
+  "create_keyframe_sequence",
+  // task 21 (Open Cloud animation upload)
+  "upload_animation",
+  // task 22 (animation playback + sound/lighting wrappers)
+  "play_animation",
+  "create_sound",
+  "set_lighting",
   // task 16 batch B (set_camera is view-only and intentionally NOT a write tool;
   // raycast/bounds/camera-read/perf/measure are reads)
   "focus_instance",

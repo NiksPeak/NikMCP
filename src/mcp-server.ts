@@ -7,6 +7,11 @@ import { getDiag } from "./bridge.js";
 import { gateToolCall } from "./settings.js";
 import { rgbaToPng } from "./png-encoder.js";
 import type { Context, CommandResult } from "./types.js";
+import { readUserConfig } from "./config.js";
+import { readKey } from "./credentials.js";
+import { detectRojo, buildBinary, ROJO_INSTALL_HINT } from "./rojo.js";
+import { buildAnimRbxmx, type AnimKfs } from "./anim-rbxmx.js";
+import { validateUploadInput, resolveCreator, uploadAnimation } from "./open-cloud.js";
 
 // The Claude Code MCP client JSON-stringifies object-valued args for loosely-typed
 // (z.any) fields, so serialized datatypes like {__t:"Color3",...} or a build object
@@ -1145,6 +1150,234 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       inputSchema: { spec: objectArg(), context: contextArg },
     },
     async ({ spec, context }) => call("generate_build", chooseContext(context), { spec })
+  );
+
+  server.registerTool(
+    "create_keyframe_sequence",
+    {
+      title: "Create Keyframe Sequence",
+      description:
+        "Build a KeyframeSequence (nested Keyframe/Pose tree) from JSON and parent it under " +
+        "parentPath. Poses use the serializer's tagged CFrame form and are matched to a rig by " +
+        "part name at PLAYBACK time. registerPreview returns a TEMPORARY, session-only " +
+        "tempAnimationId (KeyframeSequenceProvider:RegisterKeyframeSequence) -- NOT a permanent " +
+        "uploaded AnimationId. One undo.",
+      inputSchema: {
+        parentPath: z.string(),
+        name: z.string().default("Animation"),
+        loop: z.boolean().default(false),
+        priority: z
+          .enum(["Idle", "Movement", "Action", "Action2", "Action3", "Action4", "Core"])
+          .default("Action"),
+        keyframes: objectArg(),
+        registerPreview: z.boolean().default(true),
+        context: contextArg,
+      },
+    },
+    async ({ parentPath, name, loop, priority, keyframes, registerPreview, context }) =>
+      call("create_keyframe_sequence", chooseContext(context), {
+        parentPath,
+        name,
+        loop,
+        priority,
+        keyframes,
+        registerPreview,
+      })
+  );
+
+  // Open Cloud animation upload (task 21). Node orchestrates: serialize the KFS in
+  // Studio (edit), build .rbxmx -> binary .rbxm via rojo, then Open Cloud upload+poll.
+  // Not a simple call() passthrough -- it chains a plugin round-trip with Node-side
+  // conversion + network, failing fast (and pre-network) on each missing prerequisite.
+  server.registerTool(
+    "upload_animation",
+    {
+      title: "Upload Animation (Open Cloud)",
+      description:
+        "Turn a KeyframeSequence at `path` into a permanent, shippable AnimationId via the " +
+        "Open Cloud Assets API. Edit-context only. Requires a configured Open Cloud key + creator " +
+        "(dock Open Cloud panel or `nikmcp set-key`/`set-creator`) and `rojo` on PATH for the " +
+        "binary build step. A fresh upload may sit in moderation briefly but works for the owner " +
+        "in Studio immediately.",
+      inputSchema: {
+        path: z.string(),
+        name: z.string(),
+        description: z.string().max(1000).default(""),
+        creatorId: z.number().int().positive().optional(),
+        creatorType: z.enum(["user", "group"]).default("user"),
+        context: contextArg,
+      },
+    },
+    async ({ path, name, description, creatorId, creatorType, context }) => {
+      const reason = gateToolCall("upload_animation");
+      if (reason) return blocked(reason);
+
+      // Pure guards + prerequisites, all BEFORE any network call.
+      const input = validateUploadInput({ name, description });
+      if (!input.ok) return blocked(input.error);
+      const userCfg = readUserConfig();
+      const creator = resolveCreator({ creatorId, creatorType }, userCfg.creator);
+      if (!creator.ok) return blocked(creator.error);
+      const key = readKey();
+      if (!key) {
+        return blocked(
+          "upload_animation: no API key - run `nikmcp set-key <KEY>` or use the dock Open Cloud panel"
+        );
+      }
+      const rojoCmd = detectRojo(userCfg.rojoPath);
+      if (!rojoCmd) return blocked(ROJO_INSTALL_HINT);
+
+      // Serialize the KeyframeSequence in Studio. context:"server" routes to the
+      // playtest agent, which returns the standard "not supported" error -> surfaced.
+      let serialized: CommandResult;
+      try {
+        serialized = await enqueueAndAwait(
+          "upload_animation",
+          chooseContext(context),
+          { path },
+          cfg.commandTimeoutMs
+        );
+      } catch (e) {
+        return blocked(String((e as Error).message ?? e));
+      }
+      if (!serialized.ok) {
+        return blocked(serialized.error ?? (serialized as { err?: string }).err ?? "serialization failed");
+      }
+
+      // Build XML rbxmx, then convert to binary rbxm via rojo (Open Cloud rejects XML).
+      let rbxm: Buffer;
+      try {
+        const rbxmx = buildAnimRbxmx(serialized.result as AnimKfs);
+        rbxm = buildBinary(rojoCmd, rbxmx);
+      } catch (e) {
+        return blocked(String((e as Error).message ?? e));
+      }
+
+      const up = await uploadAnimation({
+        key,
+        creator: creator.value,
+        rbxm,
+        name: input.value.name,
+        description: input.value.description,
+        assetType: cfg.openCloudAssetType,
+        fileContentType: cfg.openCloudFileContentType,
+      });
+      if (!up.ok) return blocked(up.error);
+      return renderResult({ id: "", ok: true, result: up.value });
+    }
+  );
+
+  // play_animation (task 22): the FIRST server/runtime-context write tool -- it plays
+  // a track on a live rig during an F5 playtest (handled by RuntimeAgentSource). We
+  // enforce the server-only rule here in Node: under edit context it returns the
+  // specific "requires a running playtest" error rather than the generic agent miss.
+  server.registerTool(
+    "play_animation",
+    {
+      title: "Play Animation",
+      description:
+        "Play an AnimationId on a live rig's Animator during an F5 playtest. SERVER CONTEXT ONLY " +
+        "(there is no simulation in edit). `target` is a path to a Humanoid/AnimationController rig, " +
+        "or \"player\" for the playtest player's character. Returns the track Length (0 if not yet " +
+        "streamed). Surfaces the real engine error (nil character, no Animator, asset not loaded).",
+      inputSchema: {
+        target: z.string(),
+        animationId: z.union([z.string(), z.number()]),
+        looped: z.boolean().optional(),
+        priority: z
+          .enum(["Idle", "Movement", "Action", "Action2", "Action3", "Action4", "Core"])
+          .optional(),
+        fadeTime: z.number().default(0.1),
+        weight: z.number().default(1),
+        speed: z.number().default(1),
+        context: contextArg,
+      },
+    },
+    async ({ target, animationId, looped, priority, fadeTime, weight, speed, context }) => {
+      const reason = gateToolCall("play_animation");
+      if (reason) return blocked(reason);
+      const ctx = chooseContext(context);
+      if (ctx !== "server") {
+        return blocked("play_animation requires a running playtest (server context)");
+      }
+      return call("play_animation", ctx, {
+        target,
+        animationId,
+        looped,
+        priority,
+        fadeTime,
+        weight,
+        speed,
+      });
+    }
+  );
+
+  server.registerTool(
+    "create_sound",
+    {
+      title: "Create Sound",
+      description:
+        "Convenience wrapper over create_instance: create a Sound under parentPath with validated " +
+        "props (coerced soundId, volume clamped 0-10, rollOff enum with fallback). One undo. " +
+        "playOnCreate previews it with :Play() in edit mode.",
+      inputSchema: {
+        parentPath: z.string(),
+        soundId: z.union([z.string(), z.number()]),
+        name: z.string().default("Sound"),
+        volume: z.number().default(0.5),
+        looped: z.boolean().default(false),
+        playbackSpeed: z.number().default(1),
+        rollOffMode: z.enum(["Inverse", "Linear", "LinearSquare", "InverseTapered"]).optional(),
+        rollOffMinDistance: z.number().optional(),
+        rollOffMaxDistance: z.number().optional(),
+        playOnCreate: z.boolean().default(false),
+        context: contextArg,
+      },
+    },
+    async ({
+      parentPath,
+      soundId,
+      name,
+      volume,
+      looped,
+      playbackSpeed,
+      rollOffMode,
+      rollOffMinDistance,
+      rollOffMaxDistance,
+      playOnCreate,
+      context,
+    }) =>
+      call("create_sound", chooseContext(context), {
+        parentPath,
+        soundId,
+        name,
+        volume,
+        looped,
+        playbackSpeed,
+        rollOffMode,
+        rollOffMinDistance,
+        rollOffMaxDistance,
+        playOnCreate,
+      })
+  );
+
+  server.registerTool(
+    "set_lighting",
+    {
+      title: "Set Lighting",
+      description:
+        "Convenience over set_properties on Lighting plus optional child effects " +
+        "(Atmosphere/Sky/BloomEffect/ColorCorrectionEffect/DepthOfFieldEffect/SunRaysEffect, " +
+        "get-or-created one per class). Tagged Color3/Vector3 values via the serializer. Rejects " +
+        "unknown property/effect names (named). One undo.",
+      inputSchema: {
+        properties: objectArg().optional(),
+        effects: objectArg().optional(),
+        context: contextArg,
+      },
+    },
+    async ({ properties, effects, context }) =>
+      call("set_lighting", chooseContext(context), { properties, effects })
   );
 
   server.registerTool(

@@ -35,6 +35,17 @@ async function T(label, name, args, check) {
     return { ok: false, text: "" };
   }
 }
+// Negative assertion: expect the tool to ERROR and its message to match rx.
+async function TErr(label, name, args, rx) {
+  try {
+    const r = await client.callTool({ name, arguments: args });
+    const text = (r.content || []).map((c) => c.text ?? `[${c.type}]`).join("\n");
+    const ok = !!r.isError && rx.test(text);
+    rows.push({ tool: label, ok, err: ok ? "" : `expected error /${rx.source}/, got: ${text.slice(0, 160)}` });
+  } catch (e) {
+    rows.push({ tool: label, ok: false, err: String(e?.message || e).slice(0, 200) });
+  }
+}
 const V3 = (x, y, z) => JSON.stringify({ __t: "Vector3", x, y, z });
 const C3 = (r, g, b) => JSON.stringify({ __t: "Color3", r, g, b });
 const CF = (...c) => JSON.stringify({ __t: "CFrame", comps: c });
@@ -96,6 +107,43 @@ try {
   await T("generate_build.spec", "generate_build", {
     spec: JSON.stringify({ kind: "grid", className: "Part", rows: 2, cols: 2, spacing: 4, parentPath: M, properties: { Anchored: true } }),
   });
+  await T("create_keyframe_sequence.keyframes", "create_keyframe_sequence", {
+    parentPath: M, name: "ObjArgAnim", registerPreview: false,
+    keyframes: JSON.stringify([
+      { time: 0, poses: [{ part: "Root", cframe: { __t: "CFrame", comps: [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1] } }] },
+      { time: 1, poses: [{ part: "Root", cframe: { __t: "CFrame", comps: [0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1] } }] },
+    ]),
+  }, (t) => /"keyframeCount":\s*2\b/.test(t) && /"poseCount":\s*2\b/.test(t));
+  // --- task 22: create_sound (coerced id) + set_lighting (tagged Color3 round-trip) ---
+  await T("create_sound (bare-number id coerced)", "create_sound", {
+    parentPath: M, name: "SFX", soundId: 9112824440, volume: 0.7,
+  });
+  await T("  verify SoundId coerced to rbxassetid", "get_properties",
+    { path: M + ".SFX", propertyNames: ["SoundId", "Volume"] },
+    (t) => /rbxassetid:\/\/9112824440/.test(t));
+  await TErr("create_sound rejects empty soundId", "create_sound",
+    { parentPath: M, soundId: "" }, /invalid soundId/);
+
+  // set_lighting: tagged Color3 must round-trip (not silently black). Self-restoring
+  // (snapshot -> apply -> verify -> restore), and only destroys an Atmosphere we made.
+  await T("snapshot Lighting", "run_luau", {
+    code: `local L=game:GetService("Lighting") _G.__oa=L.OutdoorAmbient _G.__ct=L.ClockTime _G.__hadAtmo=L:FindFirstChildOfClass("Atmosphere")~=nil return true`,
+  });
+  await T("set_lighting.properties+effects", "set_lighting", {
+    properties: JSON.stringify({ ClockTime: 6, OutdoorAmbient: { __t: "Color3", r: 1, g: 0, b: 0 } }),
+    effects: JSON.stringify({ Atmosphere: { Density: 0.3 } }),
+  }, (t) => /"applied"/.test(t) && /"effects"/.test(t));
+  await T("  verify OutdoorAmbient red (tagged Color3 not black)", "get_properties",
+    { path: "game.Lighting", propertyNames: ["OutdoorAmbient"] },
+    (t) => /"r":\s*1\b/.test(t) && /"g":\s*0\b/.test(t) && /"b":\s*0\b/.test(t));
+  await TErr("set_lighting rejects unknown property", "set_lighting",
+    { properties: JSON.stringify({ NotARealProp: 1 }) }, /unknown Lighting property/);
+  await TErr("set_lighting rejects unknown effect class", "set_lighting",
+    { effects: JSON.stringify({ NotAnEffect: { X: 1 } }) }, /unknown effect class/);
+  await T("restore Lighting", "run_luau", {
+    code: `local L=game:GetService("Lighting") L.OutdoorAmbient=_G.__oa L.ClockTime=_G.__ct if not _G.__hadAtmo then local a=L:FindFirstChildOfClass("Atmosphere") if a then a:Destroy() end end return true`,
+  });
+
   await T("import_scene.scene", "import_scene", {
     scene: JSON.stringify({ roots: [{ parentPath: M, build: { className: "Part", name: "SceneP", properties: { Anchored: true } } }] }),
   });

@@ -109,6 +109,11 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `get_playtest_output` | experimental | edit | drain/peek the playtest log buffer captured since start |
 | `simulate_keyboard_input` / `simulate_mouse_input` | experimental | — | `VirtualInputManager` is **RobloxScriptSecurity-restricted**; returns a clear reason when blocked |
 | `character_navigation` | experimental | server | `Humanoid:MoveTo(position)`; needs a running playtest (use `context:"server"`) |
+| `create_keyframe_sequence` | write | edit only | build a `KeyframeSequence` (Keyframe/Pose tree) from JSON, one undo. Poses matched to a rig by part name at **playback** time. `registerPreview` returns a **temporary, session-only** `tempAnimationId` (not a permanent uploaded `AnimationId`) |
+| `upload_animation` | write | edit only | serialize a `KeyframeSequence` at `path` and upload it via **Open Cloud** to a **permanent `AnimationId`**. Node builds `.rbxmx` → binary `.rbxm` via **`rojo`** (external dep) → multipart upload + operation poll. Needs an Open Cloud **key** + **creator id** (dock Open Cloud panel or `nikmcp set-key`/`set-creator`) and `rojo` on PATH. Fresh uploads may be **in moderation** briefly but work for the owner in Studio immediately |
+| `play_animation` | write | **server only** | play an `AnimationId` on a live rig's `Animator` during an F5 playtest (`target` = rig path or `"player"`). Returns `AnimationTrack.Length`. Under `context:"edit"` returns a specific "requires a running playtest" error. Surfaces the real engine error (nil character, no Animator, asset not loaded) |
+| `create_sound` | write | edit | convenience wrapper over `create_instance`: a `Sound` under `parentPath` with validated props (coerced `soundId`, volume clamped 0-10, rollOff enum). One undo. `playOnCreate` previews via `:Play()` |
+| `set_lighting` | write | edit | convenience over `set_properties` on `Lighting` + optional child effects (Atmosphere/Sky/Bloom/ColorCorrection/DepthOfField/SunRays, one per class). Tagged Color3/Vector3 via serializer; rejects unknown property/effect names. One undo |
 | `get_status` | meta | — | `{ edit, server }` connectivity (ungated) |
 
 `context: "auto"` (the default) targets the **running F5 server** when it's alive, else the editor.
@@ -138,6 +143,28 @@ The dock has three tabs: **Status / Settings / Activity**.
 `/settings` that enables it (**trust-on-first-use**) and then rejects requests missing/!= it.
 Disabling it from the dock clears the adopted token. The F5 runtime agent carries the token via its
 `McpToken` attribute.
+
+## Open Cloud animation upload (`upload_animation`)
+
+Turns a built `KeyframeSequence` into a permanent, shippable `AnimationId`. The API key is a
+**secret and stays Node-side only** — it is read from the env var `ROBLOX_OPEN_CLOUD_KEY` or a
+per-user credentials file (`%APPDATA%/nikmcp/credentials.json` on Windows, `~/.config/nikmcp/`
+elsewhere, written with `0600` where supported). It is **never** stored in the place, the plugin, or
+the non-secret `config.json` (which holds only the creator id / `rojoPath`).
+
+One-time setup (either path):
+- **Dock:** Settings tab → **Open Cloud** → paste your key + creator id → **Save**. The key is POSTed
+  to your local server over localhost, the box clears, and it shows `key set (****1234)`. The **?**
+  button opens the full step-by-step (create an API key with the **Assets** system, Read **and**
+  Write, operating creator set to you/your group).
+- **CLI:** `npx nikmcp set-key <KEY>`, `npx nikmcp set-creator <id> [--group]`, and
+  `npx nikmcp doctor` (prints key/creator/rojo/port — the key masked to the last 4).
+
+Requirements & honest limits: needs **[`rojo`](https://rojo.space)** on PATH (`rokit add
+rojo-rbx/rojo`) for the XML→binary `.rbxm` step — a Studio plugin cannot produce binary `.rbxm` or
+call Open Cloud itself. A fresh upload may sit **in moderation** briefly, but the `AnimationId` works
+for the owner in Studio immediately. On any failure (no key/creator, rojo missing, KFS not found,
+Open Cloud error) the tool returns the **real** error — it never fabricates an asset id.
 
 ## Setup
 

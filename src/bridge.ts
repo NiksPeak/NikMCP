@@ -6,6 +6,8 @@ import { HOST } from "./config.js";
 import type { Context, CommandResult } from "./types.js";
 import { dequeue, resolveResult, markSeen, isAlive } from "./queue.js";
 import { setSettings, checkAuth } from "./settings.js";
+import { writeKey, maskKey } from "./credentials.js";
+import { writeUserConfig } from "./config.js";
 
 const log = (...args: unknown[]) => console.error("[bridge]", ...args); // stderr only
 
@@ -167,6 +169,35 @@ export function startBridge(cfg: AppConfig): void {
     if (!authed(req, res)) return; // allowed until a token is adopted (TOFU)
     setSettings(req.body ?? {});
     res.json({ ok: true });
+  });
+
+  // Dock Open Cloud panel posts the typed API key + creator here. The bridge binds
+  // 127.0.0.1 only, so this stays on localhost. The key goes to the SECRET credentials
+  // file (never the place, the plugin, or the non-secret config.json); the creator goes
+  // to user config. We return only a masked tail so the key is never echoed back.
+  app.post("/config/set-key", (req, res) => {
+    if (!authed(req, res)) return;
+    const { creatorId, creatorType, apiKey } = (req.body ?? {}) as {
+      creatorId?: number;
+      creatorType?: string;
+      apiKey?: string;
+    };
+    const key = typeof apiKey === "string" ? apiKey.trim() : "";
+    if (!key) {
+      res.status(400).json({ ok: false, error: "no apiKey provided" });
+      return;
+    }
+    try {
+      writeKey(key);
+      const id = Number(creatorId);
+      if (Number.isFinite(id) && id > 0) {
+        const creator = creatorType === "group" ? { groupId: Math.floor(id) } : { userId: Math.floor(id) };
+        writeUserConfig({ creator });
+      }
+      res.json({ ok: true, masked: maskKey(key) });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
   });
 
   // Lightweight liveness + which contexts are connected (drives status UI).

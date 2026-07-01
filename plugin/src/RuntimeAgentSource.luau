@@ -176,6 +176,9 @@ local function runLuau(code)
 	return { ok = true, output = output, result = result }
 end
 
+-- Keep played tracks referenced so they are not GC'd mid-play (play_animation).
+local playingTracks = {}
+
 -- Read-tool parity: these all work against the running server's DataModel so
 -- playtest debugging mirrors the edit Executor. Edit-only tools (script editing,
 -- selection, undo, asset insert) fall through to the unsupported message.
@@ -502,6 +505,73 @@ local function execute(cmd)
 			return { ok = false, err = "EndTest failed: " .. tostring(err) }
 		end
 		return { ok = false, err = "playtest_control start is an edit-only operation" }
+	elseif cmd.type == "play_animation" then
+		-- First server-context write tool: play a track on a live rig's Animator.
+		local Players = game:GetService("Players")
+		local targetInst
+		if p.target == "player" or p.target == nil then
+			local player = Players:GetPlayers()[1]
+			targetInst = player and player.Character
+			if not targetInst then
+				return { ok = false, err = "play_animation: no player character yet" }
+			end
+		else
+			targetInst = resolve(p.target)
+			if not targetInst then
+				return { ok = false, err = "play_animation: target not found: " .. tostring(p.target) }
+			end
+		end
+		local controller = targetInst:FindFirstChildOfClass("Humanoid")
+			or targetInst:FindFirstChildOfClass("AnimationController")
+		if not controller then
+			return { ok = false, err = "play_animation: " .. tostring(p.target) .. " has no Humanoid/AnimationController" }
+		end
+		local animator = controller:FindFirstChildOfClass("Animator")
+		if not animator then
+			animator = Instance.new("Animator")
+			animator.Parent = controller
+		end
+		local idStr
+		local rawId = p.animationId
+		if type(rawId) == "number" then
+			idStr = "rbxassetid://" .. tostring(math.floor(rawId))
+		elseif type(rawId) == "string" and rawId ~= "" then
+			if string.match(rawId, "^%d+$") then
+				idStr = "rbxassetid://" .. rawId
+			else
+				idStr = rawId
+			end
+		else
+			return { ok = false, err = "play_animation: invalid animationId" }
+		end
+		local anim = Instance.new("Animation")
+		anim.AnimationId = idStr
+		local okLoad, trackOrErr = pcall(function()
+			return animator:LoadAnimation(anim)
+		end)
+		if not okLoad then
+			return { ok = false, err = "play_animation: LoadAnimation failed: " .. tostring(trackOrErr) }
+		end
+		local track = trackOrErr
+		if p.priority then
+			pcall(function()
+				track.Priority = Enum.AnimationPriority[p.priority]
+			end)
+		end
+		if type(p.looped) == "boolean" then
+			track.Looped = p.looped
+		end
+		local fadeTime = type(p.fadeTime) == "number" and p.fadeTime or 0.1
+		local weight = type(p.weight) == "number" and p.weight or 1
+		local speed = type(p.speed) == "number" and p.speed or 1
+		local okPlay, playErr = pcall(function()
+			track:Play(fadeTime, weight, speed)
+		end)
+		if not okPlay then
+			return { ok = false, err = "play_animation: Play failed: " .. tostring(playErr) }
+		end
+		table.insert(playingTracks, track)
+		return { ok = true, result = { length = track.Length, isPlaying = true, targetPath = targetInst:GetFullName() } }
 	else
 		return { ok = false, err = "agent does not support command: " .. tostring(cmd.type) }
 	end
