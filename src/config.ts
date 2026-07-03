@@ -94,12 +94,16 @@ export function resolveConfig(argv: string[] = process.argv.slice(2)): AppConfig
     syncDir:
       typeof fileCfg.syncDir === "string" && fileCfg.syncDir ? fileCfg.syncDir : undefined,
     rocreate: {
-      // ROCREATE_API_KEY env > config.json rocreate.apiKey > openCloud.apiKey fallback
+      // ROCREATE_API_KEY env > config.json rocreate.apiKey > openCloud.apiKey fallback.
+      // Trailing `|| undefined` coerces an empty-string apiKey (the shipped example
+      // ships "") to undefined so rocreateKey() honors its `string | null` contract
+      // and an empty key can never reach the OC client -- same guard the openCloud
+      // creator ids use above.
       apiKey:
-        process.env.ROCREATE_API_KEY ??
-        fileCfg.rocreate?.apiKey ??
-        process.env.ROBLOX_API_KEY ??
-        fileOpenCloud.apiKey,
+        (process.env.ROCREATE_API_KEY ??
+          fileCfg.rocreate?.apiKey ??
+          process.env.ROBLOX_API_KEY ??
+          fileOpenCloud.apiKey) || undefined,
     },
   };
 }
