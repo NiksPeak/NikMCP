@@ -31,10 +31,14 @@ Settings.TOOLS = {
 	{ name = "get_file_tree", group = "read", label = "File tree" },
 	{ name = "search_by_property", group = "read", label = "Search by property" },
 	{ name = "get_tags", group = "read", label = "Get tags" },
+	-- task 25: script sync (export/status read the place; import mutates it)
+	{ name = "export_scripts", group = "read", label = "Export scripts to disk" },
+	{ name = "sync_status", group = "read", label = "Script sync status" },
 	-- write / edit (read-only mode blocks these)
 	{ name = "run_luau", group = "write", label = "Run Luau" },
 	{ name = "set_property", group = "write", label = "Set property" },
 	{ name = "write_script", group = "write", label = "Write script" },
+	{ name = "import_scripts", group = "write", label = "Import scripts from disk" },
 	{ name = "set_selection", group = "write", label = "Set selection" },
 	{ name = "create_instance", group = "write", label = "Create instance" },
 	{ name = "delete_instance", group = "write", label = "Delete instance" },

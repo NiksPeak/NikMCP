@@ -337,6 +337,144 @@ local function listScripts(rootPath: string): any
 	return { ok = true, result = out }
 end
 
+-- == Task 25: disk<->Studio script sync (edit context ONLY) ===================
+-- FNV-1a 32-bit over CRLF->LF-normalized source bytes. MUST stay bit-identical
+-- to fnv1a32 in src/sync.ts. Test vectors (tests/sync-unit.mjs asserts the Node
+-- side against these): "" = 811c9dc5, "a" = e40c292c, "hello" = 4f9f2cab,
+-- "foobar" = bf9cf968.
+local function syncFnv1a32(text: string): string
+	local buf = buffer.fromstring(text)
+	local h = 2166136261
+	for i = 0, buffer.len(buf) - 1 do
+		h = bit32.bxor(h, buffer.readu8(buf, i))
+		-- h * 16777619 mod 2^32 without f64 precision loss: 0x01000193 =
+		-- 2^24 + 2^8 + 0x93; lshift terms are already uint32-truncated.
+		h = (bit32.lshift(h, 24) + bit32.lshift(h, 8) + h * 0x93) % 4294967296
+	end
+	return string.format("%08x", h)
+end
+
+local function syncNormalize(src: string): string
+	return (string.gsub(src, "\r\n", "\n"))
+end
+
+-- Same access pattern as getScriptSource (GetEditorSource, fallback .Source).
+local function syncReadSource(inst: Instance): (boolean, string)
+	local src: any = nil
+	local ok = pcall(function()
+		src = ScriptEditorService:GetEditorSource(inst)
+	end)
+	if not ok or src == nil then
+		local ok2 = pcall(function()
+			src = (inst :: any).Source
+		end)
+		if not ok2 or src == nil then
+			return false, "could not read source"
+		end
+	end
+	return true, src :: string
+end
+
+local function syncHasScriptDescendant(inst: Instance): boolean
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("LuaSourceContainer") then
+			return true
+		end
+	end
+	return false
+end
+
+local function syncList(rootPath: string): any
+	if RunService:IsRunning() then
+		return { ok = false, err = "sync_list is edit-context only (stop the playtest first)" }
+	end
+	local root = resolvePath(rootPath or "game")
+	if not root then
+		return { ok = false, err = "path not found: " .. tostring(rootPath) }
+	end
+	local out = {}
+	local function consider(inst: Instance)
+		if not inst:IsA("LuaSourceContainer") then
+			return
+		end
+		local okRead, src = syncReadSource(inst)
+		if not okRead then
+			return -- unreadable source (permissions); listed nowhere, never faked
+		end
+		table.insert(out, {
+			path = inst:GetFullName(),
+			className = inst.ClassName,
+			hash = syncFnv1a32(syncNormalize(src)),
+			hasChildren = syncHasScriptDescendant(inst),
+		})
+	end
+	consider(root)
+	for _, inst in ipairs(root:GetDescendants()) do
+		consider(inst)
+	end
+	return { ok = true, result = out }
+end
+
+local function syncGetSources(paths: { string }): any
+	if RunService:IsRunning() then
+		return { ok = false, err = "sync_get_sources is edit-context only (stop the playtest first)" }
+	end
+	local out = {}
+	for _, path in ipairs(paths) do
+		local inst = resolvePath(path)
+		if not inst or not inst:IsA("LuaSourceContainer") then
+			table.insert(out, { path = path, err = "not found or not a script" })
+		else
+			local okRead, src = syncReadSource(inst)
+			if okRead then
+				table.insert(out, { path = path, source = syncNormalize(src) })
+			else
+				table.insert(out, { path = path, err = src })
+			end
+		end
+	end
+	return { ok = true, result = out }
+end
+
+-- Apply many sources inside ONE ChangeHistory recording (one undo step).
+-- Best-effort per item; the recording is still finalized (Commit if anything
+-- applied, Cancel if nothing did).
+local function syncSetSources(items: { { path: string, source: string } }): any
+	if RunService:IsRunning() then
+		return { ok = false, err = "sync_set_sources is edit-context only (stop the playtest first)" }
+	end
+	if type(items) ~= "table" or #items == 0 then
+		return { ok = false, err = "items array required" }
+	end
+	local results = {}
+	local anyApplied = false
+	local recording = ChangeHistoryService:TryBeginRecording("import_scripts")
+	for _, it in ipairs(items) do
+		local inst = it and it.path and resolvePath(it.path)
+		if not inst or not inst:IsA("LuaSourceContainer") then
+			table.insert(results, { path = it and it.path or "?", ok = false, err = "not found or not a script" })
+		elseif type(it.source) ~= "string" then
+			table.insert(results, { path = it.path, ok = false, err = "source missing" })
+		else
+			local newSource = it.source
+			local ok, err = pcall(function()
+				ScriptEditorService:UpdateSourceAsync(inst, function()
+					return newSource
+				end)
+			end)
+			table.insert(results, { path = it.path, ok = ok, err = if ok then nil else tostring(err) })
+			anyApplied = anyApplied or ok
+		end
+	end
+	if recording then
+		ChangeHistoryService:FinishRecording(
+			recording,
+			anyApplied and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel
+		)
+	end
+	return { ok = true, result = results }
+end
+
 local function getPlaceInfo(): any
 	local KEY_SERVICES = {
 		"Workspace", "Players", "ReplicatedStorage", "ReplicatedFirst",
@@ -2996,6 +3134,13 @@ function Executor.execute(cmd: { type: string, payload: any }): any
 		return grepScripts(p)
 	elseif cmd.type == "get_script_analysis" then
 		return getScriptAnalysis(p)
+	-- task 25: disk<->Studio script sync primitives (edit context only)
+	elseif cmd.type == "sync_list" then
+		return syncList(p.root or "game")
+	elseif cmd.type == "sync_get_sources" then
+		return syncGetSources(p.paths or {})
+	elseif cmd.type == "sync_set_sources" then
+		return syncSetSources(p.items or {})
 	-- undo/redo + mass ops
 	elseif cmd.type == "undo" then
 		return undo()

@@ -6,6 +6,7 @@
   "apiDumpTtlHours": 168,
   "luauGate": true,
   "luauLspPath": "",
+  "syncDir": "",
   "openCloud": {
     "_comment": "Open Cloud (upload_asset). apiKey here is overridden by the ROBLOX_API_KEY env var if set. Set exactly one of creatorUserId/creatorGroupId. Copy this file to config.json (gitignored) and fill in real values -- never commit a real key.",
     "apiKey": "",

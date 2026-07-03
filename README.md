@@ -83,6 +83,9 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `find_and_replace_in_scripts` | write | edit only | find/replace across scripts under a root (`regex?`) |
 | `grep_scripts` | read | auto / edit / server | matches `{ path, line, text }` under a root (`regex?`) |
 | `get_script_analysis` | read | auto / edit / server | compile-check (loadstring) syntax diagnostics |
+| `export_scripts` | read | edit only | dump all scripts under `root` (default: the 8 script-bearing services) to a disk tree with Rojo-style names + a `nikmcp-sync.json` manifest — see **Script sync** |
+| `sync_status` | read | edit only | three-way drift report per exported file: clean / diskAhead / studioAhead / CONFLICT / missing — see **Script sync** |
+| `import_scripts` | write | edit only | apply diskAhead files back to Studio in ONE undo step; any conflict aborts everything with a diff; sources Luau-analyzed first — see **Script sync** |
 | `undo` / `redo` | write | edit only | `ChangeHistoryService:Undo()/Redo()` |
 | `mass_create_objects` | write | auto / edit / server | create many in one undo (`items[]`) |
 | `mass_duplicate` | write | auto / edit / server | clone `count` times, cumulative `offset?` |
@@ -173,6 +176,37 @@ pinned release).
 | `apiDumpTtlHours` | `168` | refetch the dump when older, or when the Studio version changed |
 | `luauGate` | `true` | Gate B on/off |
 | `luauLspPath` | — | absolute path override for the analyzer binary (else cache `bin/`, else `PATH`, else auto-download) |
+
+## Script sync (task 25)
+
+`export_scripts` / `sync_status` / `import_scripts` — a drift-safe bridge between the Explorer
+and a disk tree. **Edit mode only** (all three refuse while a playtest is running).
+
+**Mapping (Rojo-compatible):** ModuleScript `Name` → `Name.luau`; Script → `Name.server.luau`;
+LocalScript → `Name.client.luau`. A script with script-descendants becomes a folder holding
+`init(.server|.client).luau` plus its children; non-script containers on the path become plain
+folders (containers with no script descendants are not exported). Names are
+filename-sanitized (`\/:*?"<>|` stripped) — the manifest (`nikmcp-sync.json`) keeps the real
+DataModel path, so sanitization is display-only. Sanitization/case collisions get a stable
+`__2`/`__3` suffix. Same-named sibling scripts share one DataModel path (the whole transport is
+path-addressed), so only the first is exported and the rest are reported in `duplicates[]`.
+
+**Drift protocol (never auto-resolve):** every hash is FNV-1a 32-bit over CRLF→LF-normalized
+source, computed bit-identically on both sides (Luau + Node). `sync_status` classifies each
+manifest entry three ways — disk vs manifest vs live Studio: `clean`, `diskAhead` (importable),
+`studioAhead` (report only; re-export to accept), `CONFLICT` (both moved), plus
+`missingInStudio` / `missingOnDisk` / `newOnDisk`. `import_scripts` refuses the ENTIRE import
+on any conflict and returns a whitespace-normalized unified diff per conflict; `studioAhead`
+and missing entries are skipped, reported, and never block. Applied files land in ONE
+ChangeHistory recording — a single Ctrl+Z reverts the whole import. Every applied source runs
+through the task-24 Luau analyze gate first (errors abort the import; `skipAnalysis:true`
+bypasses; analyzer unavailable = fail-open with `analyzed: 0`). `dryRun:true` returns the
+would-apply plan.
+
+**v1 limits:** import updates existing scripts only — new files on disk are reported
+(`newOnDisk`), never created; deleted disk files never delete instances. Creation/deletion
+sync is a future task. Default export dir can be set once via `syncDir` in `config.json`
+(the tool's `dir` param wins).
 
 ## Settings
 

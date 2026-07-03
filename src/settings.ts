@@ -83,6 +83,8 @@ export const WRITE_TOOLS = new Set<string>([
   "verify_playtest",
   "upload_asset",
   "upload_capture",
+  // task 25 (import mutates scripts; export_scripts/sync_status are reads)
+  "import_scripts",
 ]);
 
 const DEFAULTS: Settings = {

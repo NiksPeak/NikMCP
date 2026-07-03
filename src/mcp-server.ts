@@ -22,6 +22,24 @@ import {
   analyzeLuau,
   type Diagnostic,
 } from "./luau-gate.js";
+import {
+  fnv1a32,
+  normalizeSource,
+  planExport,
+  readManifest,
+  writeManifestAtomic,
+  readDiskSource,
+  writeDiskSource,
+  findUnknownFiles,
+  classify,
+  decideImport,
+  unifiedDiff,
+  MANIFEST_NAME,
+  type SyncListEntry,
+  type Manifest,
+  type ManifestEntry,
+  type StatusEntry,
+} from "./sync.js";
 import type { Context, CommandResult } from "./types.js";
 
 // The Claude Code MCP client JSON-stringifies object-valued args for loosely-typed
@@ -2287,6 +2305,375 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         bytes,
         contentType: "image/png",
         applyTo,
+      });
+    }
+  );
+
+  // ----- Task 25: disk<->Studio script sync ---------------------------------
+  // export_scripts / sync_status / import_scripts. Drift doctrine as a tool:
+  // never auto-resolve -- report and wait. v1: import updates EXISTING scripts
+  // only; new disk files are reported, deletions never delete instances.
+  const SYNC_DEFAULT_ROOTS = [
+    "Workspace",
+    "ReplicatedStorage",
+    "ReplicatedFirst",
+    "ServerScriptService",
+    "ServerStorage",
+    "StarterGui",
+    "StarterPack",
+    "StarterPlayer",
+  ];
+
+  // The sync primitives are edit-DataModel operations; during a real F5 playtest
+  // the edit Executor's IsRunning() stays false (separate DataModel), so the
+  // authoritative playtest signal Node-side is the server agent's liveness.
+  function syncPlaytestGuard() {
+    if (isAlive("server")) {
+      return blocked("edit mode only: a playtest is running -- stop it first");
+    }
+    return null;
+  }
+
+  async function syncListEntries(roots: string[]): Promise<SyncListEntry[]> {
+    const out: SyncListEntry[] = [];
+    for (const root of roots) {
+      const r = await enqueueAndAwait("sync_list", "edit", { root }, cfg.commandTimeoutMs);
+      if (!r.ok) {
+        throw new Error(`sync_list '${root}': ${r.error ?? (r as { err?: string }).err ?? "failed"}`);
+      }
+      const arr = Array.isArray(r.result) ? (r.result as SyncListEntry[]) : [];
+      out.push(...arr);
+    }
+    return out;
+  }
+
+  interface SyncStatusRow extends StatusEntry {
+    diskHash: string | null;
+    studioHash: string | null;
+  }
+
+  async function computeSyncStatus(dir: string): Promise<
+    | { error: string }
+    | {
+        manifest: Manifest;
+        rows: SyncStatusRow[];
+        newOnDisk: string[];
+        diskSources: Map<string, string>;
+      }
+  > {
+    const manifest = readManifest(dir);
+    if (!manifest) {
+      return { error: `no ${MANIFEST_NAME} in '${dir}' -- run export_scripts first` };
+    }
+    let live: SyncListEntry[];
+    try {
+      live = await syncListEntries(manifest.roots);
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+    // First-wins per path, matching export's duplicate-sibling rule.
+    const studioHashes = new Map<string, string>();
+    for (const e of live) {
+      if (!studioHashes.has(e.path)) studioHashes.set(e.path, e.hash);
+    }
+    const rows: SyncStatusRow[] = [];
+    const diskSources = new Map<string, string>();
+    for (const [relPath, me] of Object.entries(manifest.files)) {
+      const disk = readDiskSource(dir, relPath);
+      if (disk !== null) diskSources.set(relPath, disk);
+      const diskHash = disk === null ? null : fnv1a32(disk);
+      const studioHash = studioHashes.get(me.dataModelPath) ?? null;
+      rows.push({
+        relPath,
+        dataModelPath: me.dataModelPath,
+        className: me.className,
+        state: classify(me.hash, diskHash, studioHash),
+        diskHash,
+        studioHash,
+      });
+    }
+    return { manifest, rows, newOnDisk: findUnknownFiles(dir, manifest), diskSources };
+  }
+
+  function jsonResult(value: unknown) {
+    return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
+  }
+
+  server.registerTool(
+    "export_scripts",
+    {
+      title: "Export Scripts To Disk",
+      description:
+        "Dump every Script/LocalScript/ModuleScript under root (default: the standard " +
+        "script-bearing services) to a disk tree mirroring the Explorer hierarchy, " +
+        "Rojo-style names (Name.server.luau / Name.client.luau / Name.luau; scripts with " +
+        "script-descendants become folders with init.*.luau). Writes a nikmcp-sync.json " +
+        "manifest (real DataModel path + content hash per file) used by sync_status / " +
+        "import_scripts. Overwrites its own managed files; never deletes files it did not " +
+        "write. Same-named sibling scripts share one path, so only the first is exported -- " +
+        "the rest are reported in duplicates[]. Edit mode only.",
+      inputSchema: {
+        root: z.string().optional(),
+        dir: z.string().optional(),
+      },
+    },
+    async ({ root, dir }) => {
+      const reason = gateToolCall("export_scripts");
+      if (reason) return blocked(reason);
+      const guard = syncPlaytestGuard();
+      if (guard) return guard;
+      const outDir = dir || cfg.syncDir;
+      if (!outDir) return blocked("dir required (or set syncDir in config.json)");
+      const roots = root ? [root] : SYNC_DEFAULT_ROOTS;
+      let entries: SyncListEntry[];
+      try {
+        entries = await syncListEntries(roots);
+      } catch (e) {
+        return blocked(e instanceof Error ? e.message : String(e));
+      }
+      const plan = planExport(entries);
+      const files: Record<string, ManifestEntry> = {};
+      let bytes = 0;
+      const errors: string[] = [];
+      for (let i = 0; i < plan.files.length; i += 30) {
+        const batch = plan.files.slice(i, i + 30);
+        const r = await enqueueAndAwait(
+          "sync_get_sources",
+          "edit",
+          { paths: batch.map((f) => f.entry.path) },
+          cfg.commandTimeoutMs
+        );
+        if (!r.ok) return blocked(r.error ?? "sync_get_sources failed");
+        const arr = Array.isArray(r.result)
+          ? (r.result as { path: string; source?: string; err?: string }[])
+          : [];
+        const byPath = new Map(arr.map((it) => [it.path, it]));
+        for (const f of batch) {
+          const item = byPath.get(f.entry.path);
+          if (!item || item.err || typeof item.source !== "string") {
+            errors.push(`${f.entry.path}: ${item?.err ?? "no source returned"}`);
+            continue;
+          }
+          // Hash the CONTENT we actually wrote (not the earlier listing hash),
+          // so an edit between list and fetch cannot poison the manifest.
+          const normalized = normalizeSource(item.source);
+          bytes += writeDiskSource(outDir, f.relPath, normalized);
+          files[f.relPath] = {
+            dataModelPath: f.entry.path,
+            className: f.entry.className,
+            hash: fnv1a32(normalized),
+          };
+        }
+      }
+      let placeName = "";
+      try {
+        const pi = await enqueueAndAwait("get_place_info", "edit", {}, 5000);
+        const n = (pi.result as { name?: unknown } | undefined)?.name;
+        if (typeof n === "string") placeName = n;
+      } catch {
+        // best-effort metadata only
+      }
+      writeManifestAtomic(outDir, {
+        roots,
+        exportedAt: new Date().toISOString(),
+        placeName,
+        files,
+      });
+      const out: Record<string, unknown> = {
+        files: Object.keys(files).length,
+        bytes,
+        duplicates: plan.duplicates,
+        dir: outDir,
+      };
+      if (errors.length) out.errors = errors;
+      return jsonResult(out);
+    }
+  );
+
+  server.registerTool(
+    "sync_status",
+    {
+      title: "Script Sync Status",
+      description:
+        "Read-only three-way drift report for an export_scripts dir: per file, disk hash " +
+        "vs manifest vs live Studio hash -> clean / diskAhead (importable) / studioAhead " +
+        "(re-export to pick up) / CONFLICT (both moved -- import will refuse) / " +
+        "missingInStudio / missingOnDisk, plus newOnDisk (*.luau files the manifest does " +
+        "not know; v1 import never creates them). Edit mode only.",
+      inputSchema: { dir: z.string().optional() },
+    },
+    async ({ dir }) => {
+      const reason = gateToolCall("sync_status");
+      if (reason) return blocked(reason);
+      const guard = syncPlaytestGuard();
+      if (guard) return guard;
+      const target = dir || cfg.syncDir;
+      if (!target) return blocked("dir required (or set syncDir in config.json)");
+      const s = await computeSyncStatus(target);
+      if ("error" in s) return blocked(s.error);
+      const byState: Record<string, { relPath: string; dataModelPath: string }[]> = {};
+      for (const row of s.rows) {
+        (byState[row.state] ??= []).push({
+          relPath: row.relPath,
+          dataModelPath: row.dataModelPath,
+        });
+      }
+      return jsonResult({
+        dir: target,
+        total: s.rows.length,
+        counts: Object.fromEntries(Object.entries(byState).map(([k, v]) => [k, v.length])),
+        clean: (byState.clean ?? []).length,
+        diskAhead: byState.diskAhead ?? [],
+        studioAhead: byState.studioAhead ?? [],
+        conflict: byState.conflict ?? [],
+        missingInStudio: byState.missingInStudio ?? [],
+        missingOnDisk: byState.missingOnDisk ?? [],
+        newOnDisk: s.newOnDisk,
+      });
+    }
+  );
+
+  server.registerTool(
+    "import_scripts",
+    {
+      title: "Import Scripts From Disk",
+      description:
+        "Apply diskAhead files from an export_scripts dir back to Studio in ONE undo step. " +
+        "Drift-safe: ANY conflict (disk AND Studio both changed since export) aborts the " +
+        "ENTIRE import with a whitespace-normalized unified diff per conflict -- never " +
+        "auto-resolves. studioAhead / missing entries are reported and skipped, not " +
+        "blocking. Every applied source is Luau-analyzed first (task 24 gate; errors abort " +
+        "the whole import; skipAnalysis:true bypasses). dryRun:true returns the would-apply " +
+        "plan. v1 limits: updates EXISTING scripts only -- new disk files are reported, " +
+        "never created; deleted disk files never delete instances. Edit mode only.",
+      inputSchema: {
+        dir: z.string().optional(),
+        dryRun: z.boolean().default(false),
+        skipAnalysis: z.boolean().default(false),
+      },
+    },
+    async ({ dir, dryRun, skipAnalysis }) => {
+      const reason = gateToolCall("import_scripts");
+      if (reason) return blocked(reason);
+      const guard = syncPlaytestGuard();
+      if (guard) return guard;
+      const target = dir || cfg.syncDir;
+      if (!target) return blocked("dir required (or set syncDir in config.json)");
+      const s = await computeSyncStatus(target);
+      if ("error" in s) return blocked(s.error);
+      const decision = decideImport(s.rows);
+
+      if (decision.action === "abort") {
+        // Fetch the Studio side of each conflict for the diff (disk side is local).
+        const paths = decision.conflicts.map((c) => c.dataModelPath);
+        const studioSources = new Map<string, string>();
+        try {
+          const r = await enqueueAndAwait(
+            "sync_get_sources",
+            "edit",
+            { paths },
+            cfg.commandTimeoutMs
+          );
+          if (r.ok && Array.isArray(r.result)) {
+            for (const it of r.result as { path: string; source?: string }[]) {
+              if (typeof it.source === "string") studioSources.set(it.path, it.source);
+            }
+          }
+        } catch {
+          // diff degrades to disk-only excerpt below
+        }
+        const conflicts = decision.conflicts.map((c) => ({
+          relPath: c.relPath,
+          dataModelPath: c.dataModelPath,
+          // -studio +disk: what would change in Studio if the disk version won.
+          diff: unifiedDiff(
+            studioSources.get(c.dataModelPath) ?? "(studio source unavailable)",
+            s.diskSources.get(c.relPath) ?? "(disk source unavailable)"
+          ),
+        }));
+        return blocked(
+          "import aborted: conflicts (both disk AND Studio changed since export). " +
+            "Nothing was applied. Resolve manually (re-export to accept Studio, or " +
+            "copy the disk version over after reviewing), then retry.\n" +
+            JSON.stringify({ conflicts }, null, 2)
+        );
+      }
+
+      // Task 24 synergy: Luau-gate every would-apply source BEFORE touching Studio.
+      let analyzed = 0;
+      if (cfg.luauGate && !skipAnalysis && decision.apply.length > 0) {
+        await luauGateReady(3000);
+        const diagnostics: { relPath: string; errors: Diagnostic[] }[] = [];
+        for (const row of decision.apply) {
+          const src = s.diskSources.get(row.relPath);
+          if (src === undefined) continue;
+          const res = await analyzeLuau(src);
+          if (!res.available) {
+            analyzed = 0;
+            diagnostics.length = 0;
+            break; // analyzer gone (fail open, one stderr notice already emitted)
+          }
+          analyzed++;
+          if (res.errors.length) diagnostics.push({ relPath: row.relPath, errors: res.errors });
+        }
+        if (diagnostics.length) {
+          return blocked(
+            "import aborted: Luau analyze found errors (nothing was applied; fix the " +
+              "files or pass skipAnalysis:true):\n" +
+              JSON.stringify(diagnostics, null, 2)
+          );
+        }
+      }
+
+      const plan = {
+        wouldApply: decision.apply.map((r) => ({
+          relPath: r.relPath,
+          dataModelPath: r.dataModelPath,
+        })),
+        skippedStudioAhead: decision.skippedStudioAhead.map((r) => r.relPath),
+        missing: decision.missing.map((r) => ({ relPath: r.relPath, state: r.state })),
+        newOnDisk: s.newOnDisk,
+        analyzed,
+      };
+      if (dryRun) return jsonResult({ dryRun: true, ...plan });
+      if (decision.apply.length === 0) {
+        return jsonResult({ applied: [], note: "nothing is diskAhead", ...plan });
+      }
+
+      const items = decision.apply.map((row) => ({
+        path: row.dataModelPath,
+        source: s.diskSources.get(row.relPath) ?? "",
+      }));
+      const r = await enqueueAndAwait(
+        "sync_set_sources",
+        "edit",
+        { items },
+        cfg.commandTimeoutMs
+      );
+      if (!r.ok) return blocked(r.error ?? "sync_set_sources failed");
+      const results = Array.isArray(r.result)
+        ? (r.result as { path: string; ok: boolean; err?: string }[])
+        : [];
+      const okPaths = new Set(results.filter((x) => x.ok).map((x) => x.path));
+
+      // Refresh manifest hashes for applied files ONLY.
+      for (const row of decision.apply) {
+        if (okPaths.has(row.dataModelPath)) {
+          const src = s.diskSources.get(row.relPath);
+          if (src !== undefined && s.manifest.files[row.relPath]) {
+            s.manifest.files[row.relPath].hash = fnv1a32(src);
+          }
+        }
+      }
+      writeManifestAtomic(target, s.manifest);
+
+      return jsonResult({
+        applied: results.filter((x) => x.ok).map((x) => x.path),
+        failed: results.filter((x) => !x.ok),
+        skippedStudioAhead: plan.skippedStudioAhead,
+        missing: plan.missing,
+        newOnDisk: plan.newOnDisk,
+        analyzed,
       });
     }
   );

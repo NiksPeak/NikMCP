@@ -21,7 +21,8 @@
     "selftest:opencloud": "node tests/open-cloud-request.mjs",
     "selftest:apidump": "node tests/api-dump-validation.mjs",
     "selftest:luau": "node tests/luau-gate.mjs",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "selftest:sync": "node tests/sync-unit.mjs"
   },
   "keywords": [
     "roblox",

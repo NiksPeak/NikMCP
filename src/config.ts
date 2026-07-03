@@ -11,6 +11,7 @@ export interface AppConfig {
   apiDumpTtlHours: number; // refetch when the cached dump is older / version changed
   luauGate: boolean; // Part B: luau-lsp analyze gate on Luau source
   luauLspPath?: string; // absolute path override for the analyzer binary
+  syncDir?: string; // task 25: default export/import dir (the tool's dir param wins)
 }
 
 export interface OpenCloudConfig {
@@ -80,6 +81,8 @@ export function resolveConfig(argv: string[] = process.argv.slice(2)): AppConfig
       typeof fileCfg.luauLspPath === "string" && fileCfg.luauLspPath
         ? fileCfg.luauLspPath
         : undefined,
+    syncDir:
+      typeof fileCfg.syncDir === "string" && fileCfg.syncDir ? fileCfg.syncDir : undefined,
   };
 }
 
