@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SRC = join(ROOT, "plugin", "src");
 const ROOT_NAME = "RobloxStudioMCP";
-const CHILDREN = ["Config", "Settings", "Serializer", "Executor", "StatusWidget", "RuntimeAgentSource"];
+const CHILDREN = ["Config", "Settings", "Serializer", "Executor", "StatusWidget", "RuntimeAgentSource", "ClientAgentSource"];
 
 const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 function cdata(s) {

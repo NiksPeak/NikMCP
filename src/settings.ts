@@ -78,6 +78,11 @@ export const WRITE_TOOLS = new Set<string>([
   "group_instances",
   "ungroup_instance",
   "align_instances",
+  // task 23 (verify_playtest starts/stops playtests + runs code; upload_asset/
+  // upload_capture publish to Roblox via Open Cloud -- client_query is a read)
+  "verify_playtest",
+  "upload_asset",
+  "upload_capture",
 ]);
 
 const DEFAULTS: Settings = {

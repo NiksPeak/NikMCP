@@ -17,7 +17,9 @@ local AssetService = game:GetService("AssetService")
 local CaptureService = game:GetService("CaptureService")
 local MarketplaceService = game:GetService("MarketplaceService")
 local Stats = game:GetService("Stats")
+local StarterPlayer = game:GetService("StarterPlayer")
 local Serializer = require(script.Parent.Serializer)
+local ClientAgentSource = require(script.Parent.ClientAgentSource)
 
 local Executor = {}
 
@@ -93,6 +95,7 @@ local playtestCapturing = false
 -- get_playtest_output and on any live server-context poll.
 local playtestStartedAt: number? = nil
 local playtestLastActivity: number = 0
+local playtestMode: string? = nil
 local function pushPlaytest(text: string, level: string, t: number)
 	if not playtestCapturing then
 		return
@@ -823,6 +826,47 @@ local function cleanupPlaytestStopListener()
 	end
 end
 
+-- Client agent (play mode only): HttpService is server-only, so a LocalScript
+-- cannot reach the bridge directly -- it relays through the server agent
+-- (RuntimeAgentSource) instead. Injected BEFORE ExecutePlayModeAsync so it
+-- travels into the run DataModel; run mode never gets this (no client there).
+local CLIENT_AGENT_NAME = "NikMCP_ClientAgent"
+
+local function injectClientAgent()
+	local starterPlayerScripts = StarterPlayer:FindFirstChild("StarterPlayerScripts")
+	if not starterPlayerScripts then
+		return
+	end
+	if starterPlayerScripts:FindFirstChild(CLIENT_AGENT_NAME) then
+		return -- never two: name-check before parenting
+	end
+	local agent = Instance.new("LocalScript")
+	agent.Name = CLIENT_AGENT_NAME
+	agent.Archivable = true
+	local seOk = pcall(function()
+		ScriptEditorService:UpdateSourceAsync(agent, function()
+			return ClientAgentSource
+		end)
+	end)
+	if not seOk then
+		agent.Source = ClientAgentSource
+	end
+	agent.Parent = starterPlayerScripts
+end
+
+local function cleanupClientAgent()
+	local starterPlayerScripts = StarterPlayer:FindFirstChild("StarterPlayerScripts")
+	if not starterPlayerScripts then
+		return
+	end
+	local existing = starterPlayerScripts:FindFirstChild(CLIENT_AGENT_NAME)
+	if existing then
+		pcall(function()
+			existing:Destroy()
+		end)
+	end
+end
+
 local function playtestControl(p: any): any
 	local action = tostring(p.action)
 	local mode = p.mode or "run"
@@ -835,12 +879,17 @@ local function playtestControl(p: any): any
 		end
 		playtestRing = {}
 		playtestCapturing = true
+		playtestMode = mode
 		if p.numPlayers ~= nil then
 			pcall(function()
 				TestService.NumberOfPlayers = math.clamp(tonumber(p.numPlayers) or 1, 1, 8)
 			end)
 		end
 		injectPlaytestStopListener()
+		if mode == "play" then
+			-- Play mode only -- run mode has no client, period.
+			injectClientAgent()
+		end
 		local launchErr: string? = nil
 		task.spawn(function()
 			local ok, err = pcall(function()
@@ -855,13 +904,17 @@ local function playtestControl(p: any): any
 			-- Execute*ModeAsync returns only when the playtest ENDS.
 			playtestCapturing = false
 			playtestStartedAt = nil
+			playtestMode = nil
 			cleanupPlaytestStopListener()
+			pcall(cleanupClientAgent)
 		end)
 		-- Brief wait to surface an immediate launch failure before reporting.
 		task.wait(0.3)
 		if launchErr ~= nil then
 			playtestCapturing = false
+			playtestMode = nil
 			cleanupPlaytestStopListener()
+			pcall(cleanupClientAgent)
 			local fn = (mode == "play") and "ExecutePlayModeAsync" or "ExecuteRunModeAsync"
 			return { ok = false, err = "StudioTestService:" .. fn .. " failed: " .. launchErr }
 		end
@@ -883,7 +936,9 @@ local function playtestControl(p: any): any
 		end)
 		playtestCapturing = false
 		playtestStartedAt = nil
+		playtestMode = nil
 		cleanupPlaytestStopListener()
+		pcall(cleanupClientAgent)
 		return {
 			ok = true,
 			output = "sent stop (warn " .. PLAYTEST_STOP_SIGNAL
@@ -900,7 +955,11 @@ local function getPlaytestOutput(p: any): any
 	if p.drain ~= false then
 		playtestRing = {}
 	end
-	return { ok = true, result = { lines = lines, capturing = playtestCapturing, count = #lines } }
+	local result: { [string]: any } = { lines = lines, capturing = playtestCapturing, count = #lines, client = {} }
+	if playtestMode ~= "play" then
+		result.note = "run mode has no client"
+	end
+	return { ok = true, result = result }
 end
 
 -- Playtest lifecycle status (feeds the ungated get_playtest_status tool). The
@@ -924,7 +983,7 @@ local function getPlaytestStatus(): any
 		ok = true,
 		result = {
 			running = simRunning,
-			mode = playtestStartedAt ~= nil and "run" or nil,
+			mode = playtestMode,
 			startedAtUnix = playtestStartedAt,
 			durationSec = duration,
 			players = players,

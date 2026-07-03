@@ -154,6 +154,31 @@ try {
   });
   await T("  verify ST_UI exists", "search_instances", { query: "ST_UI", root: M }, (t) => /ST_UI/.test(t));
 
+  // --- task 23: outer-array/object objectArg coercion via STRING ---
+  await T("verify_playtest.clientChecks (string array)", "verify_playtest", {
+    mode: "run",
+    assertScript: "return { passed = true, failures = {} }",
+    clientChecks: JSON.stringify([{ name: "objArgCheck" }]),
+    timeoutSec: 30,
+  }, (t) => /"passed":\s*true/.test(t) && /"objArgCheck"/.test(t) && /"skipped"/.test(t));
+
+  await T("verify_playtest.clientChecks (nested args string)", "verify_playtest", {
+    mode: "run",
+    assertScript: "return { passed = true, failures = {} }",
+    clientChecks: JSON.stringify([{ name: "objArgNested", args: JSON.stringify({ foo: "bar" }) }]),
+    timeoutSec: 30,
+  }, (t) => /"passed":\s*true/.test(t) && /"objArgNested"/.test(t));
+
+  await TErr("upload_asset.applyTo (string)", "upload_asset", {
+    assetType: "Image", displayName: "objArgTest",
+    applyTo: JSON.stringify({ path: M + ".P", property: "Color" }),
+  }, /provide exactly one of filePath or content/);
+
+  await TErr("upload_capture.applyTo (string)", "upload_capture", {
+    displayName: "objArgTest",
+    applyTo: JSON.stringify({ path: M + ".P", property: "Color" }),
+  }, /not configured/);
+
   // NOTE: character_navigation.position is the same objectArg() class but needs a
   // running playtest with a character, so it isn't exercised here (code-only coverage).
 } catch (e) {

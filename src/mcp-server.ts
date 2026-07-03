@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { extname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -6,6 +8,20 @@ import { enqueueAndAwait, chooseContext, isAlive } from "./queue.js";
 import { getDiag } from "./bridge.js";
 import { gateToolCall } from "./settings.js";
 import { rgbaToPng } from "./png-encoder.js";
+import { preflightSize, redactKey, uploadAsset } from "./open-cloud.js";
+import {
+  startApiDumpLoad,
+  apiDumpReady,
+  validateCreate,
+  validatePropertyWrite,
+  classInfo,
+} from "./api-dump.js";
+import {
+  startLuauGate,
+  luauGateReady,
+  analyzeLuau,
+  type Diagnostic,
+} from "./luau-gate.js";
 import type { Context, CommandResult } from "./types.js";
 
 // The Claude Code MCP client JSON-stringifies object-valued args for loosely-typed
@@ -83,11 +99,73 @@ function blocked(reason: string) {
 export async function startMcpServer(cfg: AppConfig): Promise<void> {
   const server = new McpServer({ name: "roblox-studio-mcp", version: "0.2.0" });
 
+  // ----- task 24: Node-side validation layer --------------------------------
+  // Both loaders are lazy + background: MCP stdio init never waits on a network
+  // fetch. The first validated call awaits readiness for at most ~3s, then
+  // passes through un-validated while loading continues (fail OPEN).
+  if (cfg.apiValidation) startApiDumpLoad({ ttlHours: cfg.apiDumpTtlHours });
+  if (cfg.luauGate) startLuauGate({ luauLspPath: cfg.luauLspPath });
+
+  // Part A: pre-enqueue API-dump validation. A rejection costs zero Studio
+  // round-trips. Returns the same error shape renderResult uses.
+  async function apiIdx() {
+    if (!cfg.apiValidation) return null;
+    return apiDumpReady(3000);
+  }
+
+  // Part B: analyze a full Luau chunk before it is enqueued. Errors block;
+  // warnings ride along and are appended to the success result text.
+  async function gateLuau(
+    source: string,
+    skipAnalysis: boolean | undefined,
+    label: string
+  ): Promise<{ block?: ReturnType<typeof blocked>; warnings: Diagnostic[] }> {
+    if (!cfg.luauGate || skipAnalysis) return { warnings: [] };
+    await luauGateReady(3000);
+    const res = await analyzeLuau(source);
+    if (!res.available || res.ok) return { warnings: res.warnings };
+    const lines = source.split("\n");
+    const msgs = res.errors.map((d) => {
+      const excerpt = (lines[d.line - 1] ?? "").trim();
+      return `${d.line}:${d.col} ${d.kind}: ${d.message}` + (excerpt ? `\n  > ${excerpt}` : "");
+    });
+    return {
+      block: blocked(
+        `validation (${label}): Luau analyze found ${res.errors.length} error(s):\n` +
+          msgs.join("\n") +
+          "\n(pass skipAnalysis:true only if you are sure Studio accepts this source)"
+      ),
+      warnings: [],
+    };
+  }
+
+  function withLuauWarnings<T extends { isError?: boolean; content: unknown[] }>(
+    res: T,
+    warnings: Diagnostic[]
+  ): T {
+    if (!warnings.length || res.isError) return res;
+    const text =
+      "luau warnings:\n" +
+      warnings.map((d) => `${d.line}:${d.col} ${d.kind}: ${d.message}`).join("\n");
+    return { ...res, content: [...res.content, { type: "text" as const, text }] };
+  }
+
   const contextArg = z
     .enum(["auto", "edit", "server"])
     .default("auto")
     .describe(
       "Which Studio context to target. 'server' = the running F5 playtest server."
+    );
+
+  // task 23: run_luau and read_console additionally accept 'client' (the F5 play-mode
+  // client, relayed through the server agent). Kept separate from contextArg above so
+  // every other tool's schema is untouched.
+  const contextArgWithClient = z
+    .enum(["auto", "edit", "server", "client"])
+    .default("auto")
+    .describe(
+      "Which Studio context to target. 'server' = the running F5 playtest server. " +
+        "'client' = the F5 play-mode client (read-only; run_luau context='client' is not supported)."
     );
 
   // Gate -> enqueue -> render. The server enforces the plugin's settings here so
@@ -139,10 +217,25 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       title: "Run Luau",
       description:
         "Execute Luau in Studio and return printed output and any returned value. " +
-        "Use context='server' to run inside the live F5 playtest server.",
-      inputSchema: { code: z.string(), context: contextArg },
+        "Use context='server' to run inside the live F5 playtest server. " +
+        "context='client' is NOT supported -- loadstring is server-only; use client_query " +
+        "for read-only introspection of the play-mode client. Source is checked Node-side " +
+        "with luau-lsp analyze first (skipAnalysis:true bypasses the gate).",
+      inputSchema: {
+        code: z.string(),
+        context: contextArgWithClient,
+        skipAnalysis: z.boolean().default(false),
+      },
     },
-    async ({ code, context }) => call("run_luau", chooseContext(context), { code })
+    async ({ code, context, skipAnalysis }) => {
+      if (context === "client") {
+        return blocked("not supported: loadstring is server-only; use client_query");
+      }
+      const g = await gateLuau(code, skipAnalysis, "run_luau");
+      if (g.block) return g.block;
+      const res = await call("run_luau", chooseContext(context), { code });
+      return withLuauWarnings(res, g.warnings);
+    }
   );
 
   server.registerTool(
@@ -166,7 +259,11 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     {
       title: "Set Property",
       description:
-        "Set a property on an instance (edit context wraps it in undo history).",
+        "Set a property on an instance (edit context wraps it in undo history). " +
+        "The property name is validated Node-side against the API dump (the instance's " +
+        "class is unknown here, so only property-name existence, writability, and " +
+        "unambiguous primitive/enum types are checked; complex/ambiguous values pass " +
+        "through and Studio stays the final authority).",
       inputSchema: {
         path: z.string(),
         property: z.string(),
@@ -174,8 +271,11 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         context: contextArg,
       },
     },
-    async ({ path, property, value, context }) =>
-      call("set_property", chooseContext(context), { path, property, value })
+    async ({ path, property, value, context }) => {
+      const err = validatePropertyWrite(await apiIdx(), property, value);
+      if (err) return blocked(`validation: ${err}`);
+      return call("set_property", chooseContext(context), { path, property, value });
+    }
   );
 
   server.registerTool(
@@ -184,15 +284,22 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       title: "Write Script Source",
       description:
         "Set a script's source via ScriptEditorService (edit context only). " +
-        "Creates the script if missing when 'className' is provided.",
+        "Creates the script if missing when 'className' is provided. Source is " +
+        "checked Node-side with luau-lsp analyze first: syntax/type errors reject " +
+        "the write with line/col diagnostics (skipAnalysis:true bypasses the gate).",
       inputSchema: {
         path: z.string(),
         source: z.string(),
         className: z.enum(["Script", "LocalScript", "ModuleScript"]).optional(),
+        skipAnalysis: z.boolean().default(false),
       },
     },
-    async ({ path, source, className }) =>
-      call("write_script", "edit", { path, source, className })
+    async ({ path, source, className, skipAnalysis }) => {
+      const g = await gateLuau(source, skipAnalysis, "write_script");
+      if (g.block) return g.block;
+      const res = await call("write_script", "edit", { path, source, className });
+      return withLuauWarnings(res, g.warnings);
+    }
   );
 
   server.registerTool(
@@ -214,15 +321,24 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       title: "Read Console",
       description:
         "Return recent Studio Output (LogService history + a live ring buffer). " +
-        "Highest-value tool for debugging.",
+        "Highest-value tool for debugging. context='client' reads the F5 play-mode " +
+        "client's console (relayed via the server agent) -- requires a running playtest " +
+        "with the agent connected.",
       inputSchema: {
         count: z.number().int().min(1).max(500).default(100),
         levelFilter: z.enum(["error", "warning", "output"]).optional(),
-        context: contextArg,
+        context: contextArgWithClient,
       },
     },
-    async ({ count, levelFilter, context }) =>
-      call("read_console", chooseContext(context), { count, levelFilter })
+    async ({ count, levelFilter, context }) => {
+      if (context === "client") {
+        if (!isAlive("server")) {
+          return blocked("client console requires a running playtest with the agent connected");
+        }
+        return call("read_console", "server", { count, levelFilter, context: "client" });
+      }
+      return call("read_console", chooseContext(context), { count, levelFilter });
+    }
   );
 
   server.registerTool(
@@ -337,7 +453,10 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     "create_instance",
     {
       title: "Create Instance",
-      description: "Create an instance under parentPath, with optional name + properties.",
+      description:
+        "Create an instance under parentPath, with optional name + properties. " +
+        "className (must exist and be creatable) and property names/types are " +
+        "validated Node-side against the API dump before reaching Studio.",
       inputSchema: {
         className: z.string(),
         parentPath: z.string(),
@@ -346,13 +465,23 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         context: contextArg,
       },
     },
-    async ({ className, parentPath, name, properties, context }) =>
-      call("create_instance", chooseContext(context), {
+    async ({ className, parentPath, name, properties, context }) => {
+      const idx = await apiIdx();
+      let err = validateCreate(idx, className);
+      if (!err && properties) {
+        for (const [prop, v] of Object.entries(properties)) {
+          err = validatePropertyWrite(idx, prop, v, className);
+          if (err) break;
+        }
+      }
+      if (err) return blocked(`validation: ${err}`);
+      return call("create_instance", chooseContext(context), {
         className,
         parentPath,
         name,
         properties,
-      })
+      });
+    }
   );
 
   server.registerTool(
@@ -423,7 +552,9 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     "bulk_set_property",
     {
       title: "Bulk Set Property",
-      description: "Set one property across many instances in a single undoable batch.",
+      description:
+        "Set one property across many instances in a single undoable batch. " +
+        "Property name validated Node-side against the API dump.",
       inputSchema: {
         paths: z.array(z.string()),
         property: z.string(),
@@ -431,8 +562,11 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         context: contextArg,
       },
     },
-    async ({ paths, property, value, context }) =>
-      call("bulk_set_property", chooseContext(context), { paths, property, value })
+    async ({ paths, property, value, context }) => {
+      const err = validatePropertyWrite(await apiIdx(), property, value);
+      if (err) return blocked(`validation: ${err}`);
+      return call("bulk_set_property", chooseContext(context), { paths, property, value });
+    }
   );
 
   server.registerTool(
@@ -526,17 +660,21 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     {
       title: "Get Playtest Output",
       description:
-        "Drain (or peek with drain:false) the playtest log buffer captured since " +
-        "playtest_control start — print/warn/error lines from the run. Returns logs " +
-        "since the playtest started; once you have what you need, stop the playtest " +
-        "with playtest_control action='stop' so it doesn't keep running.",
+        "Drain (or peek with drain:false) the playtest log buffer -- print/warn/error " +
+        "lines from the run, plus a `client` array of F5 play-mode client lines (task 23). " +
+        "F5 (play mode) with a live agent: routed to the running server agent's ring, which " +
+        "is the source of truth (the edit plugin cannot see the run DataModel). Run mode (F8) " +
+        "or no live agent: falls back to the edit plugin's captured ring and `client` is " +
+        "empty with a note. Once you have what you need, stop the playtest with " +
+        "playtest_control action='stop' so it doesn't keep running.",
       inputSchema: { drain: z.boolean().default(true), context: contextArg },
     },
     async ({ drain, context: _context }) =>
-      // Always edit: the playtest log buffer lives in the edit plugin (it captures
-      // the run's output). Routing to the live server agent yields "agent does not
-      // support command: get_playtest_output" (same class as the playtest_control pin).
-      call("get_playtest_output", "edit", { drain })
+      // Live F5 agent is the truth for a real playtest; the edit ring is the fallback
+      // for Run mode / no agent connected (same class as the playtest_control pin).
+      isAlive("server")
+        ? call("get_playtest_output", "server", { drain })
+        : call("get_playtest_output", "edit", { drain })
   );
 
   // ----- Batch 2: attributes ------------------------------------------------
@@ -739,8 +877,20 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         context: contextArg,
       },
     },
-    async ({ items, context }) =>
-      call("mass_create_objects", chooseContext(context), { items })
+    async ({ items, context }) => {
+      const idx = await apiIdx();
+      for (const item of items) {
+        let err = validateCreate(idx, item.className);
+        if (!err && item.properties) {
+          for (const [prop, v] of Object.entries(item.properties)) {
+            err = validatePropertyWrite(idx, prop, v, item.className);
+            if (err) break;
+          }
+        }
+        if (err) return blocked(`validation: ${err}`);
+      }
+      return call("mass_create_objects", chooseContext(context), { items });
+    }
   );
 
   server.registerTool(
@@ -810,22 +960,46 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         context: contextArg,
       },
     },
-    async ({ paths, property, value, context }) =>
-      call("mass_set_property", chooseContext(context), { paths, property, value })
+    async ({ paths, property, value, context }) => {
+      const err = validatePropertyWrite(await apiIdx(), property, value);
+      if (err) return blocked(`validation: ${err}`);
+      return call("mass_set_property", chooseContext(context), { paths, property, value });
+    }
   );
 
   // ----- Batch 5: deeper inspection -----------------------------------------
+  // task 24: real reflection from the Roblox API dump, answered entirely
+  // Node-side (no Studio round-trip). Same tool name + settings gating as before.
   server.registerTool(
     "get_class_info",
     {
       title: "Get Class Info",
       description:
-        "Best-effort class info: creatable? + which curated properties apply. Luau " +
-        "has no full reflection from a plugin (no API dump bundled) — documented in note.",
-      inputSchema: { className: z.string(), context: contextArg },
+        "Real class reflection from the official Roblox API dump (Node-side, no Studio " +
+        "round-trip): superclass, tags, creatable?, and paginated members (~50/page) with " +
+        "memberType, valueType, security, tags, and the declaring class. Pass cursor from " +
+        "nextCursor to page. Unknown class returns a did-you-mean suggestion.",
+      inputSchema: {
+        className: z.string(),
+        memberType: z.enum(["Property", "Function", "Event", "Callback"]).optional(),
+        includeInherited: z.boolean().default(true),
+        cursor: z.string().optional(),
+      },
     },
-    async ({ className, context }) =>
-      call("get_class_info", chooseContext(context), { className })
+    async ({ className, memberType, includeInherited, cursor }) => {
+      const reason = gateToolCall("get_class_info");
+      if (reason) return blocked(reason);
+      // This tool needs the dump even when apiValidation is off -- start the
+      // (idempotent) load here too.
+      startApiDumpLoad({ ttlHours: cfg.apiDumpTtlHours });
+      const idx = await apiDumpReady(3000);
+      if (!idx) {
+        return blocked("API dump not available yet, retry shortly");
+      }
+      const info = classInfo(idx, { className, memberType, includeInherited, cursor });
+      if ("error" in info) return blocked(info.error);
+      return { content: [{ type: "text" as const, text: JSON.stringify(info, null, 2) }] };
+    }
   );
 
   server.registerTool(
@@ -908,8 +1082,14 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         context: contextArg,
       },
     },
-    async ({ path, properties, context }) =>
-      call("set_properties", chooseContext(context), { path, properties })
+    async ({ path, properties, context }) => {
+      const idx = await apiIdx();
+      for (const [prop, v] of Object.entries(properties)) {
+        const err = validatePropertyWrite(idx, prop, v);
+        if (err) return blocked(`validation: ${err}`);
+      }
+      return call("set_properties", chooseContext(context), { path, properties });
+    }
   );
 
   server.registerTool(
@@ -1025,7 +1205,8 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       title: "Upload Decal",
       description:
         "Publish an image as a decal. UNSUPPORTED from a plugin (needs Open Cloud " +
-        "Assets API key) — returns a clear reason.",
+        "Assets API key) — returns a clear reason. Use upload_asset instead (task 23): " +
+        "it uploads via the Open Cloud Assets API and can apply the result directly.",
       inputSchema: { context: contextArg },
     },
     async ({ context }) => call("upload_decal", chooseContext(context), {})
@@ -1554,7 +1735,614 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     }
   );
 
+  // ----- Task 23 Batch A: client_query (F5 client introspection, read-only) -
+  server.registerTool(
+    "client_query",
+    {
+      title: "Client Query",
+      description:
+        "Fixed, read-only introspection queries on the F5 play-mode CLIENT, relayed " +
+        "server -> client over a RemoteEvent (arbitrary client code is impossible: " +
+        "loadstring is server-only, so there is no client run_luau). name: 'fps' (avg " +
+        "1/RenderStepped over ~30 frames), 'camera' (CFrame + FieldOfView), 'gui_tree' " +
+        "({maxDepth?}, PlayerGui summary), 'local_player' (character present?, HRP " +
+        "position, Humanoid state/health), 'ping' (GetNetworkPing). Requires a running " +
+        "F5 play-mode playtest with the agent connected; unknown name lists the valid set.",
+      inputSchema: {
+        name: z.enum(["fps", "camera", "gui_tree", "local_player", "ping"]),
+        args: objectArg().optional(),
+      },
+    },
+    async ({ name, args }) => {
+      if (!isAlive("server")) {
+        return blocked("client_query requires a running F5 play-mode playtest (agent not connected)");
+      }
+      // commandTimeoutMs (30s) safely exceeds the agent's own 5s internal client timeout.
+      return call("client_query", "server", { name, args });
+    }
+  );
+
+  // ----- Task 23 Batch B: verify_playtest (self-correcting loop) ------------
+  interface VerifyCheck {
+    name: string;
+    ok: boolean;
+    detail?: string;
+    skipped?: string;
+  }
+  interface VerifyOutput {
+    passed: boolean;
+    failures: string[];
+    checks: VerifyCheck[];
+    serverErrors: string[];
+    clientErrors: string[];
+    durationSec: number;
+    stopped: boolean;
+  }
+
+  function consoleLines(res: CommandResult): { text: string; level: string }[] {
+    if (!res.ok || !res.result || typeof res.result !== "object") return [];
+    const lines = (res.result as { lines?: unknown }).lines;
+    if (!Array.isArray(lines)) return [];
+    return lines
+      .filter((l): l is Record<string, unknown> => !!l && typeof l === "object")
+      .map((l) => ({ text: String(l.text ?? ""), level: String(l.level ?? "") }));
+  }
+
+  async function runVerifyPlaytest(input: {
+    mode: "run" | "play";
+    setupScript?: string;
+    assertScript: string;
+    clientChecks?: { name: string; args?: unknown; expect?: unknown }[];
+    timeoutSec: number;
+    keepRunning: boolean;
+  }): Promise<VerifyOutput> {
+    const startedAt = Date.now();
+    const deadline = startedAt + input.timeoutSec * 1000;
+    const failures: string[] = [];
+    const checks: VerifyCheck[] = [];
+    const serverErrors: string[] = [];
+    const clientErrors: string[] = [];
+    let assertPassed = false;
+    let hadServerError = false;
+    let weStarted = false;
+    let stopped = false;
+
+    const timedOut = () => Date.now() > deadline;
+    const finish = (): VerifyOutput => ({
+      passed:
+        assertPassed &&
+        !hadServerError &&
+        checks.every((c) => c.skipped !== undefined || c.ok),
+      failures,
+      checks,
+      serverErrors,
+      clientErrors,
+      durationSec: Math.round((Date.now() - startedAt) / 1000),
+      stopped,
+    });
+
+    // Step 1 (status check) -- outside the try/finally below: we have not started
+    // anything yet, so a bail-out here must never stop someone else's playtest.
+    let alreadyRunning = isAlive("server");
+    if (!alreadyRunning) {
+      try {
+        const r = await enqueueAndAwait("get_playtest_status", "edit", {}, 5000);
+        if (r.ok && r.result && typeof r.result === "object") {
+          alreadyRunning = (r.result as { running?: boolean }).running === true;
+        }
+      } catch {
+        // no edit context polling -- degraded status, assume not running
+      }
+    }
+    if (alreadyRunning) {
+      failures.push("playtest already running; stop it or pass keepRunning");
+      return finish();
+    }
+
+    // Steps 2-5, wrapped so any early return / timeout / thrown error still stops
+    // the playtest we started (task-17 auto-stop is the backstop, not the mechanism).
+    async function body(): Promise<void> {
+      // Step 2: start, then wait for the agent to connect (cap 20s).
+      const startRes = await enqueueAndAwait(
+        "playtest_control",
+        "edit",
+        { action: "start", mode: input.mode },
+        cfg.commandTimeoutMs
+      );
+      if (!startRes.ok) {
+        failures.push(startRes.error ?? "playtest_control start failed");
+        return;
+      }
+      weStarted = true;
+
+      const connectDeadline = Date.now() + 20000;
+      while (!isAlive("server") && Date.now() < connectDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      if (!isAlive("server")) {
+        failures.push("agent never connected (check Allow HTTP Requests)");
+        return;
+      }
+      if (timedOut()) {
+        failures.push(`timeout after ${input.timeoutSec}s`);
+        return;
+      }
+
+      // Step 3: setupScript (best-effort) then assertScript (must return {passed, failures}).
+      if (input.setupScript) {
+        try {
+          await enqueueAndAwait(
+            "run_luau",
+            "server",
+            { code: input.setupScript },
+            cfg.commandTimeoutMs
+          );
+        } catch (e) {
+          failures.push(`setupScript: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      if (timedOut()) {
+        failures.push(`timeout after ${input.timeoutSec}s`);
+        return;
+      }
+
+      try {
+        const assertRes = await enqueueAndAwait(
+          "run_luau",
+          "server",
+          { code: input.assertScript },
+          cfg.commandTimeoutMs
+        );
+        if (!assertRes.ok) {
+          failures.push(assertRes.error ?? "assertScript run_luau failed");
+        } else {
+          const result = assertRes.result;
+          if (
+            result &&
+            typeof result === "object" &&
+            typeof (result as { passed?: unknown }).passed === "boolean"
+          ) {
+            const r = result as { passed: boolean; failures?: unknown };
+            assertPassed = r.passed;
+            const rf = Array.isArray(r.failures) ? r.failures.map((x) => String(x)) : [];
+            failures.push(...rf);
+          } else {
+            failures.push("assertScript did not return {passed, failures}");
+          }
+        }
+      } catch (e) {
+        failures.push(e instanceof Error ? e.message : String(e));
+      }
+      if (timedOut()) {
+        failures.push(`timeout after ${input.timeoutSec}s`);
+        return;
+      }
+
+      // Step 4: clientChecks -- play mode only; run mode is an honest skip, not a pass.
+      for (const c of input.clientChecks ?? []) {
+        if (input.mode !== "play") {
+          checks.push({ name: c.name, ok: false, skipped: "no client" });
+          continue;
+        }
+        if (timedOut()) {
+          failures.push(`timeout after ${input.timeoutSec}s`);
+          break;
+        }
+        try {
+          const r = await enqueueAndAwait(
+            "client_query",
+            "server",
+            { name: c.name, args: c.args },
+            8000
+          );
+          if (!r.ok) {
+            checks.push({ name: c.name, ok: false, detail: r.error ?? "client_query failed" });
+            continue;
+          }
+          if (c.expect && typeof c.expect === "object") {
+            const expectObj = c.expect as Record<string, unknown>;
+            const actual = (r.result ?? {}) as Record<string, unknown>;
+            const ok = Object.keys(expectObj).every(
+              (k) => JSON.stringify(actual[k]) === JSON.stringify(expectObj[k])
+            );
+            checks.push({
+              name: c.name,
+              ok,
+              detail: ok
+                ? undefined
+                : `expected ${JSON.stringify(expectObj)}, got ${JSON.stringify(r.result)}`,
+            });
+          } else {
+            checks.push({ name: c.name, ok: true });
+          }
+        } catch (e) {
+          checks.push({ name: c.name, ok: false, detail: e instanceof Error ? e.message : String(e) });
+        }
+      }
+
+      // Step 5: drain both console rings. Errors gate `passed`; Warnings ride along
+      // in the arrays for context but never fail the run on their own.
+      try {
+        const serverRes = await enqueueAndAwait(
+          "read_console",
+          "server",
+          { count: 200 },
+          cfg.commandTimeoutMs
+        );
+        for (const line of consoleLines(serverRes)) {
+          if (line.level.includes("Error")) {
+            serverErrors.push(line.text);
+            hadServerError = true;
+          } else if (line.level.includes("Warning")) {
+            serverErrors.push(line.text);
+          }
+        }
+      } catch {
+        // best-effort drain
+      }
+      if (input.mode === "play" && isAlive("server")) {
+        try {
+          const clientRes = await enqueueAndAwait(
+            "read_console",
+            "server",
+            { count: 200, context: "client" },
+            cfg.commandTimeoutMs
+          );
+          for (const line of consoleLines(clientRes)) {
+            if (line.level.includes("Error") || line.level.includes("Warning")) {
+              clientErrors.push(line.text);
+            }
+          }
+        } catch {
+          // best-effort drain
+        }
+      }
+    }
+
+    try {
+      await body();
+    } catch (e) {
+      failures.push(e instanceof Error ? e.message : String(e));
+    } finally {
+      // Step 6: ALWAYS stop what we started (unless keepRunning) -- a timeout or
+      // thrown error must still stop the playtest so it never orphans one.
+      if (weStarted && !input.keepRunning) {
+        try {
+          const stopRes = await stopPlaytest({ action: "stop", mode: input.mode });
+          stopped = !(stopRes as { isError?: boolean }).isError;
+        } catch {
+          stopped = false;
+        }
+      }
+    }
+    return finish();
+  }
+
+  server.registerTool(
+    "verify_playtest",
+    {
+      title: "Verify Playtest",
+      description:
+        "Composite: start a playtest, run your assertScript on the server, optionally " +
+        "check the F5 client, drain both consoles, then ALWAYS stop the playtest itself " +
+        "(unless keepRunning=true) -- never leave one running. Write a SMALL assertScript " +
+        "that RETURNS a Luau table `{ passed = boolean, failures = { \"...\" } }`; a script " +
+        "that returns anything else is reported as a failure (not a crash), with reason " +
+        "'assertScript did not return {passed, failures}'. failures[] carries the REAL " +
+        "captured server/client error text, not a paraphrase. setupScript (optional) runs " +
+        "first and is best-effort. clientChecks run client_query calls (play mode only; " +
+        "run mode marks them skipped, honestly, not passed). passed requires: assertScript " +
+        "passed=true AND zero server script Errors during the window AND every non-skipped " +
+        "clientCheck ok.",
+      inputSchema: {
+        mode: z.enum(["run", "play"]).default("run"),
+        setupScript: z.string().optional(),
+        assertScript: z.string(),
+        clientChecks: objectArg()
+          .pipe(
+            z.array(
+              z.object({
+                name: z.string(),
+                args: objectArg().optional(),
+                expect: objectArg().optional(),
+              })
+            )
+          )
+          .optional(),
+        timeoutSec: z.number().int().min(1).max(300).default(60),
+        keepRunning: z.boolean().default(false),
+        skipAnalysis: z.boolean().default(false),
+      },
+    },
+    async (input) => {
+      const reason = gateToolCall("verify_playtest");
+      if (reason) return blocked(reason);
+      // task 24: both scripts are full Luau chunks -- gate them before the
+      // playtest is even started (a syntax error would waste a whole run).
+      if (input.setupScript) {
+        const g = await gateLuau(input.setupScript, input.skipAnalysis, "verify_playtest setupScript");
+        if (g.block) return g.block;
+      }
+      const g = await gateLuau(input.assertScript, input.skipAnalysis, "verify_playtest assertScript");
+      if (g.block) return g.block;
+      const output = await runVerifyPlaytest(input);
+      return { content: [{ type: "text" as const, text: JSON.stringify(output, null, 2) }] };
+    }
+  );
+
+  // ----- Task 23 Batch C: Open Cloud auto-upload ----------------------------
+  const EXT_CONTENT_TYPE: Record<string, string> = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".bmp": "image/bmp",
+    ".tga": "image/tga",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".fbx": "model/fbx",
+  };
+
+  // Missing key/creator, or creator ambiguity -- never fake an upload.
+  function openCloudConfigError(): string | null {
+    const oc = cfg.openCloud;
+    if (!oc.apiKey || (oc.creatorUserId === undefined && oc.creatorGroupId === undefined)) {
+      return "not configured: set ROBLOX_API_KEY (or openCloud.apiKey) and openCloud.creatorUserId/GroupId";
+    }
+    if (oc.creatorUserId !== undefined && oc.creatorGroupId !== undefined) {
+      return "set exactly one of openCloud.creatorUserId / creatorGroupId";
+    }
+    return null;
+  }
+
+  // Shared upload + optional apply path for upload_asset and upload_capture.
+  async function doUploadAndApply(opts: {
+    assetType: "Image" | "Decal" | "Audio" | "Model";
+    displayName: string;
+    description?: string;
+    bytes: Buffer;
+    contentType: string;
+    applyTo?: { path: string; property: string };
+  }) {
+    const configErr = openCloudConfigError();
+    if (configErr) return blocked(configErr);
+
+    const sizeErr = preflightSize(opts.bytes.length);
+    if (sizeErr) return blocked(sizeErr);
+
+    const key = cfg.openCloud.apiKey as string;
+    let uploaded: { assetId: string; moderationState: string };
+    try {
+      uploaded = await uploadAsset({
+        apiKey: key,
+        creator: {
+          userId: cfg.openCloud.creatorUserId,
+          groupId: cfg.openCloud.creatorGroupId,
+        },
+        assetType: opts.assetType,
+        displayName: opts.displayName,
+        description: opts.description,
+        bytes: opts.bytes,
+        contentType: opts.contentType,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return blocked(redactKey(msg, key));
+    }
+
+    const { assetId, moderationState } = uploaded;
+    let applied = false;
+    let note: string | undefined;
+    if (opts.applyTo) {
+      if (moderationState === "Approved") {
+        try {
+          const r = await enqueueAndAwait(
+            "set_property",
+            "edit",
+            {
+              path: opts.applyTo.path,
+              property: opts.applyTo.property,
+              value: "rbxassetid://" + assetId,
+            },
+            cfg.commandTimeoutMs
+          );
+          applied = r.ok;
+          if (!r.ok) note = r.error ?? "set_property failed";
+        } catch (e) {
+          note = e instanceof Error ? e.message : String(e);
+        }
+      } else {
+        note = `asset not applied: moderationState=${moderationState}`;
+      }
+    }
+
+    const out: Record<string, unknown> = {
+      assetId,
+      assetUri: "rbxassetid://" + assetId,
+      moderationState,
+      applied,
+    };
+    if (note) out.note = note;
+    return { content: [{ type: "text" as const, text: JSON.stringify(out, null, 2) }] };
+  }
+
+  server.registerTool(
+    "upload_asset",
+    {
+      title: "Upload Asset",
+      description:
+        "Upload a file to Roblox via the Open Cloud Assets API -> { assetId, assetUri, " +
+        "moderationState, applied? }. Prefer assetType='Image' for anything destined for an " +
+        "Image property -- legacy 'Decal' ids are a DIFFERENT asset class. Requires " +
+        "ROBLOX_API_KEY (or config openCloud.apiKey) plus openCloud.creatorUserId or " +
+        "creatorGroupId (exactly one). Provide filePath (contentType inferred from extension) " +
+        "OR content (base64, contentType required) -- exactly one. Surfaces the moderation " +
+        "result verbatim; a pending or rejected asset is never claimed usable. applyTo sets " +
+        "an existing instance's property to rbxassetid://<assetId> via set_property once the " +
+        "asset is approved.",
+      inputSchema: {
+        assetType: z.enum(["Image", "Decal", "Audio", "Model"]),
+        filePath: z.string().optional(),
+        content: z.string().optional(),
+        contentType: z.string().optional(),
+        displayName: z.string(),
+        description: z.string().optional(),
+        applyTo: objectArg()
+          .pipe(z.object({ path: z.string(), property: z.string() }))
+          .optional(),
+      },
+    },
+    async ({ assetType, filePath, content, contentType, displayName, description, applyTo }) => {
+      const reason = gateToolCall("upload_asset");
+      if (reason) return blocked(reason);
+
+      if (!!filePath === !!content) {
+        return blocked("provide exactly one of filePath or content");
+      }
+
+      let bytes: Buffer;
+      let resolvedContentType: string;
+      if (filePath) {
+        try {
+          bytes = readFileSync(filePath);
+        } catch (e) {
+          return blocked(`could not read filePath: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        const inferred = EXT_CONTENT_TYPE[extname(filePath).toLowerCase()];
+        resolvedContentType = contentType ?? inferred ?? "";
+        if (!resolvedContentType) {
+          return blocked(
+            `could not infer contentType from extension '${extname(filePath)}'; pass contentType explicitly`
+          );
+        }
+      } else {
+        if (!contentType) {
+          return blocked("contentType is required when providing content (base64)");
+        }
+        bytes = Buffer.from(content as string, "base64");
+        resolvedContentType = contentType;
+      }
+
+      return doUploadAndApply({
+        assetType,
+        displayName,
+        description,
+        bytes,
+        contentType: resolvedContentType,
+        applyTo,
+      });
+    }
+  );
+
+  server.registerTool(
+    "upload_capture",
+    {
+      title: "Upload Capture",
+      description:
+        "Composite: capture_viewport then upload_asset assetType='Image' -- one call from " +
+        "screenshot to rbxassetid://. Same Open Cloud config requirement as upload_asset " +
+        "(ROBLOX_API_KEY/openCloud.apiKey + creatorUserId/GroupId). Capture errors (e.g. " +
+        "EditableImage permission off) surface verbatim.",
+      inputSchema: {
+        displayName: z.string(),
+        applyTo: objectArg()
+          .pipe(z.object({ path: z.string(), property: z.string() }))
+          .optional(),
+      },
+    },
+    async ({ displayName, applyTo }) => {
+      const reason = gateToolCall("upload_capture");
+      if (reason) return blocked(reason);
+
+      const configErr = openCloudConfigError();
+      if (configErr) return blocked(configErr);
+
+      const capRes = await enqueueAndAwait("capture_viewport", "edit", {}, cfg.commandTimeoutMs);
+      if (!capRes.ok) {
+        return blocked(capRes.error ?? "capture_viewport failed");
+      }
+      const res = capRes.result as
+        | { rgba?: string; width?: number; height?: number; image?: string }
+        | undefined;
+      let bytes: Buffer;
+      if (
+        res &&
+        typeof res.rgba === "string" &&
+        typeof res.width === "number" &&
+        typeof res.height === "number"
+      ) {
+        try {
+          bytes = rgbaToPng(Buffer.from(res.rgba, "base64"), res.width, res.height);
+        } catch (e) {
+          return blocked(`PNG encode failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      } else if (res && typeof res.image === "string") {
+        bytes = Buffer.from(res.image, "base64");
+      } else {
+        return blocked("capture_viewport returned no image data");
+      }
+
+      return doUploadAndApply({
+        assetType: "Image",
+        displayName,
+        bytes,
+        contentType: "image/png",
+        applyTo,
+      });
+    }
+  );
+
   // ----- meta (ungated) -----------------------------------------------------
+  // task 24: Node-local Luau analysis. The source variant never touches the
+  // bridge; the path variant round-trips once for get_script_source.
+  server.registerTool(
+    "analyze_script",
+    {
+      title: "Analyze Script",
+      description:
+        "Run luau-lsp analyze (with Roblox global type definitions) on Luau source. " +
+        "Provide exactly one of: source (analyzed Node-side, no Studio needed) or " +
+        "path (instance path -- fetches the script's source from Studio first). " +
+        "Returns the full diagnostic list: errors (SyntaxError/TypeError) and lint " +
+        "warnings. This is the same check write_script/run_luau apply automatically.",
+      inputSchema: {
+        source: z.string().optional(),
+        path: z.string().optional(),
+      },
+    },
+    async ({ source, path }) => {
+      if (!!source === !!path) {
+        return blocked("provide exactly one of source or path");
+      }
+      let code = source;
+      if (path) {
+        const r = await enqueueAndAwait(
+          "get_script_source",
+          chooseContext("auto"),
+          { path },
+          cfg.commandTimeoutMs
+        );
+        if (!r.ok) {
+          return blocked(r.error ?? (r as { err?: string }).err ?? "get_script_source failed");
+        }
+        const src = (r.result as { source?: unknown } | undefined)?.source;
+        if (typeof src !== "string") {
+          return blocked("get_script_source returned no source text");
+        }
+        code = src;
+      }
+      startLuauGate({ luauLspPath: cfg.luauLspPath });
+      await luauGateReady(3000);
+      const res = await analyzeLuau(code as string);
+      if (!res.available) {
+        return blocked(
+          "luau analyzer not available (binary/definitions missing or still downloading; retry shortly)"
+        );
+      }
+      const out = { ok: res.ok, errors: res.errors, warnings: res.warnings };
+      return { content: [{ type: "text" as const, text: JSON.stringify(out, null, 2) }] };
+    }
+  );
+
   server.registerTool(
     "get_status",
     {

@@ -5,6 +5,18 @@ export interface AppConfig {
   portRange: number; // how many ports to try before giving up
   pollHoldMs: number; // 0 = short-poll (return immediately)
   commandTimeoutMs: number;
+  openCloud: OpenCloudConfig;
+  // task 24 validation layer (both fail OPEN: unavailable dump/binary = pass-through)
+  apiValidation: boolean; // Part A: API-dump reflection checks pre-enqueue
+  apiDumpTtlHours: number; // refetch when the cached dump is older / version changed
+  luauGate: boolean; // Part B: luau-lsp analyze gate on Luau source
+  luauLspPath?: string; // absolute path override for the analyzer binary
+}
+
+export interface OpenCloudConfig {
+  apiKey?: string; // ROBLOX_API_KEY env > config.json openCloud.apiKey
+  creatorUserId?: number;
+  creatorGroupId?: number;
 }
 
 // Keep DEFAULT_PORT in sync with plugin/src/Config.luau.
@@ -36,6 +48,18 @@ export function resolveConfig(argv: string[] = process.argv.slice(2)): AppConfig
   const rawRange = fileCfg.portRange ?? 20;
   const portRange = Number.isInteger(rawRange) && rawRange > 0 ? rawRange : 20;
 
+  // Precedence: ROBLOX_API_KEY env > config.json openCloud.apiKey. The key never
+  // has a default -- missing means the upload_asset tool reports "not configured".
+  const fileOpenCloud = fileCfg.openCloud ?? {};
+  const openCloud: OpenCloudConfig = {
+    apiKey: process.env.ROBLOX_API_KEY ?? fileOpenCloud.apiKey,
+    // 0 is never a valid creator id -- coerce falsy to undefined so the shipped
+    // example (both ids 0) reads as "not configured", and filling in just one id
+    // works without deleting the other line.
+    creatorUserId: fileOpenCloud.creatorUserId || undefined,
+    creatorGroupId: fileOpenCloud.creatorGroupId || undefined,
+  };
+
   return {
     port,
     // Auto-pick: try [port, port+portRange) so each terminal's bridge gets a free
@@ -45,6 +69,17 @@ export function resolveConfig(argv: string[] = process.argv.slice(2)): AppConfig
     // concurrent Studio connections (HttpService services few outstanding requests).
     pollHoldMs: fileCfg.pollHoldMs ?? 0,
     commandTimeoutMs: fileCfg.commandTimeoutMs ?? 30000,
+    openCloud,
+    apiValidation: fileCfg.apiValidation !== false,
+    apiDumpTtlHours:
+      typeof fileCfg.apiDumpTtlHours === "number" && fileCfg.apiDumpTtlHours > 0
+        ? fileCfg.apiDumpTtlHours
+        : 168,
+    luauGate: fileCfg.luauGate !== false,
+    luauLspPath:
+      typeof fileCfg.luauLspPath === "string" && fileCfg.luauLspPath
+        ? fileCfg.luauLspPath
+        : undefined,
   };
 }
 

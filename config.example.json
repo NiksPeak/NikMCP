@@ -1,5 +1,15 @@
 {
   "port": 58741,
   "pollHoldMs": 0,
-  "commandTimeoutMs": 30000
+  "commandTimeoutMs": 30000,
+  "apiValidation": true,
+  "apiDumpTtlHours": 168,
+  "luauGate": true,
+  "luauLspPath": "",
+  "openCloud": {
+    "_comment": "Open Cloud (upload_asset). apiKey here is overridden by the ROBLOX_API_KEY env var if set. Set exactly one of creatorUserId/creatorGroupId. Copy this file to config.json (gitignored) and fill in real values -- never commit a real key.",
+    "apiKey": "",
+    "creatorUserId": 0,
+    "creatorGroupId": 0
+  }
 }

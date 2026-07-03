@@ -69,6 +69,8 @@ Settings.TOOLS = {
 	{ name = "search_assets", group = "assets", label = "Search assets (Open Cloud)" },
 	{ name = "list_library", group = "assets", label = "List library (Open Cloud)" },
 	{ name = "upload_decal", group = "assets", label = "Upload decal (Open Cloud)" },
+	{ name = "upload_asset", group = "assets", label = "Upload asset (Open Cloud)" },
+	{ name = "upload_capture", group = "assets", label = "Upload capture (Open Cloud)" },
 	-- experimental (may be unsupported from a plugin; see Phase D)
 	{ name = "capture_viewport", group = "experimental", label = "Capture viewport" },
 	{ name = "playtest_control", group = "experimental", label = "Playtest control" },
@@ -77,6 +79,8 @@ Settings.TOOLS = {
 	{ name = "simulate_mouse_input", group = "experimental", label = "Simulate mouse" },
 	{ name = "character_navigation", group = "experimental", label = "Character navigation" },
 	{ name = "play_animation", group = "experimental", label = "Play animation (server)" },
+	{ name = "client_query", group = "experimental", label = "Client query (F5 play)" },
+	{ name = "verify_playtest", group = "experimental", label = "Verify playtest (composite)" },
 	-- build / scene / view (Task 16)
 	{ name = "export_build", group = "scene", label = "Export build" },
 	{ name = "create_build", group = "scene", label = "Create build" },

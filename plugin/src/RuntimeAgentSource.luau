@@ -148,6 +148,97 @@ LogService.MessageOut:Connect(function(msg, mt)
 	end
 end)
 
+-- Client relay: HttpService is server-only, so the client agent (injected only
+-- in play mode by the edit plugin) talks to us over this RemoteEvent instead.
+-- Created once in the run DataModel; no edit-tree cleanup needed since it only
+-- ever exists there.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local relay = ReplicatedStorage:FindFirstChild("NikMCP_ClientRelay")
+if not relay then
+	relay = Instance.new("RemoteEvent")
+	relay.Name = "NikMCP_ClientRelay"
+	relay.Parent = ReplicatedStorage
+end
+
+-- Bind the relay to whichever player the client agent belongs to (single-player
+-- Studio testing only -- client_query/read_console already assume Players[1]).
+-- Without this, ANY client LocalScript could forge kind="queryResult" (poisoning
+-- an in-flight client_query with a guessed id) or kind="logs" (injecting fake
+-- client console lines) by firing the relay directly.
+local boundPlayer = Players:GetPlayers()[1]
+if not boundPlayer then
+	local bindConn
+	bindConn = Players.PlayerAdded:Connect(function(plr)
+		if not boundPlayer then
+			boundPlayer = plr
+		end
+		bindConn:Disconnect()
+	end)
+end
+
+-- Separate ring for client-side console lines (fed by the client agent's
+-- batched "logs" fires); same cap/shape as consoleRing.
+local CLIENT_RING_CAP = 500
+local clientRing = {}
+
+-- Flood protection: cap accepted client log entries per second; beyond that
+-- drop and warn ONCE per flood episode (not once per dropped entry).
+local FLOOD_PER_SEC = 100
+local floodSecond = 0
+local floodCount = 0
+local floodWarned = false
+
+-- client_query correlation table: id -> { done, result }, filled by the
+-- "queryResult" branch below and polled (task.wait) by the client_query command.
+local pendingQueries = {}
+local nextQueryId = 0
+
+relay.OnServerEvent:Connect(function(_player, kind, a, b)
+	if not boundPlayer then
+		boundPlayer = _player
+	end
+	if _player ~= boundPlayer then
+		return -- forged event from a non-bound client -- ignore
+	end
+	if kind == "logs" then
+		if type(a) ~= "table" then
+			return
+		end
+		local nowSec = os.time()
+		if nowSec ~= floodSecond then
+			floodSecond = nowSec
+			floodCount = 0
+			floodWarned = false
+		end
+		for _, e in ipairs(a) do
+			if floodCount >= FLOOD_PER_SEC then
+				if not floodWarned then
+					warn("[MCP agent] client log flood: dropping entries beyond " .. FLOOD_PER_SEC .. "/sec")
+					floodWarned = true
+				end
+				break
+			end
+			if type(e) == "table" then
+				floodCount += 1
+				table.insert(clientRing, e)
+				if #clientRing > CLIENT_RING_CAP then
+					table.remove(clientRing, 1)
+				end
+			end
+		end
+	elseif kind == "queryResult" then
+		if type(a) ~= "number" then
+			return
+		end
+		local slot = pendingQueries[a]
+		if slot then
+			slot.result = b
+			slot.done = true
+		end
+	end
+end)
+
 local function runLuau(code)
 	local buffer = {}
 	local function capture(...)
@@ -203,12 +294,55 @@ local function execute(cmd)
 		end
 		return { ok = true, result = walk(root, 0) }
 	elseif cmd.type == "read_console" then
+		local ring = (p.context == "client") and clientRing or consoleRing
 		local count = p.count or 100
 		local picked = {}
-		for i = math.max(1, #consoleRing - count + 1), #consoleRing do
-			table.insert(picked, consoleRing[i])
+		for i = math.max(1, #ring - count + 1), #ring do
+			table.insert(picked, ring[i])
 		end
-		return { ok = true, result = { lines = picked, total = #consoleRing } }
+		return { ok = true, result = { lines = picked, total = #ring } }
+	elseif cmd.type == "get_playtest_output" then
+		-- Drain (default) or peek both rings; feeds F5 read parity for get_playtest_output.
+		local drain = p.drain ~= false
+		local lines = consoleRing
+		local clientLines = clientRing
+		if drain then
+			consoleRing = {}
+			clientRing = {}
+		end
+		local out = { lines = lines, client = clientLines, count = #lines, capturing = true }
+		if #game:GetService("Players"):GetPlayers() == 0 then
+			out.note = "run mode has no client"
+		end
+		return { ok = true, result = out }
+	elseif cmd.type == "client_query" then
+		local Players = game:GetService("Players")
+		local player = Players:GetPlayers()[1]
+		if not player or not relay then
+			return { ok = false, err = "client agent not connected" }
+		end
+		nextQueryId += 1
+		local id = nextQueryId
+		local slot = { done = false, result = nil }
+		pendingQueries[id] = slot
+		local sent = pcall(function()
+			relay:FireClient(player, "query", id, p.name, p.args)
+		end)
+		if not sent or not relay.Parent then
+			pendingQueries[id] = nil
+			return { ok = false, err = "client agent not connected" }
+		end
+		-- Poll (not block) for the queryResult; never hang past 5s.
+		local waited = 0
+		while not slot.done and waited < 5 do
+			task.wait(0.05)
+			waited += 0.05
+		end
+		pendingQueries[id] = nil
+		if not slot.done then
+			return { ok = false, err = "client agent not connected (query timeout)" }
+		end
+		return { ok = true, result = slot.result }
 	elseif cmd.type == "search_instances" then
 		local root = resolve(p.root or "game") or game
 		local query = p.query and string.lower(tostring(p.query)) or nil

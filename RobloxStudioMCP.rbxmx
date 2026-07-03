@@ -814,6 +814,8 @@ Settings.TOOLS = {
 	{ name = "search_assets", group = "assets", label = "Search assets (Open Cloud)" },
 	{ name = "list_library", group = "assets", label = "List library (Open Cloud)" },
 	{ name = "upload_decal", group = "assets", label = "Upload decal (Open Cloud)" },
+	{ name = "upload_asset", group = "assets", label = "Upload asset (Open Cloud)" },
+	{ name = "upload_capture", group = "assets", label = "Upload capture (Open Cloud)" },
 	-- experimental (may be unsupported from a plugin; see Phase D)
 	{ name = "capture_viewport", group = "experimental", label = "Capture viewport" },
 	{ name = "playtest_control", group = "experimental", label = "Playtest control" },
@@ -822,6 +824,8 @@ Settings.TOOLS = {
 	{ name = "simulate_mouse_input", group = "experimental", label = "Simulate mouse" },
 	{ name = "character_navigation", group = "experimental", label = "Character navigation" },
 	{ name = "play_animation", group = "experimental", label = "Play animation (server)" },
+	{ name = "client_query", group = "experimental", label = "Client query (F5 play)" },
+	{ name = "verify_playtest", group = "experimental", label = "Verify playtest (composite)" },
 	-- build / scene / view (Task 16)
 	{ name = "export_build", group = "scene", label = "Export build" },
 	{ name = "create_build", group = "scene", label = "Create build" },
@@ -1015,7 +1019,9 @@ local AssetService = game:GetService("AssetService")
 local CaptureService = game:GetService("CaptureService")
 local MarketplaceService = game:GetService("MarketplaceService")
 local Stats = game:GetService("Stats")
+local StarterPlayer = game:GetService("StarterPlayer")
 local Serializer = require(script.Parent.Serializer)
+local ClientAgentSource = require(script.Parent.ClientAgentSource)
 
 local Executor = {}
 
@@ -1091,6 +1097,7 @@ local playtestCapturing = false
 -- get_playtest_output and on any live server-context poll.
 local playtestStartedAt: number? = nil
 local playtestLastActivity: number = 0
+local playtestMode: string? = nil
 local function pushPlaytest(text: string, level: string, t: number)
 	if not playtestCapturing then
 		return
@@ -1821,6 +1828,47 @@ local function cleanupPlaytestStopListener()
 	end
 end
 
+-- Client agent (play mode only): HttpService is server-only, so a LocalScript
+-- cannot reach the bridge directly -- it relays through the server agent
+-- (RuntimeAgentSource) instead. Injected BEFORE ExecutePlayModeAsync so it
+-- travels into the run DataModel; run mode never gets this (no client there).
+local CLIENT_AGENT_NAME = "NikMCP_ClientAgent"
+
+local function injectClientAgent()
+	local starterPlayerScripts = StarterPlayer:FindFirstChild("StarterPlayerScripts")
+	if not starterPlayerScripts then
+		return
+	end
+	if starterPlayerScripts:FindFirstChild(CLIENT_AGENT_NAME) then
+		return -- never two: name-check before parenting
+	end
+	local agent = Instance.new("LocalScript")
+	agent.Name = CLIENT_AGENT_NAME
+	agent.Archivable = true
+	local seOk = pcall(function()
+		ScriptEditorService:UpdateSourceAsync(agent, function()
+			return ClientAgentSource
+		end)
+	end)
+	if not seOk then
+		agent.Source = ClientAgentSource
+	end
+	agent.Parent = starterPlayerScripts
+end
+
+local function cleanupClientAgent()
+	local starterPlayerScripts = StarterPlayer:FindFirstChild("StarterPlayerScripts")
+	if not starterPlayerScripts then
+		return
+	end
+	local existing = starterPlayerScripts:FindFirstChild(CLIENT_AGENT_NAME)
+	if existing then
+		pcall(function()
+			existing:Destroy()
+		end)
+	end
+end
+
 local function playtestControl(p: any): any
 	local action = tostring(p.action)
 	local mode = p.mode or "run"
@@ -1833,12 +1881,17 @@ local function playtestControl(p: any): any
 		end
 		playtestRing = {}
 		playtestCapturing = true
+		playtestMode = mode
 		if p.numPlayers ~= nil then
 			pcall(function()
 				TestService.NumberOfPlayers = math.clamp(tonumber(p.numPlayers) or 1, 1, 8)
 			end)
 		end
 		injectPlaytestStopListener()
+		if mode == "play" then
+			-- Play mode only -- run mode has no client, period.
+			injectClientAgent()
+		end
 		local launchErr: string? = nil
 		task.spawn(function()
 			local ok, err = pcall(function()
@@ -1853,13 +1906,17 @@ local function playtestControl(p: any): any
 			-- Execute*ModeAsync returns only when the playtest ENDS.
 			playtestCapturing = false
 			playtestStartedAt = nil
+			playtestMode = nil
 			cleanupPlaytestStopListener()
+			pcall(cleanupClientAgent)
 		end)
 		-- Brief wait to surface an immediate launch failure before reporting.
 		task.wait(0.3)
 		if launchErr ~= nil then
 			playtestCapturing = false
+			playtestMode = nil
 			cleanupPlaytestStopListener()
+			pcall(cleanupClientAgent)
 			local fn = (mode == "play") and "ExecutePlayModeAsync" or "ExecuteRunModeAsync"
 			return { ok = false, err = "StudioTestService:" .. fn .. " failed: " .. launchErr }
 		end
@@ -1881,7 +1938,9 @@ local function playtestControl(p: any): any
 		end)
 		playtestCapturing = false
 		playtestStartedAt = nil
+		playtestMode = nil
 		cleanupPlaytestStopListener()
+		pcall(cleanupClientAgent)
 		return {
 			ok = true,
 			output = "sent stop (warn " .. PLAYTEST_STOP_SIGNAL
@@ -1898,7 +1957,11 @@ local function getPlaytestOutput(p: any): any
 	if p.drain ~= false then
 		playtestRing = {}
 	end
-	return { ok = true, result = { lines = lines, capturing = playtestCapturing, count = #lines } }
+	local result: { [string]: any } = { lines = lines, capturing = playtestCapturing, count = #lines, client = {} }
+	if playtestMode ~= "play" then
+		result.note = "run mode has no client"
+	end
+	return { ok = true, result = result }
 end
 
 -- Playtest lifecycle status (feeds the ungated get_playtest_status tool). The
@@ -1922,7 +1985,7 @@ local function getPlaytestStatus(): any
 		ok = true,
 		result = {
 			running = simRunning,
-			mode = playtestStartedAt ~= nil and "run" or nil,
+			mode = playtestMode,
 			startedAtUnix = playtestStartedAt,
 			durationSec = duration,
 			players = players,
@@ -5635,6 +5698,97 @@ LogService.MessageOut:Connect(function(msg, mt)
 	end
 end)
 
+-- Client relay: HttpService is server-only, so the client agent (injected only
+-- in play mode by the edit plugin) talks to us over this RemoteEvent instead.
+-- Created once in the run DataModel; no edit-tree cleanup needed since it only
+-- ever exists there.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local relay = ReplicatedStorage:FindFirstChild("NikMCP_ClientRelay")
+if not relay then
+	relay = Instance.new("RemoteEvent")
+	relay.Name = "NikMCP_ClientRelay"
+	relay.Parent = ReplicatedStorage
+end
+
+-- Bind the relay to whichever player the client agent belongs to (single-player
+-- Studio testing only -- client_query/read_console already assume Players[1]).
+-- Without this, ANY client LocalScript could forge kind="queryResult" (poisoning
+-- an in-flight client_query with a guessed id) or kind="logs" (injecting fake
+-- client console lines) by firing the relay directly.
+local boundPlayer = Players:GetPlayers()[1]
+if not boundPlayer then
+	local bindConn
+	bindConn = Players.PlayerAdded:Connect(function(plr)
+		if not boundPlayer then
+			boundPlayer = plr
+		end
+		bindConn:Disconnect()
+	end)
+end
+
+-- Separate ring for client-side console lines (fed by the client agent's
+-- batched "logs" fires); same cap/shape as consoleRing.
+local CLIENT_RING_CAP = 500
+local clientRing = {}
+
+-- Flood protection: cap accepted client log entries per second; beyond that
+-- drop and warn ONCE per flood episode (not once per dropped entry).
+local FLOOD_PER_SEC = 100
+local floodSecond = 0
+local floodCount = 0
+local floodWarned = false
+
+-- client_query correlation table: id -> { done, result }, filled by the
+-- "queryResult" branch below and polled (task.wait) by the client_query command.
+local pendingQueries = {}
+local nextQueryId = 0
+
+relay.OnServerEvent:Connect(function(_player, kind, a, b)
+	if not boundPlayer then
+		boundPlayer = _player
+	end
+	if _player ~= boundPlayer then
+		return -- forged event from a non-bound client -- ignore
+	end
+	if kind == "logs" then
+		if type(a) ~= "table" then
+			return
+		end
+		local nowSec = os.time()
+		if nowSec ~= floodSecond then
+			floodSecond = nowSec
+			floodCount = 0
+			floodWarned = false
+		end
+		for _, e in ipairs(a) do
+			if floodCount >= FLOOD_PER_SEC then
+				if not floodWarned then
+					warn("[MCP agent] client log flood: dropping entries beyond " .. FLOOD_PER_SEC .. "/sec")
+					floodWarned = true
+				end
+				break
+			end
+			if type(e) == "table" then
+				floodCount += 1
+				table.insert(clientRing, e)
+				if #clientRing > CLIENT_RING_CAP then
+					table.remove(clientRing, 1)
+				end
+			end
+		end
+	elseif kind == "queryResult" then
+		if type(a) ~= "number" then
+			return
+		end
+		local slot = pendingQueries[a]
+		if slot then
+			slot.result = b
+			slot.done = true
+		end
+	end
+end)
+
 local function runLuau(code)
 	local buffer = {}
 	local function capture(...)
@@ -5690,12 +5844,55 @@ local function execute(cmd)
 		end
 		return { ok = true, result = walk(root, 0) }
 	elseif cmd.type == "read_console" then
+		local ring = (p.context == "client") and clientRing or consoleRing
 		local count = p.count or 100
 		local picked = {}
-		for i = math.max(1, #consoleRing - count + 1), #consoleRing do
-			table.insert(picked, consoleRing[i])
+		for i = math.max(1, #ring - count + 1), #ring do
+			table.insert(picked, ring[i])
 		end
-		return { ok = true, result = { lines = picked, total = #consoleRing } }
+		return { ok = true, result = { lines = picked, total = #ring } }
+	elseif cmd.type == "get_playtest_output" then
+		-- Drain (default) or peek both rings; feeds F5 read parity for get_playtest_output.
+		local drain = p.drain ~= false
+		local lines = consoleRing
+		local clientLines = clientRing
+		if drain then
+			consoleRing = {}
+			clientRing = {}
+		end
+		local out = { lines = lines, client = clientLines, count = #lines, capturing = true }
+		if #game:GetService("Players"):GetPlayers() == 0 then
+			out.note = "run mode has no client"
+		end
+		return { ok = true, result = out }
+	elseif cmd.type == "client_query" then
+		local Players = game:GetService("Players")
+		local player = Players:GetPlayers()[1]
+		if not player or not relay then
+			return { ok = false, err = "client agent not connected" }
+		end
+		nextQueryId += 1
+		local id = nextQueryId
+		local slot = { done = false, result = nil }
+		pendingQueries[id] = slot
+		local sent = pcall(function()
+			relay:FireClient(player, "query", id, p.name, p.args)
+		end)
+		if not sent or not relay.Parent then
+			pendingQueries[id] = nil
+			return { ok = false, err = "client agent not connected" }
+		end
+		-- Poll (not block) for the queryResult; never hang past 5s.
+		local waited = 0
+		while not slot.done and waited < 5 do
+			task.wait(0.05)
+			waited += 0.05
+		end
+		pendingQueries[id] = nil
+		if not slot.done then
+			return { ok = false, err = "client agent not connected (query timeout)" }
+		end
+		return { ok = true, result = slot.result }
 	elseif cmd.type == "search_instances" then
 		local root = resolve(p.root or "game") or game
 		local query = p.query and string.lower(tostring(p.query)) or nil
@@ -6220,6 +6417,185 @@ if base then
 else
 	print("[MCP agent] scheduler armed; probing for bridge...")
 end
+]==]
+
+return SOURCE
+]]></ProtectedString>
+   </Properties>
+  </Item>
+  <Item class="ModuleScript" referent="RBX7">
+   <Properties>
+    <string name="Name">ClientAgentSource</string>
+    <ProtectedString name="Source"><![CDATA[-- Returns the client-agent source as a string. Written into a LocalScript
+-- named NikMCP_ClientAgent, injected by the edit plugin (Executor.luau
+-- playtestControl) into StarterPlayer.StarterPlayerScripts BEFORE
+-- ExecutePlayModeAsync -- play mode ONLY, never run mode (run has no client).
+-- HttpService is server-only, so this agent never touches the bridge directly:
+-- it talks to the server agent (RuntimeAgentSource) over one RemoteEvent,
+-- NikMCP_ClientRelay, which the server agent creates in ReplicatedStorage.
+-- No {{PORT}} token needed here -- there is no HTTP on this side.
+local SOURCE = [==[
+--!nonstrict
+-- Roblox Studio MCP - client agent. Auto-injected by the Studio MCP plugin,
+-- play mode only. Does nothing unless a client is actually running.
+if not game:GetService("RunService"):IsRunning() then
+	return
+end
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local LogService = game:GetService("LogService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local relay = ReplicatedStorage:WaitForChild("NikMCP_ClientRelay", 30)
+if not relay then
+	-- Server agent never created the relay (bridge/plugin not active); nothing
+	-- to do on the client side.
+	return
+end
+
+-- Compact serializer (only the tagged shapes client_query needs); matches the
+-- server agent's conventions so the bridge/tooling sees one consistent shape.
+local function serialize(v)
+	local t = typeof(v)
+	if t == "Vector3" then
+		return { __t = "Vector3", x = v.X, y = v.Y, z = v.Z }
+	elseif t == "CFrame" then
+		return { __t = "CFrame", comps = { v:GetComponents() } }
+	elseif t == "Color3" then
+		return { __t = "Color3", r = v.R, g = v.G, b = v.B }
+	end
+	return v
+end
+
+-- Ring buffer of console lines, batch-flushed to the server agent at most
+-- every 0.5s (task-19 lesson: no chatty per-frame fires). Capped so a burst
+-- between flushes can't grow unbounded.
+local PENDING_CAP = 500
+local pending = {}
+LogService.MessageOut:Connect(function(msg, mt)
+	table.insert(pending, { text = tostring(msg), level = mt.Name, t = os.time() })
+	if #pending > PENDING_CAP then
+		table.remove(pending, 1)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(0.5)
+		if #pending > 0 then
+			local batch = pending
+			pending = {}
+			pcall(function()
+				relay:FireServer("logs", batch)
+			end)
+		end
+	end
+end)
+
+-- == Fixed named queries (loadstring is server-only; arbitrary client eval is
+-- NOT supported -- these are the only introspection points the client offers).
+
+local function queryFps()
+	local samples = {}
+	local conn
+	conn = RunService.RenderStepped:Connect(function(dt)
+		if dt > 0 then
+			table.insert(samples, 1 / dt)
+		end
+	end)
+	local waited = 0
+	while #samples < 30 and waited < 3 do
+		task.wait(0.05)
+		waited += 0.05
+	end
+	conn:Disconnect()
+	local sum = 0
+	for _, v in ipairs(samples) do
+		sum += v
+	end
+	return { fps = (#samples > 0) and (sum / #samples) or 0 }
+end
+
+local function queryCamera()
+	local cam = workspace.CurrentCamera
+	if not cam then
+		return { err = "no CurrentCamera" }
+	end
+	return { cframe = serialize(cam.CFrame), fieldOfView = cam.FieldOfView }
+end
+
+local function guiWalk(inst, depth, maxDepth)
+	local node = { name = inst.Name, className = inst.ClassName }
+	if depth < maxDepth then
+		local kids = {}
+		for _, c in ipairs(inst:GetChildren()) do
+			table.insert(kids, guiWalk(c, depth + 1, maxDepth))
+		end
+		if #kids > 0 then
+			node.children = kids
+		end
+	end
+	return node
+end
+
+local function queryGuiTree(args)
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	if not playerGui then
+		return { err = "no PlayerGui" }
+	end
+	local maxDepth = (type(args) == "table" and type(args.maxDepth) == "number") and args.maxDepth or 4
+	return guiWalk(playerGui, 0, maxDepth)
+end
+
+local function queryLocalPlayer()
+	local char = LocalPlayer.Character
+	local position, humanoidState, health = nil, nil, nil
+	if char then
+		local hrp = char:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			position = serialize(hrp.Position)
+		end
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			humanoidState = tostring(hum:GetState())
+			health = hum.Health
+		end
+	end
+	return { hasCharacter = char ~= nil, position = position, humanoidState = humanoidState, health = health }
+end
+
+local function queryPing()
+	return { ping = LocalPlayer:GetNetworkPing() }
+end
+
+relay.OnClientEvent:Connect(function(kind, id, name, args)
+	if kind ~= "query" then
+		return
+	end
+	local ok, result = pcall(function()
+		if name == "fps" then
+			return queryFps()
+		elseif name == "camera" then
+			return queryCamera()
+		elseif name == "gui_tree" then
+			return queryGuiTree(args)
+		elseif name == "local_player" then
+			return queryLocalPlayer()
+		elseif name == "ping" then
+			return queryPing()
+		else
+			return { err = "unknown query '" .. tostring(name) .. "'; valid: fps, camera, gui_tree, local_player, ping" }
+		end
+	end)
+	if not ok then
+		result = { err = tostring(result) }
+	end
+	pcall(function()
+		relay:FireServer("queryResult", id, result)
+	end)
+end)
 ]==]
 
 return SOURCE

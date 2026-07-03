@@ -1,5 +1,7 @@
 # Roblox Studio MCP (dual-context)
 
+**Version 0.1.3** — July 2, 2026.
+
 A local AI-to-Studio bridge. An MCP client (Claude Desktop / Claude Code / Cursor) calls tools
 like `run_luau` or `get_instance_tree`; the call travels **MCP client → (stdio) → Node MCP
 server → in-process queue → Express bridge → (localhost HTTP) → Roblox Studio → DataModel**,
@@ -37,7 +39,7 @@ MCP client ──stdio──▶ Node process ─┬─ MCP server (stdio)
 | `src/bridge.ts` | Express `/poll` `/response` `/heartbeat` `/settings`, context-aware, optional auth |
 | `src/settings.ts` | In-memory tool gating + flags (plugin is source of truth; server enforces) |
 | `src/mcp-server.ts` | MCP server + tools (every `tools/call` gated by settings) |
-| `plugin/src/*.luau` | Edit plugin: `init.server`, `Config`, `Settings`, `Serializer`, `Executor`, `StatusWidget`, `RuntimeAgentSource` |
+| `plugin/src/*.luau` | Edit plugin: `init.server`, `Config`, `Settings`, `Serializer`, `Executor`, `StatusWidget`, `RuntimeAgentSource`, `ClientAgentSource` |
 | `plugin/plugin.project.json` | Rojo project (build target) |
 | `scripts/install-plugin.{sh,ps1}` | Build the `.rbxmx` into the local Plugins folder |
 
@@ -51,7 +53,7 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 |------|------|---------|-------|
 | `run_luau` | write | auto / edit / server | print output + returned value (serialized) |
 | `get_instance_tree` | read | auto / edit / server | depth-limited tree from a dot path |
-| `read_console` | read | auto / edit / server | recent Output via `LogService` history + live ring buffer; `count`, `levelFilter` |
+| `read_console` | read | auto / edit / server / **client** | recent Output via `LogService` history + live ring buffer; `count`, `levelFilter`; `context="client"` drains the F5 **play-mode** client's ring, relayed to the server agent over `NikMCP_ClientRelay` |
 | `get_selection` | read | edit | current `Selection:Get()` as paths |
 | `search_instances` | read | auto / edit / server | by name substring / `className` / tag under a root |
 | `get_script_source` | read | auto / edit / server | `GetEditorSource`, fallback `.Source` |
@@ -87,7 +89,7 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `smart_duplicate` | write | auto / edit / server | grid/line clone layout (`columns?`, `spacing?`) |
 | `mass_get_property` | read | auto / edit / server | one property across `paths[]` |
 | `mass_set_property` | write | auto / edit / server | alias of `bulk_set_property` |
-| `get_class_info` | read | auto / edit / server | best-effort (creatable? + applicable curated props); **no full reflection** (no API dump bundled) |
+| `get_class_info` | read | **Node-side** (no Studio round-trip) | **real reflection from the official Roblox API dump**: superclass, tags, creatable?, and paginated members (~50/page via `cursor`) with `memberType` filter, `includeInherited`, valueType/security/tags + declaring class; unknown class returns a did-you-mean |
 | `get_services` | read | auto / edit / server | loaded services (children of `game`) |
 | `get_descendants` | read | auto / edit / server | flat descendant paths (`maxDepth?`, cap 5000) |
 | `get_connected_instances` | read | auto / edit / server | `GetConnectedParts(true)` + object props |
@@ -103,16 +105,21 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `search_materials` | read | auto / edit / server | `Enum.Material` names (`query?`) |
 | `search_assets` | read | — | **unsupported from a plugin** (needs Open Cloud / web catalog API); clear error |
 | `list_library` | read | — | **unsupported from a plugin** (needs Open Cloud); clear error |
-| `upload_decal` | write | — | **unsupported from a plugin** (needs Open Cloud Assets API key); clear error |
+| `upload_decal` | write | — | still unsupported directly (no decal-specific Open Cloud endpoint) — **use `upload_asset`** (`assetType:"Image"`/`"Decal"`) instead, now supported via Open Cloud; see below |
+| `upload_asset` | write | — (Node-side, Open Cloud) | uploads bytes (`filePath` or base64 `content`) via the Open Cloud Assets API: `{ assetType: Image\|Decal\|Audio\|Model, filePath?, content?, contentType?, displayName, description?, applyTo?: {path, property} }` -> `{ assetId, assetUri: "rbxassetid://<id>", moderationState, applied? }`; 20 MB/file cap; `applyTo` calls the existing `set_property` after upload; honest `"not configured"` without a key (see **Open Cloud setup** below) |
+| `upload_capture` | write | edit (capture) + Node (upload) | composite: `capture_viewport` -> `upload_asset assetType:"Image"` in one call — `{ displayName, applyTo? }`, screenshot straight to `rbxassetid://` |
 | `capture_viewport` | experimental | edit (pinned) | **real PNG** via `CaptureService` + EditableImage; plugin sends raw RGBA, Node encodes the PNG. **Edit mode only, viewport must be visible & rendering** (engine limit -- it reads the rendered screen; playtest-view capture is **not** supported, same constraint as boshyxd). Needs Game Settings > Security > **Allow Mesh / Image APIs** (else a clear enable-this message) |
 | `playtest_control` | experimental | edit | start/stop the in-Studio sim (`mode='run'` → `RunService:Run()/Stop()`); `mode='play'` (Play Solo / players) unsupported |
-| `get_playtest_output` | experimental | edit | drain/peek the playtest log buffer captured since start |
+| `get_playtest_output` | experimental | edit / server | drain/peek the playtest log buffer; **during an active F5 playtest, reads the live server agent's ring** (plus a `client` array when the client relay has entries) instead of the stale edit-time buffer; Run mode's `client` is always `[]` with a `"run mode has no client"` note |
 | `simulate_keyboard_input` / `simulate_mouse_input` | experimental | — | `VirtualInputManager` is **RobloxScriptSecurity-restricted**; returns a clear reason when blocked |
 | `character_navigation` | experimental | server | `Humanoid:MoveTo(position)`; needs a running playtest (use `context:"server"`) |
 | `create_keyframe_sequence` | write | edit only | build a `KeyframeSequence` (Keyframe/Pose tree) from JSON for **manual upload** — collected in a shared folder (default `ServerStorage/GeneratedAnimations`, or under `parentPath`/`folderName`) so you can right-click → **Save to Roblox** or open it in the **Animation Editor**. One undo. Poses matched to a rig by part name at **playback** time. `registerPreview` returns a **temporary, session-only** `tempAnimationId` for in-Studio preview only (not a permanent `AnimationId`) |
 | `play_animation` | write | **server only** | play an `AnimationId` on a live rig's `Animator` during an F5 playtest (`target` = rig path or `"player"`). Returns `AnimationTrack.Length`. Under `context:"edit"` returns a specific "requires a running playtest" error. Surfaces the real engine error (nil character, no Animator, asset not loaded) |
+| `client_query` | read | **client (F5 play only)** | fixed read-only queries relayed from the live playtest client over `NikMCP_ClientRelay`: `fps` (RenderStepped avg), `camera` (CFrame + FOV), `gui_tree` (`maxDepth?`), `local_player` (character/HRP/Humanoid state), `ping`; unknown `name` lists the valid set; 5s timeout returns `"client agent not connected"` (Run mode, or no client yet) |
+| `verify_playtest` | write | edit (drives a playtest) | composite self-correcting loop: start playtest -> optional `setupScript` -> `assertScript` (**must** return `{ passed, failures }`) -> optional `clientChecks` (`client_query` calls, play mode only; `skipped:"no client"` in run mode) -> drain server + client errors -> **always stops the playtest it started** (unless `keepRunning`), even on timeout/throw. `{ mode, setupScript?, assertScript, clientChecks?, timeoutSec?, keepRunning? }` -> `{ passed, failures, checks, serverErrors, clientErrors, durationSec, stopped }` |
 | `create_sound` | write | edit | convenience wrapper over `create_instance`: a `Sound` under `parentPath` with validated props (coerced `soundId`, volume clamped 0-10, rollOff enum). One undo. `playOnCreate` previews via `:Play()` |
 | `set_lighting` | write | edit | convenience over `set_properties` on `Lighting` + optional child effects (Atmosphere/Sky/Bloom/ColorCorrection/DepthOfField/SunRays, one per class). Tagged Color3/Vector3 via serializer; rejects unknown property/effect names. One undo |
+| `analyze_script` | meta | Node-side (`source`) / one round-trip (`path`) | run `luau-lsp analyze` (with Roblox global type definitions) on Luau source: pass `source` (no Studio needed) **or** `path` (fetches the script's source from Studio first) — exactly one. Returns `{ ok, errors, warnings }`; the same check `write_script`/`run_luau` apply automatically |
 | `get_status` | meta | — | `{ edit, server }` connectivity (ungated) |
 
 `context: "auto"` (the default) targets the **running F5 server** when it's alive, else the editor.
@@ -123,6 +130,49 @@ console, search/list, place info, properties, attributes, descendants, services,
 `search_by_property`) plus `character_navigation`, and returns a clean "agent does not support
 command" error for edit-only ops (selection, script editing, undo, asset insertion, tagging) — those
 are edit-time operations anyway. Pass `context: "edit"` to target the editor explicitly.
+
+## Validation layer (task 24)
+
+Two Node-side gates run **before** a command is enqueued to the bridge, so a rejection costs
+zero Studio round-trips. Both fail **open**: if the dump or the analyzer binary is unavailable,
+every tool behaves exactly as before (one stderr notice per gate per server lifetime), and MCP
+stdio init **never** waits on a network fetch — loading is lazy + background, and the first
+validated call waits at most ~3s before passing through.
+
+**Gate A — API-dump reflection** (`apiValidation`, default `true`): validates against the
+official Roblox `Full-API-Dump.json` (fetched for the current Studio version, mirrored fallback).
+
+- `create_instance` / `mass_create_objects`: className must exist and be creatable
+  (`NotCreatable`/`Service` rejected); property names/types checked against the actual class.
+- `set_property` / `bulk_set_property` / `mass_set_property` / `set_properties`: the instance's
+  **class is unknown Node-side** (only a path), so the property name must exist on *some* class
+  (kills the `Trasparency` class of failure, with a did-you-mean), must be writable somewhere,
+  and unambiguous primitive/enum types are checked (enum typos get a did-you-mean). Ambiguous or
+  complex values pass through — **Studio's Executor stays the final authority**.
+
+**Gate B — Luau analyze** (`luauGate`, default `true`): full Luau chunks (`run_luau` code,
+`write_script` source, `verify_playtest` setup/assert scripts) are run through
+`luau-lsp analyze` (pinned release, with `globalTypes.d.luau` so `game`/`task`/`Instance`
+resolve). Syntax/type errors (including the leading-paren ambiguity class) reject with
+`line:col Kind: message` + a source excerpt; lint warnings ride along on success as a
+`luau warnings:` block. Line-fragment tools (`edit_script_lines`, `insert_script_lines`,
+`find_and_replace_in_scripts`) are **not** gated — fragments are not standalone chunks and
+would false-positive. `skipAnalysis: true` is the escape hatch if the pinned analyzer ever
+disagrees with current Studio.
+
+**Cache**: everything lives in `~/.nikmcp/` (machine-level, survives `npx nikmcp@latest`):
+`api-dump.json` + `api-dump.meta.json`, `globalTypes.d.luau`, `.luaurc` (nonstrict default —
+a `--!strict` directive in your source still wins), `bin/luau-lsp(.exe)` (auto-downloaded,
+pinned release).
+
+**Config keys** (`config.json`, see `config.example.json`):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `apiValidation` | `true` | Gate A on/off |
+| `apiDumpTtlHours` | `168` | refetch the dump when older, or when the Studio version changed |
+| `luauGate` | `true` | Gate B on/off |
+| `luauLspPath` | — | absolute path override for the analyzer binary (else cache `bin/`, else `PATH`, else auto-download) |
 
 ## Settings
 
@@ -215,6 +265,29 @@ own build so you test uncommitted changes:
   another tab). Capture reads the rendered screen, so playtest-view capture isn't supported — this is a
   Roblox engine limit, not a NikMCP one (boshyxd's `capture_screenshot` has the same constraint).
 
+## Open Cloud setup
+
+`upload_asset` / `upload_capture` publish bytes to Roblox via the **Open Cloud Assets API** —
+this happens entirely Node-side (`src/open-cloud.ts`); the API key never reaches the plugin, the
+bridge wire, or a log line.
+
+1. On the [Creator Dashboard](https://creator.roblox.com) go to **Open Cloud → API Keys** and
+   create a key.
+2. Grant it the **Assets API** `asset:read` + `asset:write` scopes, scoped to the creator
+   (your user, or a group you belong to) you'll upload as.
+3. Configure the key — precedence is **`ROBLOX_API_KEY` env var > `config.json` `openCloud.apiKey`**:
+   ```bash
+   export ROBLOX_API_KEY=...   # or set it in config.json instead
+   ```
+4. Set exactly one of `openCloud.creatorUserId` / `openCloud.creatorGroupId` in `config.json`
+   (whichever the key was scoped to). Copy `config.example.json` to `config.json` (gitignored —
+   never commit a real key) and fill in the real values.
+5. Limits: **20 MB per file**, rejected pre-flight with the actual size rather than waiting on a
+   4xx. Missing key/creator → the tool returns an honest `"not configured: set ROBLOX_API_KEY (or
+   openCloud.apiKey) and openCloud.creatorUserId/GroupId"` — it never fakes an upload.
+6. Moderation is surfaced **verbatim**: a still-pending or rejected asset comes back with its real
+   `moderationState` and `applied:false` — never claimed usable before Roblox says so.
+
 ## F5 playtest flow
 
 1. In **edit mode**, click **Enable Playtest** (or call `enable_playtest_agent` once). The
@@ -233,9 +306,16 @@ own build so you test uncommitted changes:
 edit plugin is already bound to, so `run_luau` reaches it with zero setup. Only **Play / Play
 Solo (F5)** needs the runtime agent.
 
-**Client-context limitation (honest):** the agent runs in the **server** DataModel. Arbitrary
-Luau on the **client** side of a playtest is out of scope — `loadstring` doesn't work in
-client/LocalScript context. A client agent would be a separate, narrower feature.
+**Client-context limitation (honest, updated):** client **output** is now readable in F5 **play**
+mode — a `NikMCP_ClientAgent` LocalScript (injected at `playtest_control` start, play mode only,
+removed on stop) hooks `LogService` and relays lines to the server agent over a
+`NikMCP_ClientRelay` RemoteEvent; read them with `read_console context="client"` or
+`get_playtest_output`. Fixed client introspection (`fps`, `camera`, `gui_tree`, `local_player`,
+`ping`) is exposed via `client_query`, also relayed the same way. Arbitrary client-side
+`run_luau context="client"` **remains impossible** — `loadstring` is server-only, and no amount of
+relaying changes that; calling it returns `"not supported: loadstring is server-only; use
+client_query"`. **Run mode has no client** (it never injects the LocalScript), so client reads in
+Run mode return an honest empty result with a `"run mode has no client"` note, not an error.
 
 ## Ports
 Default base is **58741** — boshyxd `robloxstudio-mcp`'s port — so NikMCP is a drop-in
