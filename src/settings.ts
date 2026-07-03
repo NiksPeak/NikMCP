@@ -85,6 +85,13 @@ export const WRITE_TOOLS = new Set<string>([
   "upload_capture",
   // task 25 (import mutates scripts; export_scripts/sync_status are reads)
   "import_scripts",
+  // task 26 RoCreate (mutating/sensitive; scan/status/list are reads)
+  "rocreate_set_credentials",
+  "rocreate_reupload_assets",
+  "rocreate_apply_asset_map",
+  "rocreate_reupload_devproducts",
+  "rocreate_reupload_gamepasses",
+  "rocreate_rewrite_monetization_module",
 ]);
 
 const DEFAULTS: Settings = {

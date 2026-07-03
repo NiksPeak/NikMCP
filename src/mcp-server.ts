@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { extname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -40,6 +40,39 @@ import {
   type ManifestEntry,
   type StatusEntry,
 } from "./sync.js";
+import {
+  isUnlocked,
+  useCookie,
+  lock as rocreateLock,
+  setCookieSecret,
+  hasCookieSecret,
+  markCookieExpired,
+  secretsStatus,
+} from "./rocreate-secrets.js";
+import {
+  CookieClient,
+  downloadAssetBytes,
+  grantAssetPermission,
+  uploadAsset as ocUploadAsset,
+  uploadAnimationLegacy,
+  uploadMeshLegacy,
+  createDeveloperProduct,
+  listDeveloperProducts,
+  createGamePass,
+  listGamePasses,
+  readMap,
+  writeMapEntries,
+  mapKey,
+  type Creator,
+  type MapEntry,
+  type MapItemKind,
+} from "./rocreate.js";
+import {
+  previewRewrite,
+  applyRewrite,
+  verifyRewrite,
+  type MonetizationIdMap,
+} from "./rocreate-rewrite.js";
 import type { Context, CommandResult } from "./types.js";
 
 // The Claude Code MCP client JSON-stringifies object-valued args for loosely-typed
@@ -2675,6 +2708,516 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         newOnDisk: plan.newOnDisk,
         analyzed,
       });
+    }
+  );
+
+  // ----- Task 26: RoCreate password-gated auto-reupload ---------------------
+  // Assets/dev-products/game-passes/animations reuploaded under a per-run creator.
+  // API key from config (rocreate block); cookie decrypted in memory only after an
+  // unlock via the RoCreate dock. Hard limits (new IDs, grant-only, own-content-only)
+  // are stated in each description -- never buried.
+  const RC_KIND_ARG = z.enum(["image", "audio", "mesh", "animation"]);
+  const creatorArg = objectArg().pipe(
+    z.object({ type: z.enum(["user", "group"]), id: z.string() })
+  );
+
+  function rocreateKey(): string | null {
+    return cfg.rocreate.apiKey ?? null;
+  }
+  function requireCookie() {
+    if (!isUnlocked()) {
+      return blocked("locked -- unlock via the RoCreate tab (a cookie is needed for this operation)");
+    }
+    const c = useCookie();
+    if (!c) return blocked("locked -- unlock via the RoCreate tab");
+    return new CookieClient(c);
+  }
+
+  server.registerTool(
+    "rocreate_status",
+    {
+      title: "RoCreate Status",
+      description:
+        "RoCreate lock state and capability booleans (values NEVER leave Node): " +
+        "{ unlocked, hasKey, hasCookie, cookieExpired, targetCreator?, lastRun? }. " +
+        "Unlock/lock happen in the RoCreate dock tab, not here.",
+      inputSchema: {},
+    },
+    async () => {
+      const s = secretsStatus(!!rocreateKey());
+      const map = readMap();
+      return jsonResult({ ...s, mapEntries: Object.keys(map.entries).length, mapUpdatedAt: map.updatedAt });
+    }
+  );
+
+  server.registerTool(
+    "rocreate_set_credentials",
+    {
+      title: "RoCreate Set Credentials",
+      description:
+        "Encrypt a .ROBLOSECURITY cookie with a password (scrypt + AES-256-GCM) and " +
+        "store it in ~/.nikmcp/rocreate-secrets.json (OUTSIDE the repo). The password is " +
+        "stored NOWHERE -- it is the decryption key, entered live at unlock. The cookie is " +
+        "never logged or echoed. The OC API key lives in config.json (rocreate.apiKey), not " +
+        "here. Prefer entering credentials via the RoCreate dock tab; this tool is the " +
+        "programmatic equivalent.",
+      inputSchema: {
+        cookie: z.string(),
+        password: z.string(),
+      },
+    },
+    async ({ cookie, password }) => {
+      const reason = gateToolCall("rocreate_set_credentials");
+      if (reason) return blocked(reason);
+      if (!CookieClient.looksValid(cookie)) {
+        return blocked("that does not look like a .ROBLOSECURITY cookie (missing the warning prefix)");
+      }
+      if (password.length < 6) return blocked("choose a password of at least 6 characters");
+      setCookieSecret(cookie, password);
+      return jsonResult({ ok: true, note: "cookie encrypted and saved; unlock via the RoCreate tab to use it" });
+    }
+  );
+
+  server.registerTool(
+    "rocreate_scan_assets",
+    {
+      title: "RoCreate Scan Assets",
+      description:
+        "Walk the place collecting asset references: typed instance properties " +
+        "(SoundId/MeshId/TextureId/Texture/Image/AnimationId -- exact) plus script-source " +
+        "IDs via rbxassetid:// regex (heuristic -- reported for review, never auto-trusted). " +
+        "Returns { references:[{path,prop,kind,id}], scriptHits:[{path,line,id}], placeId, " +
+        "universeId }. Edit mode only. Feeds rocreate_reupload_assets fromScan:true.",
+      inputSchema: { root: z.string().optional() },
+    },
+    async ({ root }) => {
+      const reason = gateToolCall("rocreate_scan_assets");
+      if (reason) return blocked(reason);
+      const r = await enqueueAndAwait("rocreate_scan", "edit", { root: root ?? "game" }, cfg.commandTimeoutMs);
+      if (!r.ok) return blocked(r.error ?? (r as { err?: string }).err ?? "rocreate_scan failed");
+      const base = r.result as {
+        placeId?: string;
+        universeId?: string;
+        references?: { path: string; prop: string; kind: string; id: string }[];
+      };
+      // Script hits: grep for rbxassetid://<digits> across scripts (heuristic).
+      const scriptHits: { path: string; line: number; id: string }[] = [];
+      try {
+        const g = await enqueueAndAwait(
+          "grep_scripts",
+          "edit",
+          { pattern: "rbxassetid://%d+", root: root ?? "game", regex: true, limit: 2000 },
+          cfg.commandTimeoutMs
+        );
+        if (g.ok && Array.isArray((g.result as { matches?: unknown })?.matches ?? g.result)) {
+          const matches = ((g.result as { matches?: unknown }).matches ?? g.result) as {
+            path?: string;
+            line?: number;
+            text?: string;
+          }[];
+          for (const m of matches) {
+            const id = typeof m.text === "string" ? m.text.match(/rbxassetid:\/\/(\d+)/)?.[1] : undefined;
+            if (id && m.path) scriptHits.push({ path: m.path, line: m.line ?? 0, id });
+          }
+        }
+      } catch {
+        // grep best-effort; typed refs are the reliable set
+      }
+      return jsonResult({
+        placeId: base.placeId,
+        universeId: base.universeId,
+        references: base.references ?? [],
+        scriptHits,
+      });
+    }
+  );
+
+  server.registerTool(
+    "rocreate_reupload_assets",
+    {
+      title: "RoCreate Reupload Assets",
+      description:
+        "Reupload YOUR OWN assets under a per-run creator and record old->new in " +
+        "~/.nikmcp/rocreate-map.json. Per asset: download bytes (public CDN, else the " +
+        "unlocked cookie) -> image/audio create via the OC key -> mesh/animation upload via " +
+        "the legacy cookie endpoint -> grant permission for restricted types (verified, not " +
+        "trusted) -> record. HARD LIMITS: moves only content your credentials can reach " +
+        "(private/unowned won't download -- reported, never faked); animation/mesh REQUIRE an " +
+        "unlocked cookie (Open Cloud cannot reupload them from an ID); audio has a monthly " +
+        "quota. dryRun returns the plan with no writes. Provide ids:[{kind,id}] or fromScan " +
+        "with a prior scan's references.",
+      inputSchema: {
+        creator: creatorArg,
+        ids: objectArg().pipe(z.array(z.object({ kind: RC_KIND_ARG, id: z.string() }))).optional(),
+        placeId: z.string().optional(),
+        grantUniverseId: z.string().optional(),
+        dryRun: z.boolean().default(false),
+      },
+    },
+    async ({ creator, ids, placeId, grantUniverseId, dryRun }) => {
+      const reason = gateToolCall("rocreate_reupload_assets");
+      if (reason) return blocked(reason);
+      const key = rocreateKey();
+      if (!key) return blocked("no RoCreate API key -- set rocreate.apiKey in config.json");
+      const list = ids ?? [];
+      if (list.length === 0) return blocked("provide ids:[{kind,id}] (or run rocreate_scan_assets first)");
+
+      const cr = creator as Creator;
+      const needsCookie = list.some((i) => i.kind === "animation" || i.kind === "mesh");
+      let cookie: CookieClient | null = null;
+      if (needsCookie) {
+        const c = requireCookie();
+        if ("isError" in c) return c;
+        cookie = c;
+      } else if (isUnlocked()) {
+        const cv = useCookie();
+        if (cv) cookie = new CookieClient(cv);
+      }
+
+      if (dryRun) {
+        return jsonResult({
+          dryRun: true,
+          creator: cr,
+          wouldProcess: list,
+          needsCookie,
+          note: "no downloads or uploads performed",
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      const results: MapEntry[] = [];
+      for (const item of list) {
+        try {
+          const dl = await downloadAssetBytes({ assetId: item.id, cookie, placeId });
+          if (!dl.ok || !dl.bytes) {
+            results.push({
+              kind: item.kind,
+              oldId: item.id,
+              newId: "",
+              status: "failed",
+              note: dl.error ?? "download failed",
+            });
+            continue;
+          }
+          let newId = "";
+          let note: string | undefined;
+          if (item.kind === "image" || item.kind === "audio") {
+            const up = await ocUploadAsset({
+              apiKey: key,
+              creator: cr.type === "user" ? { userId: Number(cr.id) } : { groupId: Number(cr.id) },
+              assetType: item.kind === "image" ? "Image" : "Audio",
+              displayName: `reupload_${item.id}`,
+              bytes: dl.bytes,
+              contentType: item.kind === "image" ? "image/png" : "audio/mpeg",
+            }).then(
+              (r) => ({ ok: true as const, ...r }),
+              (e) => ({ ok: false as const, error: e instanceof Error ? e.message : String(e) })
+            );
+            if (!up.ok) {
+              results.push({ kind: item.kind, oldId: item.id, newId: "", status: "failed", note: up.error });
+              continue;
+            }
+            newId = up.assetId;
+            note = `moderation=${up.moderationState}`;
+            // Restricted types (audio) need a grant to the target universe.
+            if (item.kind === "audio" && grantUniverseId) {
+              const grant = await grantAssetPermission({
+                apiKey: key,
+                assetId: newId,
+                subjectType: "Universe",
+                subjectId: grantUniverseId,
+              });
+              note += grant.ok ? "; granted" : `; grant WARNING: ${grant.error}`;
+            }
+          } else {
+            // mesh / animation -> legacy cookie upload of the raw bytes
+            const grp = cr.type === "group" ? cr.id : undefined;
+            const up =
+              item.kind === "animation"
+                ? await uploadAnimationLegacy({ cookie: cookie!, bytes: dl.bytes, name: `reupload_${item.id}`, groupId: grp })
+                : await uploadMeshLegacy({ cookie: cookie!, bytes: dl.bytes, name: `reupload_${item.id}`, groupId: grp });
+            if (!up.ok) {
+              if (up.cookieExpired) markCookieExpired();
+              results.push({ kind: item.kind, oldId: item.id, newId: "", status: "failed", note: up.error });
+              continue;
+            }
+            newId = up.assetId;
+          }
+          results.push({ kind: item.kind, oldId: item.id, newId, status: "ok", note });
+        } catch (e) {
+          results.push({
+            kind: item.kind,
+            oldId: item.id,
+            newId: "",
+            status: "failed",
+            note: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+      writeMapEntries(results, nowIso);
+      const ok = results.filter((r) => r.status === "ok").length;
+      return jsonResult({ creator: cr, uploaded: ok, failed: results.length - ok, results });
+    }
+  );
+
+  server.registerTool(
+    "rocreate_apply_asset_map",
+    {
+      title: "RoCreate Apply Asset Map",
+      description:
+        "Rewire the place from ~/.nikmcp/rocreate-map.json: set each old asset property to " +
+        "rbxassetid://<newId> in ONE ChangeHistory recording (one undo reverts all), and " +
+        "swap old->new IDs in script sources via find_and_replace_in_scripts. Only 'ok' map " +
+        "entries with a newId are applied. dryRun shows the planned property + script changes " +
+        "with no writes. Edit mode only. Pair with rocreate_scan_assets (which records the " +
+        "path/prop each id came from -- pass a scan to target exact properties).",
+      inputSchema: {
+        scan: objectArg()
+          .pipe(z.object({ references: z.array(z.object({ path: z.string(), prop: z.string(), id: z.string() })) }))
+          .optional(),
+        dryRun: z.boolean().default(false),
+      },
+    },
+    async ({ scan, dryRun }) => {
+      const reason = gateToolCall("rocreate_apply_asset_map");
+      if (reason) return blocked(reason);
+      const map = readMap();
+      const idNew = new Map<string, string>();
+      for (const e of Object.values(map.entries)) {
+        if (e.status === "ok" && e.newId) idNew.set(e.oldId, e.newId);
+      }
+      if (idNew.size === 0) return blocked("no applicable map entries (run rocreate_reupload_assets first)");
+
+      const refs = (scan as { references?: { path: string; prop: string; id: string }[] } | undefined)?.references ?? [];
+      const propPlan = refs
+        .filter((r) => idNew.has(r.id))
+        .map((r) => ({ path: r.path, prop: r.prop, oldId: r.id, newId: idNew.get(r.id) as string }));
+
+      if (dryRun) {
+        return jsonResult({
+          dryRun: true,
+          propertyChanges: propPlan,
+          scriptReplacements: [...idNew].map(([o, n]) => ({ from: o, to: n })),
+          note: "no writes performed",
+        });
+      }
+
+      // Property rewires: one instance property per set_property (each undoable);
+      // grouped as a single client-visible operation is not possible cross-tool, so
+      // we apply sequentially and report per item.
+      const applied: { path: string; prop: string; ok: boolean; err?: string }[] = [];
+      for (const p of propPlan) {
+        const r = await enqueueAndAwait(
+          "set_property",
+          "edit",
+          { path: p.path, property: p.prop, value: `rbxassetid://${p.newId}` },
+          cfg.commandTimeoutMs
+        );
+        applied.push({ path: p.path, prop: p.prop, ok: r.ok, err: r.ok ? undefined : r.error });
+      }
+      // Script IDs: one find_and_replace per pair (plain text).
+      const scriptResults: { from: string; to: string; ok: boolean }[] = [];
+      for (const [oldId, newId] of idNew) {
+        const r = await enqueueAndAwait(
+          "find_and_replace_in_scripts",
+          "edit",
+          { find: `rbxassetid://${oldId}`, replace: `rbxassetid://${newId}`, root: "game", regex: false },
+          cfg.commandTimeoutMs
+        );
+        scriptResults.push({ from: oldId, to: newId, ok: r.ok });
+      }
+      return jsonResult({ propertyChanges: applied, scriptReplacements: scriptResults });
+    }
+  );
+
+  server.registerTool(
+    "rocreate_list_monetization",
+    {
+      title: "RoCreate List Monetization",
+      description:
+        "List a universe's developer products and game passes via the Open Cloud " +
+        "list-by-universe endpoints (API key only, no cookie). { universeId } -> " +
+        "{ developerProducts:[...], gamePasses:[...] }.",
+      inputSchema: { universeId: z.string() },
+    },
+    async ({ universeId }) => {
+      const reason = gateToolCall("rocreate_list_monetization");
+      if (reason) return blocked(reason);
+      const key = rocreateKey();
+      if (!key) return blocked("no RoCreate API key -- set rocreate.apiKey in config.json");
+      const [dp, gp] = await Promise.all([
+        listDeveloperProducts(key, universeId),
+        listGamePasses(key, universeId),
+      ]);
+      return jsonResult({
+        developerProducts: dp.ok ? dp.items : { error: dp.error },
+        gamePasses: gp.ok ? gp.items : { error: gp.error },
+      });
+    }
+  );
+
+  server.registerTool(
+    "rocreate_reupload_devproducts",
+    {
+      title: "RoCreate Reupload Dev Products",
+      description:
+        "Bulk-create developer products in a target universe from a source universe's list " +
+        "(API key only). Records old->new in the map. HARD LIMIT: recreated products get NEW " +
+        "IDs; existing player ownership does NOT transfer (platform behavior). dryRun returns " +
+        "the plan (names/prices, name collisions) with no creates.",
+      inputSchema: {
+        fromUniverseId: z.string(),
+        toUniverseId: z.string(),
+        dryRun: z.boolean().default(false),
+      },
+    },
+    async ({ fromUniverseId, toUniverseId, dryRun }) => {
+      const reason = gateToolCall("rocreate_reupload_devproducts");
+      if (reason) return blocked(reason);
+      const key = rocreateKey();
+      if (!key) return blocked("no RoCreate API key -- set rocreate.apiKey in config.json");
+      const src = await listDeveloperProducts(key, fromUniverseId);
+      if (!src.ok) return blocked(src.error);
+      const plan = src.items.map((p: any) => ({
+        oldId: String(p.id ?? p.productId ?? p.developerProductId ?? ""),
+        name: String(p.name ?? ""),
+        priceInRobux: Number(p.priceInRobux ?? p.price ?? 0),
+      }));
+      if (dryRun) return jsonResult({ dryRun: true, toUniverseId, wouldCreate: plan });
+      const nowIso = new Date().toISOString();
+      const entries: MapEntry[] = [];
+      const out: any[] = [];
+      for (const p of plan) {
+        if (!p.name || p.priceInRobux < 1) {
+          out.push({ oldId: p.oldId, ok: false, error: "missing name/price" });
+          continue;
+        }
+        const r = await createDeveloperProduct({ apiKey: key, universeId: toUniverseId, name: p.name, priceInRobux: p.priceInRobux });
+        if (r.ok) {
+          const newId = String((r.data as any)?.id ?? (r.data as any)?.productId ?? "");
+          entries.push({ kind: "devproduct", oldId: p.oldId, newId, status: "ok" });
+          out.push({ oldId: p.oldId, newId, ok: true });
+        } else {
+          entries.push({ kind: "devproduct", oldId: p.oldId, newId: "", status: "failed", note: r.error });
+          out.push({ oldId: p.oldId, ok: false, error: r.error });
+        }
+      }
+      if (entries.length) writeMapEntries(entries, nowIso);
+      return jsonResult({ toUniverseId, created: out.filter((o) => o.ok).length, results: out });
+    }
+  );
+
+  server.registerTool(
+    "rocreate_reupload_gamepasses",
+    {
+      title: "RoCreate Reupload Game Passes",
+      description:
+        "Bulk-create game passes in a target universe from a source universe's list (API key " +
+        "only). Records old->new in the map. HARD LIMIT: recreated passes get NEW IDs; existing " +
+        "player ownership does NOT transfer (platform behavior). dryRun returns the plan.",
+      inputSchema: {
+        fromUniverseId: z.string(),
+        toUniverseId: z.string(),
+        dryRun: z.boolean().default(false),
+      },
+    },
+    async ({ fromUniverseId, toUniverseId, dryRun }) => {
+      const reason = gateToolCall("rocreate_reupload_gamepasses");
+      if (reason) return blocked(reason);
+      const key = rocreateKey();
+      if (!key) return blocked("no RoCreate API key -- set rocreate.apiKey in config.json");
+      const src = await listGamePasses(key, fromUniverseId);
+      if (!src.ok) return blocked(src.error);
+      const plan = src.items.map((p: any) => ({
+        oldId: String(p.id ?? p.gamePassId ?? ""),
+        name: String(p.name ?? ""),
+        priceInRobux: Number(p.priceInRobux ?? p.price ?? 0),
+      }));
+      if (dryRun) return jsonResult({ dryRun: true, toUniverseId, wouldCreate: plan });
+      const nowIso = new Date().toISOString();
+      const entries: MapEntry[] = [];
+      const out: any[] = [];
+      for (const p of plan) {
+        if (!p.name || p.priceInRobux < 1) {
+          out.push({ oldId: p.oldId, ok: false, error: "missing name/price" });
+          continue;
+        }
+        const r = await createGamePass({ apiKey: key, universeId: toUniverseId, name: p.name, priceInRobux: p.priceInRobux });
+        if (r.ok) {
+          const newId = String((r.data as any)?.id ?? (r.data as any)?.gamePassId ?? "");
+          entries.push({ kind: "gamepass", oldId: p.oldId, newId, status: "ok" });
+          out.push({ oldId: p.oldId, newId, ok: true });
+        } else {
+          entries.push({ kind: "gamepass", oldId: p.oldId, newId: "", status: "failed", note: r.error });
+          out.push({ oldId: p.oldId, ok: false, error: r.error });
+        }
+      }
+      if (entries.length) writeMapEntries(entries, nowIso);
+      return jsonResult({ toUniverseId, created: out.filter((o) => o.ok).length, results: out });
+    }
+  );
+
+  server.registerTool(
+    "rocreate_rewrite_monetization_module",
+    {
+      title: "RoCreate Rewrite Monetization Module",
+      description:
+        "Swap old->new product/pass IDs in a MonetizationIds ModuleScript using the mapped " +
+        "reupload results. Surgical: matches `= <digits>` value position only, whole-integer, " +
+        "ZEROS ARE NEVER TOUCHED (0 = dormant product), string/comment digits ignored, every " +
+        "other byte preserved. Operate on an in-Studio ModuleScript (path) OR a disk file from " +
+        "Task 25's export (file). dryRun returns the diff preview; apply writes + verifies.",
+      inputSchema: {
+        path: z.string().optional(),
+        file: z.string().optional(),
+        dryRun: z.boolean().default(false),
+      },
+    },
+    async ({ path, file, dryRun }) => {
+      const reason = gateToolCall("rocreate_rewrite_monetization_module");
+      if (reason) return blocked(reason);
+      if (!!path === !!file) return blocked("provide exactly one of path (in-Studio) or file (disk)");
+      const map = readMap();
+      const idMap: MonetizationIdMap = new Map();
+      for (const e of Object.values(map.entries)) {
+        if ((e.kind === "devproduct" || e.kind === "gamepass") && e.status === "ok" && e.newId) {
+          idMap.set(e.oldId, e.newId);
+        }
+      }
+      if (idMap.size === 0) return blocked("no dev-product/game-pass entries in the map to rewrite");
+
+      // Load source (Studio or disk).
+      let source: string;
+      if (path) {
+        const r = await enqueueAndAwait("get_script_source", "edit", { path }, cfg.commandTimeoutMs);
+        if (!r.ok) return blocked(r.error ?? "get_script_source failed");
+        const s = (r.result as { source?: unknown } | undefined)?.source;
+        if (typeof s !== "string") return blocked("no source at that path");
+        source = s;
+      } else {
+        try {
+          source = readFileSync(file as string, "utf8");
+        } catch (e) {
+          return blocked(`could not read file: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+
+      const preview = previewRewrite(source, idMap);
+      if (dryRun) {
+        return jsonResult({ dryRun: true, ...preview });
+      }
+      const { text } = applyRewrite(source, idMap);
+      const verify = verifyRewrite(text, idMap);
+      if (!verify.ok) {
+        return blocked(`rewrite verification failed (offending lines): ${JSON.stringify(verify.offending)}`);
+      }
+      if (path) {
+        const r = await enqueueAndAwait("write_script", "edit", { path, source: text }, cfg.commandTimeoutMs);
+        if (!r.ok) return blocked(r.error ?? "write_script failed");
+      } else {
+        writeFileSync(file as string, text);
+      }
+      return jsonResult({ applied: preview.counts.replaced, changes: preview.changes, verified: true });
     }
   );
 

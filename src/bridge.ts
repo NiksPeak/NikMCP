@@ -6,6 +6,11 @@ import { HOST } from "./config.js";
 import type { Context, CommandResult } from "./types.js";
 import { dequeue, resolveResult, markSeen, isAlive } from "./queue.js";
 import { setSettings, checkAuth } from "./settings.js";
+import {
+  unlock as rocreateUnlock,
+  lock as rocreateLock,
+  setCookieSecret,
+} from "./rocreate-secrets.js";
 
 const log = (...args: unknown[]) => console.error("[bridge]", ...args); // stderr only
 
@@ -167,6 +172,49 @@ export function startBridge(cfg: AppConfig): void {
     if (!authed(req, res)) return; // allowed until a token is adopted (TOFU)
     setSettings(req.body ?? {});
     res.json({ ok: true });
+  });
+
+  // Task 26 RoCreate: the dock POSTs the password here. Node derives the key,
+  // decrypts the cookie, and holds it in memory only (idle expiry). The password
+  // itself is never stored; a decrypt failure is the wrong-password signal. Authed
+  // by the same x-mcp-token as the mutating routes -- a cookie sits behind this.
+  app.post("/rocreate/unlock", (req, res) => {
+    if (!authed(req, res)) return;
+    const password = (req.body as { password?: unknown } | undefined)?.password;
+    if (typeof password !== "string" || !password) {
+      res.status(400).json({ ok: false, error: "password required" });
+      return;
+    }
+    const r = rocreateUnlock(password);
+    // Never echo the reason verbatim beyond the two safe cases; both are non-sensitive.
+    res.status(r.ok ? 200 : 401).json(r);
+  });
+
+  app.post("/rocreate/lock", (req, res) => {
+    if (!authed(req, res)) return;
+    rocreateLock();
+    res.json({ ok: true });
+  });
+
+  // One-time set-credentials from the dock: encrypt the cookie with the password
+  // and persist it. The cookie is never echoed back or logged.
+  app.post("/rocreate/set-credentials", (req, res) => {
+    if (!authed(req, res)) return;
+    const { cookie, password } = (req.body ?? {}) as { cookie?: unknown; password?: unknown };
+    if (typeof cookie !== "string" || typeof password !== "string" || !cookie || !password) {
+      res.status(400).json({ ok: false, error: "cookie and password required" });
+      return;
+    }
+    if (!cookie.includes("_|WARNING:-DO-NOT-SHARE-THIS.")) {
+      res.status(400).json({ ok: false, error: "that does not look like a .ROBLOSECURITY cookie" });
+      return;
+    }
+    try {
+      setCookieSecret(cookie, password);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
   });
 
   // Lightweight liveness + which contexts are connected (drives status UI).

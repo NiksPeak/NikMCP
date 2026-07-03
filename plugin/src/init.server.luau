@@ -637,6 +637,75 @@ status.onSetAuth = function(enabled: boolean, token: string)
 	end
 end
 
+-- == Task 26 RoCreate: dock -> bridge routes (over 127.0.0.1, authed) =========
+-- Pick the connected bridge to talk to (selected port, else first connected).
+-- The widget passes the raw password/cookie; they go straight to Node over
+-- localhost and are never persisted plugin-side.
+local function rocreateTargetPort(): number?
+	if selectedPort and connections[selectedPort] then
+		return selectedPort
+	end
+	return firstConnectedPort()
+end
+
+local function rocreatePost(path: string, body: any): (boolean, any)
+	local port = rocreateTargetPort()
+	if not port then
+		return false, "no connected bridge (connect a port first)"
+	end
+	local headers = authHeaders() or {}
+	headers["Content-Type"] = "application/json"
+	local ok, resp = pcall(function()
+		return HttpService:RequestAsync({
+			Url = urlFor(port) .. path,
+			Method = "POST",
+			Headers = headers,
+			Body = HttpService:JSONEncode(body),
+		})
+	end)
+	if not ok then
+		return false, "request failed"
+	end
+	local data: any = nil
+	pcall(function()
+		data = HttpService:JSONDecode(resp.Body)
+	end)
+	return resp.Success, data
+end
+
+status.onRocreateUnlock = function(password: string): string
+	if password == "" then
+		return "enter a password"
+	end
+	local ok, data = rocreatePost("/rocreate/unlock", { password = password })
+	if ok then
+		status:_setRocreateStatus({ unlocked = true })
+		return "unlocked"
+	end
+	if typeof(data) == "table" and data.error then
+		return tostring(data.error)
+	end
+	return "unlock failed"
+end
+
+status.onRocreateLock = function()
+	rocreatePost("/rocreate/lock", {})
+end
+
+status.onRocreateSetCreds = function(cookie: string, password: string): string
+	if cookie == "" or password == "" then
+		return "enter both a cookie and a password"
+	end
+	local ok, data = rocreatePost("/rocreate/set-credentials", { cookie = cookie, password = password })
+	if ok then
+		return "credentials saved -- now Unlock with your password"
+	end
+	if typeof(data) == "table" and data.error then
+		return tostring(data.error)
+	end
+	return "save failed"
+end
+
 -- == Connect / Disconnect primary button (acts on the SELECTED port only) =====
 status.onPrimary = function()
 	if not selectedPort then

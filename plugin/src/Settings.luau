@@ -34,11 +34,22 @@ Settings.TOOLS = {
 	-- task 25: script sync (export/status read the place; import mutates it)
 	{ name = "export_scripts", group = "read", label = "Export scripts to disk" },
 	{ name = "sync_status", group = "read", label = "Script sync status" },
+	-- task 26: RoCreate (status/scan/list read; the rest mutate -> write group)
+	{ name = "rocreate_status", group = "read", label = "RoCreate status" },
+	{ name = "rocreate_scan_assets", group = "read", label = "RoCreate scan assets" },
+	{ name = "rocreate_list_monetization", group = "read", label = "RoCreate list monetization" },
 	-- write / edit (read-only mode blocks these)
 	{ name = "run_luau", group = "write", label = "Run Luau" },
 	{ name = "set_property", group = "write", label = "Set property" },
 	{ name = "write_script", group = "write", label = "Write script" },
 	{ name = "import_scripts", group = "write", label = "Import scripts from disk" },
+	-- task 26: RoCreate mutating tools
+	{ name = "rocreate_set_credentials", group = "write", label = "RoCreate set credentials" },
+	{ name = "rocreate_reupload_assets", group = "write", label = "RoCreate reupload assets" },
+	{ name = "rocreate_apply_asset_map", group = "write", label = "RoCreate apply asset map" },
+	{ name = "rocreate_reupload_devproducts", group = "write", label = "RoCreate reupload dev products" },
+	{ name = "rocreate_reupload_gamepasses", group = "write", label = "RoCreate reupload game passes" },
+	{ name = "rocreate_rewrite_monetization_module", group = "write", label = "RoCreate rewrite monetization module" },
 	{ name = "set_selection", group = "write", label = "Set selection" },
 	{ name = "create_instance", group = "write", label = "Create instance" },
 	{ name = "delete_instance", group = "write", label = "Delete instance" },

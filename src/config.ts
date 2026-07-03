@@ -12,12 +12,22 @@ export interface AppConfig {
   luauGate: boolean; // Part B: luau-lsp analyze gate on Luau source
   luauLspPath?: string; // absolute path override for the analyzer binary
   syncDir?: string; // task 25: default export/import dir (the tool's dir param wins)
+  rocreate: RoCreateConfig; // task 26
 }
 
 export interface OpenCloudConfig {
   apiKey?: string; // ROBLOX_API_KEY env > config.json openCloud.apiKey
   creatorUserId?: number;
   creatorGroupId?: number;
+}
+
+// Task 26 RoCreate: the Open Cloud key for reupload/monetization. Same key CLASS
+// as openCloud.apiKey but kept in its own block so a RoCreate key can be scoped
+// separately (assets:read+write, asset-permissions:write, developer-product,
+// game-pass). The COOKIE never lives here -- it is encrypted in
+// ~/.nikmcp/rocreate-secrets.json, password-gated.
+export interface RoCreateConfig {
+  apiKey?: string; // ROCREATE_API_KEY env > config.json rocreate.apiKey > openCloud.apiKey fallback
 }
 
 // Keep DEFAULT_PORT in sync with plugin/src/Config.luau.
@@ -83,6 +93,14 @@ export function resolveConfig(argv: string[] = process.argv.slice(2)): AppConfig
         : undefined,
     syncDir:
       typeof fileCfg.syncDir === "string" && fileCfg.syncDir ? fileCfg.syncDir : undefined,
+    rocreate: {
+      // ROCREATE_API_KEY env > config.json rocreate.apiKey > openCloud.apiKey fallback
+      apiKey:
+        process.env.ROCREATE_API_KEY ??
+        fileCfg.rocreate?.apiKey ??
+        process.env.ROBLOX_API_KEY ??
+        fileOpenCloud.apiKey,
+    },
   };
 }
 

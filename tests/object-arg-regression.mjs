@@ -181,6 +181,23 @@ try {
 
   // NOTE: character_navigation.position is the same objectArg() class but needs a
   // running playtest with a character, so it isn't exercised here (code-only coverage).
+
+  // --- task 26: RoCreate object/array objectArg coercion via STRING ---
+  // creator (object) + ids (array of objects) passed as JSON strings. Coercion
+  // proof: the response must be a domain result (no-key error OR the dry-run plan
+  // echoing what we sent), NOT a zod "Expected object, received string" schema error.
+  await T("rocreate_reupload_assets.creator+ids (strings)", "rocreate_reupload_assets", {
+    creator: JSON.stringify({ type: "user", id: "1" }),
+    ids: JSON.stringify([{ kind: "image", id: "123" }]),
+    dryRun: true,
+  }, (t) => !/Expected object|invalid_type|Expected array/i.test(t) &&
+           /(no RoCreate API key|"wouldProcess"|"image")/.test(t));
+
+  await T("rocreate_apply_asset_map.scan (string)", "rocreate_apply_asset_map", {
+    scan: JSON.stringify({ references: [{ path: "game.Workspace.P", prop: "Color", id: "123" }] }),
+    dryRun: true,
+  }, (t) => !/Expected object|invalid_type/i.test(t) &&
+           /(no applicable map entries|"propertyChanges"|"scriptReplacements")/.test(t));
 } catch (e) {
   if (e?.message !== "studio-unreachable") rows.push({ tool: "FATAL", ok: false, err: String(e?.stack || e).slice(0, 300) });
 } finally {

@@ -337,6 +337,91 @@ local function listScripts(rootPath: string): any
 	return { ok = true, result = out }
 end
 
+-- == Task 26: RoCreate asset scan (edit context) =============================
+-- Walk the place collecting asset references from known instance properties plus
+-- the current PlaceId (the download step needs it as Roblox-Place-Id). Script-
+-- source IDs are collected by the Node side via grep_scripts; here we only do the
+-- typed instance properties, which are exact (not heuristic).
+
+-- property name -> asset kind. A property is read via pcall (not every class has
+-- every property); a value of 0 / "" / "rbxassetid://0" is skipped.
+local ROCREATE_ASSET_PROPS: { [string]: string } = {
+	SoundId = "audio",
+	MeshId = "mesh",
+	TextureId = "image",
+	Texture = "image",
+	Image = "image",
+	AnimationId = "animation",
+	HeadColor = "skip", -- guard: never treat colors as ids (defensive; not an id prop)
+}
+
+-- Extract a numeric asset id from a Content/string value. Accepts
+-- "rbxassetid://123", "http://www.roblox.com/asset/?id=123", or a bare "123".
+local function rocreateExtractId(value: any): string?
+	if typeof(value) == "number" then
+		if value > 0 then
+			return tostring(math.floor(value))
+		end
+		return nil
+	end
+	if typeof(value) ~= "string" then
+		return nil
+	end
+	local id = string.match(value, "rbxassetid://(%d+)")
+		or string.match(value, "[%?&]id=(%d+)")
+		or string.match(value, "^(%d+)$")
+	if id and tonumber(id) and tonumber(id) > 0 then
+		return id
+	end
+	return nil
+end
+
+local function rocreateScan(rootPath: string): any
+	if RunService:IsRunning() then
+		return { ok = false, err = "rocreate_scan is edit-context only (stop the playtest first)" }
+	end
+	local root = resolvePath(rootPath or "game") or game
+	local references = {}
+	local seen: { [string]: boolean } = {}
+	local function consider(inst: Instance)
+		for prop, kind in pairs(ROCREATE_ASSET_PROPS) do
+			if kind == "skip" then
+				continue
+			end
+			local ok, value = pcall(function()
+				return (inst :: any)[prop]
+			end)
+			if ok then
+				local id = rocreateExtractId(value)
+				if id then
+					local dedup = inst:GetFullName() .. "|" .. prop
+					if not seen[dedup] then
+						seen[dedup] = true
+						table.insert(references, {
+							path = inst:GetFullName(),
+							prop = prop,
+							kind = kind,
+							id = id,
+						})
+					end
+				end
+			end
+		end
+	end
+	consider(root)
+	for _, inst in ipairs(root:GetDescendants()) do
+		consider(inst)
+	end
+	return {
+		ok = true,
+		result = {
+			placeId = tostring(game.PlaceId),
+			universeId = tostring(game.GameId),
+			references = references,
+		},
+	}
+end
+
 -- == Task 25: disk<->Studio script sync (edit context ONLY) ===================
 -- FNV-1a 32-bit over CRLF->LF-normalized source bytes. MUST stay bit-identical
 -- to fnv1a32 in src/sync.ts. Test vectors (tests/sync-unit.mjs asserts the Node
@@ -3134,6 +3219,9 @@ function Executor.execute(cmd: { type: string, payload: any }): any
 		return grepScripts(p)
 	elseif cmd.type == "get_script_analysis" then
 		return getScriptAnalysis(p)
+	-- task 26: RoCreate asset scan (edit context only)
+	elseif cmd.type == "rocreate_scan" then
+		return rocreateScan(p.root or "game")
 	-- task 25: disk<->Studio script sync primitives (edit context only)
 	elseif cmd.type == "sync_list" then
 		return syncList(p.root or "game")

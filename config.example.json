@@ -7,6 +7,10 @@
   "luauGate": true,
   "luauLspPath": "",
   "syncDir": "",
+  "rocreate": {
+    "_comment": "Task 26 RoCreate reupload. apiKey is the Open Cloud key (assets:read+write, asset-permissions:write, developer-product, game-pass); overridden by ROCREATE_API_KEY env, falls back to openCloud.apiKey. The .ROBLOSECURITY COOKIE never lives here -- it is encrypted (scrypt+AES-256-GCM) in ~/.nikmcp/rocreate-secrets.json and unlocked with a password via the RoCreate dock tab.",
+    "apiKey": ""
+  },
   "openCloud": {
     "_comment": "Open Cloud (upload_asset). apiKey here is overridden by the ROBLOX_API_KEY env var if set. Set exactly one of creatorUserId/creatorGroupId. Copy this file to config.json (gitignored) and fill in real values -- never commit a real key.",
     "apiKey": "",

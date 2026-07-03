@@ -22,7 +22,8 @@
     "selftest:apidump": "node tests/api-dump-validation.mjs",
     "selftest:luau": "node tests/luau-gate.mjs",
     "prepublishOnly": "npm run build",
-    "selftest:sync": "node tests/sync-unit.mjs"
+    "selftest:sync": "node tests/sync-unit.mjs",
+    "selftest:rocreate": "node tests/rocreate-unit.mjs"
   },
   "keywords": [
     "roblox",

@@ -123,6 +123,7 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `create_sound` | write | edit | convenience wrapper over `create_instance`: a `Sound` under `parentPath` with validated props (coerced `soundId`, volume clamped 0-10, rollOff enum). One undo. `playOnCreate` previews via `:Play()` |
 | `set_lighting` | write | edit | convenience over `set_properties` on `Lighting` + optional child effects (Atmosphere/Sky/Bloom/ColorCorrection/DepthOfField/SunRays, one per class). Tagged Color3/Vector3 via serializer; rejects unknown property/effect names. One undo |
 | `analyze_script` | meta | Node-side (`source`) / one round-trip (`path`) | run `luau-lsp analyze` (with Roblox global type definitions) on Luau source: pass `source` (no Studio needed) **or** `path` (fetches the script's source from Studio first) — exactly one. Returns `{ ok, errors, warnings }`; the same check `write_script`/`run_luau` apply automatically |
+| `rocreate_*` (9 tools) | read/write | Node + edit | password-gated reupload of YOUR OWN assets/dev-products/game-passes/animations under a per-run creator — see **RoCreate** |
 | `get_status` | meta | — | `{ edit, server }` connectivity (ungated) |
 
 `context: "auto"` (the default) targets the **running F5 server** when it's alive, else the editor.
@@ -208,9 +209,46 @@ would-apply plan.
 sync is a future task. Default export dir can be set once via `syncDir` in `config.json`
 (the tool's `dir` param wins).
 
+## RoCreate (task 26)
+
+Password-gated auto-reupload of **your own** content — images, audio, meshes, animations, dev
+products, game passes — under a per-run target creator, then rewire the place to the new IDs.
+Locked behind a 4th dock tab; nothing sensitive is ever committed.
+
+**Auth split** (see `ROCREATE_CAPABILITY_MATRIX.md` for endpoint provenance): almost everything is
+**Open Cloud key** only (create asset, grant permission, create/list dev-products + game-passes). The
+**cookie** does exactly two things the key can't — download the bytes of an existing asset ID, and the
+one upload Open Cloud refuses (**animation/mesh reupload**, via the legacy `UploadNewAnimation`/
+`UploadNewMesh` endpoints with the raw KeyframeSequence/mesh bytes). Place association is auto-satisfied:
+the download passes `game.PlaceId` (NikMCP runs inside the place) as `Roblox-Place-Id`.
+
+**Secrets** — the API key lives in the gitignored `config.json` `rocreate.apiKey` block (env
+`ROCREATE_API_KEY` overrides; falls back to `openCloud.apiKey`). The `.ROBLOSECURITY` cookie is
+encrypted (**scrypt(password) → AES-256-GCM**) in `~/.nikmcp/rocreate-secrets.json` (outside the repo).
+**The password is stored nowhere** — it is the decryption key, entered live at unlock; a decrypt failure
+IS the wrong-password signal. The old→new map lives in `~/.nikmcp/rocreate-map.json`.
+
+**Unlock flow** — the RoCreate dock tab sets credentials once (`POST /rocreate/set-credentials`), then
+unlocks per session with the password (`POST /rocreate/unlock`); Node holds the decrypted cookie in
+memory only, with a 30-min idle expiry, until you Lock (`/rocreate/lock`). All `rocreate_*` tools refuse
+with "locked — unlock via the RoCreate tab" until then.
+
+**Tools** — `rocreate_status` (booleans only; values never leave Node), `rocreate_set_credentials`,
+`rocreate_scan_assets` (walk the place for asset refs + script `rbxassetid://` hits), `rocreate_reupload_assets`
+(download → upload → grant restricted → record map; `dryRun` for the plan), `rocreate_apply_asset_map`
+(rewire instance props in one undo + script IDs via `find_and_replace_in_scripts`), `rocreate_list_monetization`,
+`rocreate_reupload_devproducts` / `rocreate_reupload_gamepasses` (bulk create in a target universe),
+`rocreate_rewrite_monetization_module` (swap old→new IDs in a MonetizationIds ModuleScript — zeros never
+touched, string/comment digits ignored, byte-preserving preview/apply/verify).
+
+**Hard limits** (stated in every relevant tool): recreated dev products / game passes get **NEW IDs** —
+existing ownership does **not** transfer (platform behavior). Asset-permission grants are **grant-only, no
+API revoke**, and a 200 is verified not trusted. Only content your credentials can reach is moved —
+private/unowned won't download, and that is reported, never faked. Audio has a monthly quota.
+
 ## Settings
 
-The dock has three tabs: **Status / Settings / Activity**.
+The dock has four tabs: **Status / Settings / Activity / RoCreate**.
 
 - **Settings** (scrollable): every tool as a toggle, grouped **Read / Write / Experimental** (all
   default ON), plus **Read-only mode** (master write kill-switch), **Confirm-destructive** (persisted

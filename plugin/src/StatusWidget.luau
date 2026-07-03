@@ -356,6 +356,11 @@ function StatusWidget.new(plugin: Plugin)
 	self.onToggleTool = nil
 	self.onSetFlag = nil
 	self.onSetAuth = nil
+	-- task 26 RoCreate: dock -> init.server HTTP callbacks. init.server POSTs to the
+	-- bridge routes; the widget never holds a cookie/key, only triggers and booleans.
+	self.onRocreateUnlock = nil -- (password) -> "ok" | "wrong password" | error string
+	self.onRocreateLock = nil -- () -> ()
+	self.onRocreateSetCreds = nil -- (cookie, password) -> "ok" | error string
 
 	-- Header: lifted gradient panel with title + subtitle and a status pill.
 	local header = Instance.new("Frame")
@@ -690,20 +695,24 @@ function StatusWidget.new(plugin: Plugin)
 		end
 	end)
 
-	-- Settings + Activity views and the tab strip that switches between them.
+	-- Settings + Activity + RoCreate views and the tab strip that switches between them.
 	local settingsView = makeView()
 	local activityView = makeView()
+	local rocreateView = makeView()
 	self.settingsView = settingsView
 	self.activityView = activityView
-	self.views = { Status = scroller, Settings = settingsView, Activity = activityView }
+	self.rocreateView = rocreateView
+	self.views = { Status = scroller, Settings = settingsView, Activity = activityView, RoCreate = rocreateView }
 	self:_buildSettings(settingsView)
 	self:_buildActivity(activityView)
+	self:_buildRoCreate(rocreateView)
 
 	self.tabs = {}
-	for i, name in ipairs({ "Status", "Settings", "Activity" }) do
+	-- 4 tabs now; narrower footprint so the strip still fits the dock width.
+	for i, name in ipairs({ "Status", "Settings", "Activity", "RoCreate" }) do
 		local tab = Instance.new("TextButton")
 		tab.Name = name
-		tab.Size = UDim2.fromOffset(80, 24)
+		tab.Size = UDim2.fromOffset(66, 24)
 		tab.BackgroundColor3 = Theme.panel
 		tab.AutoButtonColor = false
 		tab.Text = name
@@ -1134,6 +1143,190 @@ function StatusWidget:_buildSettings(view: ScrollingFrame)
 		self.settings.auth.token = tokenBox.Text
 		pushAuth()
 	end)
+end
+
+-- -- RoCreate view -----------------------------------------------------------
+-- Locked by default: a password unlocks the encrypted cookie in Node (memory only).
+-- The widget holds NO secrets -- it triggers bridge routes and shows booleans.
+function StatusWidget:_buildRoCreate(view: ScrollingFrame)
+	local order = 0
+	local function nextOrder(): number
+		order += 1
+		return order
+	end
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, 0, 0, 20)
+	title.BackgroundTransparency = 1
+	title.Font = Enum.Font.GothamBold
+	title.Text = "RoCreate"
+	title.TextColor3 = Theme.text
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextScaled = true
+	title.LayoutOrder = nextOrder()
+	textConstraint(title, 15, 11)
+	title.Parent = view
+
+	local hint = Instance.new("TextLabel")
+	hint.Size = UDim2.new(1, 0, 0, 26)
+	hint.BackgroundTransparency = 1
+	hint.Font = Enum.Font.Gotham
+	hint.Text = "Password-gated reupload. The cookie is encrypted on disk; the password is never stored."
+	hint.TextColor3 = Theme.subtext
+	hint.TextXAlignment = Enum.TextXAlignment.Left
+	hint.TextWrapped = true
+	hint.TextScaled = true
+	hint.LayoutOrder = nextOrder()
+	textConstraint(hint, 11, 9)
+	hint.Parent = view
+
+	-- status line (unlocked / hasKey / hasCookie); refreshed by _setRocreateStatus
+	local status = Instance.new("TextLabel")
+	status.Size = UDim2.new(1, 0, 0, 18)
+	status.BackgroundTransparency = 1
+	status.Font = Enum.Font.Code
+	status.Text = "status: locked"
+	status.TextColor3 = Theme.amber
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.TextScaled = true
+	status.LayoutOrder = nextOrder()
+	textConstraint(status, 12, 9)
+	status.Parent = view
+	self.rcStatusLabel = status
+
+	local result = Instance.new("TextLabel")
+	result.Size = UDim2.new(1, 0, 0, 18)
+	result.BackgroundTransparency = 1
+	result.Font = Enum.Font.Gotham
+	result.Text = ""
+	result.TextColor3 = Theme.subtext
+	result.TextXAlignment = Enum.TextXAlignment.Left
+	result.TextScaled = true
+	result.LayoutOrder = 999
+	textConstraint(result, 11, 9)
+	result.Parent = view
+	self.rcResultLabel = result
+
+	local function makeBox(placeholder: string, mask: boolean): TextBox
+		local box = Instance.new("TextBox")
+		box.Size = UDim2.new(1, 0, 0, 28)
+		box.BackgroundColor3 = Theme.field
+		box.Text = ""
+		box.PlaceholderText = placeholder
+		box.Font = Enum.Font.Code
+		box.TextColor3 = Theme.text
+		box.PlaceholderColor3 = Theme.subtext
+		box.TextScaled = true
+		box.ClearTextOnFocus = false
+		box.LayoutOrder = nextOrder()
+		corner(box, 8)
+		stroke(box, Theme.stroke, 0.2)
+		textConstraint(box, 13, 9)
+		box.Parent = view
+		return box
+	end
+
+	local function makeBtn(text: string, fill: Color3): TextButton
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(0.5, -4, 0, 30)
+		btn.BackgroundColor3 = fill
+		btn.AutoButtonColor = true
+		btn.Text = text
+		btn.Font = Enum.Font.GothamMedium
+		btn.TextColor3 = Theme.bg
+		btn.TextScaled = true
+		corner(btn, 8)
+		textConstraint(btn, 13, 10)
+		return btn
+	end
+
+	-- Unlock row: password + Unlock / Lock
+	local pwBox = makeBox("password (unlock)", true)
+
+	local btnRow = Instance.new("Frame")
+	btnRow.Size = UDim2.new(1, 0, 0, 30)
+	btnRow.BackgroundTransparency = 1
+	btnRow.LayoutOrder = nextOrder()
+	hlist(btnRow, 8)
+	btnRow.Parent = view
+
+	local unlockBtn = makeBtn("Unlock", Theme.green)
+	unlockBtn.Parent = btnRow
+	local lockBtn = makeBtn("Lock", Theme.panelHi)
+	lockBtn.TextColor3 = Theme.text
+	lockBtn.Parent = btnRow
+
+	unlockBtn.MouseButton1Click:Connect(function()
+		self:_click()
+		if self.onRocreateUnlock then
+			local res = self.onRocreateUnlock(pwBox.Text)
+			pwBox.Text = ""
+			self:_setRocreateResult(res)
+		end
+	end)
+	lockBtn.MouseButton1Click:Connect(function()
+		self:_click()
+		if self.onRocreateLock then
+			self.onRocreateLock()
+		end
+		self:_setRocreateStatus({ unlocked = false })
+		self:_setRocreateResult("locked")
+	end)
+
+	-- Set-credentials section (collapsible-ish; always shown, compact)
+	local credHeader = Instance.new("TextLabel")
+	credHeader.Size = UDim2.new(1, 0, 0, 18)
+	credHeader.BackgroundTransparency = 1
+	credHeader.Font = Enum.Font.GothamBold
+	credHeader.Text = "Set credentials (one time)"
+	credHeader.TextColor3 = Theme.subtext
+	credHeader.TextXAlignment = Enum.TextXAlignment.Left
+	credHeader.TextScaled = true
+	credHeader.LayoutOrder = nextOrder()
+	textConstraint(credHeader, 12, 9)
+	credHeader.Parent = view
+
+	local cookieBox = makeBox("paste .ROBLOSECURITY cookie", false)
+	local credPwBox = makeBox("password to encrypt it with", true)
+	local saveBtn = makeBtn("Save credentials", Theme.accent)
+	saveBtn.Size = UDim2.new(1, 0, 0, 30)
+	saveBtn.LayoutOrder = nextOrder()
+	saveBtn.Parent = view
+	saveBtn.MouseButton1Click:Connect(function()
+		self:_click()
+		if self.onRocreateSetCreds then
+			local res = self.onRocreateSetCreds(cookieBox.Text, credPwBox.Text)
+			cookieBox.Text = ""
+			credPwBox.Text = ""
+			self:_setRocreateResult(res)
+		end
+	end)
+end
+
+-- Refresh the status line from booleans (values never leave Node; these are flags).
+function StatusWidget:_setRocreateStatus(s: any)
+	if not self.rcStatusLabel then
+		return
+	end
+	local unlocked = s and s.unlocked == true
+	local parts = { unlocked and "unlocked" or "locked" }
+	if s and s.hasKey ~= nil then
+		table.insert(parts, "key:" .. (s.hasKey and "yes" or "no"))
+	end
+	if s and s.hasCookie ~= nil then
+		table.insert(parts, "cookie:" .. (s.hasCookie and "yes" or "no"))
+	end
+	if s and s.cookieExpired == true then
+		table.insert(parts, "COOKIE EXPIRED - re-enter")
+	end
+	self.rcStatusLabel.Text = "status: " .. table.concat(parts, "  ")
+	self.rcStatusLabel.TextColor3 = unlocked and Theme.green or Theme.amber
+end
+
+function StatusWidget:_setRocreateResult(text: string?)
+	if self.rcResultLabel then
+		self.rcResultLabel.Text = text or ""
+	end
 end
 
 -- -- activity view ----------------------------------------------------------
