@@ -90,6 +90,7 @@ export const WRITE_TOOLS = new Set<string>([
   "rocreate_reupload_assets",
   "rocreate_apply_asset_map",
   "rocreate_reupload_devproducts",
+  "rocreate_create_devproducts",
   "rocreate_reupload_gamepasses",
   "rocreate_rewrite_monetization_module",
 ]);

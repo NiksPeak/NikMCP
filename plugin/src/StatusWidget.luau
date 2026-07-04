@@ -327,7 +327,7 @@ function StatusWidget.new(plugin: Plugin)
 	version.Size = UDim2.fromOffset(120, 9)
 	version.BackgroundTransparency = 1
 	version.Font = Enum.Font.Merriweather -- readable serif at small sizes
-	version.Text = "version 0.1.2"
+	version.Text = "version 0.1.5"
 	version.TextColor3 = Theme.subtext
 	version.TextXAlignment = Enum.TextXAlignment.Left
 	version.TextYAlignment = Enum.TextYAlignment.Top

@@ -3161,6 +3161,67 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
   );
 
   server.registerTool(
+    "rocreate_create_devproducts",
+    {
+      title: "RoCreate Create Dev Products",
+      description:
+        "Create one or more brand-new developer products in a universe from an explicit list -- " +
+        "just give each a name and a price in Robux (optional description). Publishes via the " +
+        "Open Cloud API key (no source universe needed). Pass as many products as you want in one " +
+        "call. dryRun returns the plan (names/prices) with no creates. Net-new products get fresh " +
+        "IDs; this does NOT remap anything (use reupload_devproducts to clone an existing catalog).",
+      inputSchema: {
+        universeId: z.string(),
+        products: objectArg().pipe(
+          z
+            .array(
+              z.object({
+                name: z.string(),
+                priceInRobux: z.number(),
+                description: z.string().optional(),
+              })
+            )
+            .min(1)
+        ),
+        dryRun: z.boolean().default(false),
+      },
+    },
+    async ({ universeId, products, dryRun }) => {
+      const reason = gateToolCall("rocreate_create_devproducts");
+      if (reason) return blocked(reason);
+      const key = rocreateKey();
+      if (!key) return blocked("no RoCreate API key -- set rocreate.apiKey in config.json");
+      const plan = products.map((p) => ({
+        name: String(p.name ?? "").trim(),
+        priceInRobux: Number(p.priceInRobux),
+        description: p.description,
+      }));
+      if (dryRun) return jsonResult({ dryRun: true, universeId, wouldCreate: plan });
+      const out: any[] = [];
+      for (const p of plan) {
+        if (!p.name || !Number.isFinite(p.priceInRobux) || p.priceInRobux < 1) {
+          out.push({ name: p.name, ok: false, error: "missing name or price < 1" });
+          continue;
+        }
+        const r = await createDeveloperProduct({
+          apiKey: key,
+          universeId,
+          name: p.name,
+          description: p.description,
+          priceInRobux: p.priceInRobux,
+        });
+        if (r.ok) {
+          const newId = String((r.data as any)?.id ?? (r.data as any)?.productId ?? "");
+          out.push({ name: p.name, newId, priceInRobux: p.priceInRobux, ok: true });
+        } else {
+          out.push({ name: p.name, ok: false, error: r.error });
+        }
+      }
+      return jsonResult({ universeId, created: out.filter((o) => o.ok).length, results: out });
+    }
+  );
+
+  server.registerTool(
     "rocreate_reupload_gamepasses",
     {
       title: "RoCreate Reupload Game Passes",

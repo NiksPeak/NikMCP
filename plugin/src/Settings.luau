@@ -48,6 +48,7 @@ Settings.TOOLS = {
 	{ name = "rocreate_reupload_assets", group = "write", label = "RoCreate reupload assets" },
 	{ name = "rocreate_apply_asset_map", group = "write", label = "RoCreate apply asset map" },
 	{ name = "rocreate_reupload_devproducts", group = "write", label = "RoCreate reupload dev products" },
+	{ name = "rocreate_create_devproducts", group = "write", label = "RoCreate create dev products" },
 	{ name = "rocreate_reupload_gamepasses", group = "write", label = "RoCreate reupload game passes" },
 	{ name = "rocreate_rewrite_monetization_module", group = "write", label = "RoCreate rewrite monetization module" },
 	{ name = "set_selection", group = "write", label = "Set selection" },

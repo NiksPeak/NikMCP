@@ -1,6 +1,6 @@
 # Roblox Studio MCP (dual-context)
 
-**Version 0.1.3** — July 2, 2026.
+**Version 0.1.5** — July 3, 2026.
 
 A local AI-to-Studio bridge. An MCP client (Claude Desktop / Claude Code / Cursor) calls tools
 like `run_luau` or `get_instance_tree`; the call travels **MCP client → (stdio) → Node MCP
