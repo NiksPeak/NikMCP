@@ -443,67 +443,9 @@ export async function listGamePasses(apiKey: string, universeId: string) {
   );
 }
 
-// ---------- cookie-side: legacy animation / mesh upload -----------------------
-// Open Cloud cannot reupload an animation from existing bytes, so the raw
-// KeyframeSequence binary (from downloadAssetBytes) is POSTed to the legacy
-// endpoint. kartFr's confirmed path. Response 200 body = new asset id (integer).
-
-export async function uploadAnimationLegacy(opts: {
-  cookie: CookieClient;
-  bytes: Buffer;
-  name: string;
-  description?: string;
-  groupId?: string;
-}): Promise<{ ok: true; assetId: string } | { ok: false; error: string; cookieExpired?: boolean }> {
-  const params = new URLSearchParams({
-    assetTypeName: "Animation",
-    name: opts.name,
-    description: opts.description ?? "",
-  });
-  if (opts.groupId) params.set("groupId", opts.groupId);
-  const url = `https://www.roblox.com/ide/publish/UploadNewAnimation?${params.toString()}`;
-  const res = await opts.cookie.fetch(url, {
-    method: "POST",
-    body: new Uint8Array(opts.bytes),
-  });
-  const text = await res.text();
-  if (res.ok) {
-    const id = text.trim();
-    if (/^\d+$/.test(id)) return { ok: true, assetId: id };
-    return { ok: false, error: `unexpected upload response: ${text.slice(0, 120)}` };
-  }
-  if (text.includes("NotLoggedIn") || res.status === 401) {
-    return { ok: false, error: "cookie expired -- re-enter in the RoCreate tab", cookieExpired: true };
-  }
-  if (text.includes("Inappropriate name or description")) {
-    return { ok: false, error: "animation name/description was moderated" };
-  }
-  return { ok: false, error: `animation upload failed (${res.status}): ${text.slice(0, 120)}` };
-}
-
-export async function uploadMeshLegacy(opts: {
-  cookie: CookieClient;
-  bytes: Buffer;
-  name: string;
-  description?: string;
-  groupId?: string;
-}): Promise<{ ok: true; assetId: string } | { ok: false; error: string; cookieExpired?: boolean }> {
-  const params = new URLSearchParams({
-    assetTypeName: "Mesh",
-    name: opts.name,
-    description: opts.description ?? "",
-  });
-  if (opts.groupId) params.set("groupId", opts.groupId);
-  const url = `https://data.roblox.com/ide/publish/UploadNewMesh?${params.toString()}`;
-  const res = await opts.cookie.fetch(url, { method: "POST", body: new Uint8Array(opts.bytes) });
-  const text = await res.text();
-  if (res.ok) {
-    const id = text.trim();
-    if (/^\d+$/.test(id)) return { ok: true, assetId: id };
-    return { ok: false, error: `unexpected mesh response: ${text.slice(0, 120)}` };
-  }
-  if (text.includes("NotLoggedIn") || res.status === 401) {
-    return { ok: false, error: "cookie expired -- re-enter in the RoCreate tab", cookieExpired: true };
-  }
-  return { ok: false, error: `mesh upload failed (${res.status}): ${text.slice(0, 120)}` };
-}
+// NOTE: the legacy cookie upload endpoints (www.roblox.com/ide/publish/
+// UploadNewAnimation and data.roblox.com/ide/publish/UploadNewMesh) were RETIRED
+// by Roblox (410/404 as of 2026). Animation and Mesh are now first-class Open
+// Cloud asset types (assets/v1/assets, assetType "Animation"/"Mesh", model/x-rbxm),
+// so reupload routes through the KEY path in mcp-server (uploadAsset) -- no cookie
+// upload, no CSRF. The cookie is still used ONLY to DOWNLOAD restricted asset bytes.

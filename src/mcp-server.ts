@@ -46,7 +46,6 @@ import {
   lock as rocreateLock,
   setCookieSecret,
   hasCookieSecret,
-  markCookieExpired,
   secretsStatus,
 } from "./rocreate-secrets.js";
 import {
@@ -54,8 +53,6 @@ import {
   downloadAssetBytes,
   grantAssetPermission,
   uploadAsset as ocUploadAsset,
-  uploadAnimationLegacy,
-  uploadMeshLegacy,
   createDeveloperProduct,
   listDeveloperProducts,
   createGamePass,
@@ -2839,12 +2836,13 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       description:
         "Reupload YOUR OWN assets under a per-run creator and record old->new in " +
         "~/.nikmcp/rocreate-map.json. Per asset: download bytes (public CDN, else the " +
-        "unlocked cookie) -> image/audio create via the OC key -> mesh/animation upload via " +
-        "the legacy cookie endpoint -> grant permission for restricted types (verified, not " +
-        "trusted) -> record. HARD LIMITS: moves only content your credentials can reach " +
-        "(private/unowned won't download -- reported, never faked); animation/mesh REQUIRE an " +
-        "unlocked cookie (Open Cloud cannot reupload them from an ID); audio has a monthly " +
-        "quota. A restricted asset whose universe grant returns 200 but is NOT confirmed " +
+        "unlocked cookie) -> create via the Open Cloud KEY (image/audio/animation/mesh -- " +
+        "animation & mesh are Open Cloud asset types as of Oct 2025, uploaded as the " +
+        "downloaded .rbxm) -> grant permission for restricted types (audio/animation, " +
+        "verified not trusted) -> record. HARD LIMITS: moves only content your credentials " +
+        "can reach (private/unowned won't download -- reported, never faked); animation/mesh " +
+        "downloads REQUIRE an unlocked cookie (restricted); audio has a monthly quota. A " +
+        "restricted asset whose universe grant returns 200 but is NOT confirmed " +
         "(missing asset-permissions:write scope) is recorded 'pending', never 'ok'. An id " +
         "already reuploaded ok is SKIPPED on re-run (no double-upload) unless force:true. " +
         "dryRun returns the plan with no writes. Provide ids:[{kind,id}] or fromScan with a " +
@@ -2896,9 +2894,6 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       const existing = readMap();
       const results: MapEntry[] = [];
       const skipped: { kind: string; oldId: string; newId: string }[] = [];
-      // Once the cookie 401s mid-run it is dead for the rest of the batch -- do not
-      // re-hit it item after item (Gate 3: never loop a dead cookie).
-      let cookieDead = false;
 
       // Grant a restricted asset (audio/animation) to the target universe and
       // report honestly. A grant that returns 200 but does not confirm the asset
@@ -2928,17 +2923,6 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
           skipped.push({ kind: item.kind, oldId: item.id, newId: prior.newId });
           continue;
         }
-        const usesCookie = item.kind === "animation" || item.kind === "mesh";
-        if (usesCookie && cookieDead) {
-          results.push({
-            kind: item.kind,
-            oldId: item.id,
-            newId: "",
-            status: "failed",
-            note: "cookie expired -- re-enter in the RoCreate tab",
-          });
-          continue;
-        }
         try {
           const dl = await downloadAssetBytes({ assetId: item.id, cookie, placeId });
           if (!dl.ok || !dl.bytes) {
@@ -2954,52 +2938,49 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
           let newId = "";
           let note: string | undefined;
           let status: MapEntry["status"] = "ok";
-          if (item.kind === "image" || item.kind === "audio") {
-            const up = await ocUploadAsset({
-              apiKey: key,
-              creator: cr.type === "user" ? { userId: Number(cr.id) } : { groupId: Number(cr.id) },
-              assetType: item.kind === "image" ? "Image" : "Audio",
-              displayName: `reupload_${item.id}`,
-              bytes: dl.bytes,
-              contentType: item.kind === "image" ? "image/png" : "audio/mpeg",
-            }).then(
-              (r) => ({ ok: true as const, ...r }),
-              (e) => ({ ok: false as const, error: e instanceof Error ? e.message : String(e) })
-            );
-            if (!up.ok) {
-              results.push({ kind: item.kind, oldId: item.id, newId: "", status: "failed", note: up.error });
-              continue;
-            }
-            newId = up.assetId;
-            note = `moderation=${up.moderationState}`;
-            // Audio is a restricted type -> grant + verify (status "pending" if unapplied).
-            if (item.kind === "audio") {
-              const g = await grantRestricted(newId);
-              status = g.status;
-              note += g.note;
-            }
-          } else {
-            // mesh / animation -> legacy cookie upload of the raw bytes
-            const grp = cr.type === "group" ? cr.id : undefined;
-            const up =
-              item.kind === "animation"
-                ? await uploadAnimationLegacy({ cookie: cookie!, bytes: dl.bytes, name: `reupload_${item.id}`, groupId: grp })
-                : await uploadMeshLegacy({ cookie: cookie!, bytes: dl.bytes, name: `reupload_${item.id}`, groupId: grp });
-            if (!up.ok) {
-              if (up.cookieExpired) {
-                markCookieExpired();
-                cookieDead = true;
-              }
-              results.push({ kind: item.kind, oldId: item.id, newId: "", status: "failed", note: up.error });
-              continue;
-            }
-            newId = up.assetId;
-            // Animation is also a restricted type -> grant + verify, same as audio.
-            if (item.kind === "animation") {
-              const g = await grantRestricted(newId);
-              status = g.status;
-              note = (note ?? "") + g.note;
-            }
+          // All four kinds now upload through the Open Cloud KEY path. Roblox
+          // retired the legacy ide/publish endpoints (410/404) and made Animation
+          // and Mesh first-class Open Cloud asset types (Oct 2025). assetdelivery
+          // returns animations/meshes already wrapped as binary .rbxm ("<roblox!"),
+          // which is exactly the model/x-rbxm fileContent Open Cloud wants -- proven
+          // live end-to-end for Animation (2026-07-04).
+          const assetType =
+            item.kind === "image"
+              ? "Image"
+              : item.kind === "audio"
+                ? "Audio"
+                : item.kind === "animation"
+                  ? "Animation"
+                  : "Mesh";
+          const contentType =
+            item.kind === "image"
+              ? "image/png"
+              : item.kind === "audio"
+                ? "audio/mpeg"
+                : "model/x-rbxm";
+          const up = await ocUploadAsset({
+            apiKey: key,
+            creator: cr.type === "user" ? { userId: Number(cr.id) } : { groupId: Number(cr.id) },
+            assetType,
+            displayName: `reupload_${item.id}`,
+            bytes: dl.bytes,
+            contentType,
+          }).then(
+            (r) => ({ ok: true as const, ...r }),
+            (e) => ({ ok: false as const, error: e instanceof Error ? e.message : String(e) })
+          );
+          if (!up.ok) {
+            results.push({ kind: item.kind, oldId: item.id, newId: "", status: "failed", note: up.error });
+            continue;
+          }
+          newId = up.assetId;
+          note = `moderation=${up.moderationState}`;
+          // Audio and Animation are restricted types -> grant + verify (status
+          // "pending" if the grant returns 200 but is unconfirmed).
+          if (item.kind === "audio" || item.kind === "animation") {
+            const g = await grantRestricted(newId);
+            status = g.status;
+            note += g.note;
           }
           results.push({ kind: item.kind, oldId: item.id, newId, status, note });
         } catch (e) {

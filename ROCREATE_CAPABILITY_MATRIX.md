@@ -53,10 +53,25 @@ private/unowned asset won't download.
 kartFr has **no image/decal/texture download-reupload path at all** — only Animation, Mesh, Sound. Images
 route through the CDN download + **OC key** create-asset (Image), which NikMCP already does.
 
-### Unknown B — animation upload — **(b) legacy web endpoint, NOT Open Cloud**
-Decisive: Open Cloud **cannot** reupload an animation from an existing ID. RoCreate only uploads a `.rbxm`
-the user hands it (`assetUploadValidation.ts` maps `.rbxm`→`model/x-rbxm`), and Luau cannot emit `.rbxm`
-bytes at runtime. kartFr uses the legacy path:
+### Unknown B — animation upload — **UPDATED 2026-07-04: Open Cloud KEY path (legacy endpoint is dead)**
+**Superseded finding.** The original conclusion (legacy `UploadNewAnimation`) is now WRONG: Roblox
+**retired** both `www.roblox.com/ide/publish/UploadNewAnimation` and `data.roblox.com/ide/publish/
+UploadNewMesh` (410/404 as of 2026), and on **2025-10-23 made Animation + Mesh first-class Open Cloud
+asset types**. The correct current path, **proven live end-to-end 2026-07-04**:
+- `POST https://apis.roblox.com/assets/v1/assets` (the same key path as image/audio), multipart
+  `request` JSON `{assetType:"Animation"|"Mesh", displayName, creationContext:{creator}}` + `fileContent`
+  as **`model/x-rbxm`**, then poll `/assets/v1/operations/{id}` -> `response.assetId`.
+- **Key insight:** `assetdelivery.roblox.com/v2/assetId/{id}` returns an animation/mesh already wrapped
+  as a **binary `.rbxm`** (magic `<roblox!`, hex `3c726f626c6f7821`) -- exactly the `model/x-rbxm`
+  fileContent Open Cloud wants. So the flow is: download bytes (cookie for restricted) -> OC key upload.
+  No cookie upload, no CSRF, no legacy endpoint. Verified: public animation 507770239 -> new Animation
+  asset, Approved. Animation/Mesh are restricted-ish; audio+animation also get the universe grant.
+- Cookie is now used ONLY to DOWNLOAD restricted asset bytes; all UPLOADS are key-based.
+
+Historical note (the now-dead path, kept for provenance): kartFr 1.5.0 (Feb 2026) used the legacy
+endpoint; its open PRs #216/#228/#233/#244 migrate to exactly this Open Cloud path.
+
+Original (superseded) reasoning:
 - `POST https://www.roblox.com/ide/publish/UploadNewAnimation?assetTypeName=Animation&name=<enc>&description=<enc>[&groupId=<id>]`
 - headers: `User-Agent: RobloxStudio/WinInet`, `x-csrf-token: <token>`, cookie `.ROBLOSECURITY`. No explicit
   `Content-Type` (kartFr leaves it default — flag: Roblox's exact requirement here is **unconfirmed**).

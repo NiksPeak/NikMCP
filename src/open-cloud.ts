@@ -82,7 +82,7 @@ async function fetchJson(url: string, init: RequestInit, apiKey: string): Promis
 export async function uploadAsset(opts: {
   apiKey: string;
   creator: OpenCloudCreator;
-  assetType: "Image" | "Decal" | "Audio" | "Model";
+  assetType: "Image" | "Decal" | "Audio" | "Model" | "Animation" | "Mesh";
   displayName: string;
   description?: string;
   bytes: Buffer;

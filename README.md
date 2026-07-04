@@ -215,12 +215,14 @@ Password-gated auto-reupload of **your own** content — images, audio, meshes, 
 products, game passes — under a per-run target creator, then rewire the place to the new IDs.
 Locked behind a 4th dock tab; nothing sensitive is ever committed.
 
-**Auth split** (see `ROCREATE_CAPABILITY_MATRIX.md` for endpoint provenance): almost everything is
-**Open Cloud key** only (create asset, grant permission, create/list dev-products + game-passes). The
-**cookie** does exactly two things the key can't — download the bytes of an existing asset ID, and the
-one upload Open Cloud refuses (**animation/mesh reupload**, via the legacy `UploadNewAnimation`/
-`UploadNewMesh` endpoints with the raw KeyframeSequence/mesh bytes). Place association is auto-satisfied:
-the download passes `game.PlaceId` (NikMCP runs inside the place) as `Roblox-Place-Id`.
+**Auth split** (see `ROCREATE_CAPABILITY_MATRIX.md` for endpoint provenance): **all uploads use the
+Open Cloud key** — image, audio, animation, and mesh (animation & mesh became Open Cloud asset types in
+Oct 2025; `assetdelivery` returns them already wrapped as binary `.rbxm`, exactly the `model/x-rbxm`
+fileContent the Assets API wants). The **cookie** does exactly one thing the key can't — **download** the
+bytes of a *restricted* existing asset ID (audio/animation/mesh); public assets download cookie-free.
+Restricted downloads auto-pass `game.PlaceId` (NikMCP runs inside the place) as `Roblox-Place-Id`. The
+legacy `ide/publish/UploadNewAnimation`/`UploadNewMesh` endpoints Roblox retired (410/404) are no longer
+used.
 
 **Secrets** — the API key lives in the gitignored `config.json` `rocreate.apiKey` block (env
 `ROCREATE_API_KEY` overrides; falls back to `openCloud.apiKey`). The `.ROBLOSECURITY` cookie is
