@@ -3149,7 +3149,11 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       const plan = src.items.map((p: any) => ({
         oldId: String(p.id ?? p.productId ?? p.developerProductId ?? ""),
         name: String(p.name ?? ""),
-        priceInRobux: Number(p.priceInRobux ?? p.price ?? 0),
+        // OC list nests price at priceInformation.defaultPriceInRobux (confirmed
+        // live 2026-07-04); flat fields are older/fallback shapes.
+        priceInRobux: Number(
+          p.priceInformation?.defaultPriceInRobux ?? p.priceInRobux ?? p.price ?? 0
+        ),
       }));
       if (dryRun) return jsonResult({ dryRun: true, toUniverseId, wouldCreate: plan });
       const nowIso = new Date().toISOString();
@@ -3199,7 +3203,10 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       const plan = src.items.map((p: any) => ({
         oldId: String(p.id ?? p.gamePassId ?? ""),
         name: String(p.name ?? ""),
-        priceInRobux: Number(p.priceInRobux ?? p.price ?? 0),
+        // Same nested-price shape as dev products (defensive; flat fallbacks kept).
+        priceInRobux: Number(
+          p.priceInformation?.defaultPriceInRobux ?? p.priceInRobux ?? p.price ?? 0
+        ),
       }));
       if (dryRun) return jsonResult({ dryRun: true, toUniverseId, wouldCreate: plan });
       const nowIso = new Date().toISOString();
