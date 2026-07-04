@@ -2844,21 +2844,29 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         "trusted) -> record. HARD LIMITS: moves only content your credentials can reach " +
         "(private/unowned won't download -- reported, never faked); animation/mesh REQUIRE an " +
         "unlocked cookie (Open Cloud cannot reupload them from an ID); audio has a monthly " +
-        "quota. dryRun returns the plan with no writes. Provide ids:[{kind,id}] or fromScan " +
-        "with a prior scan's references.",
+        "quota. A restricted asset whose universe grant returns 200 but is NOT confirmed " +
+        "(missing asset-permissions:write scope) is recorded 'pending', never 'ok'. An id " +
+        "already reuploaded ok is SKIPPED on re-run (no double-upload) unless force:true. " +
+        "dryRun returns the plan with no writes. Provide ids:[{kind,id}] or fromScan with a " +
+        "prior scan's references.",
       inputSchema: {
         creator: creatorArg,
         ids: objectArg().pipe(z.array(z.object({ kind: RC_KIND_ARG, id: z.string() }))).optional(),
         placeId: z.string().optional(),
         grantUniverseId: z.string().optional(),
         dryRun: z.boolean().default(false),
+        // Re-run safety: by default an id already reuploaded ok (in the map) is
+        // SKIPPED so a re-run never double-uploads / re-burns audio quota. force
+        // re-uploads it anyway (creating a fresh new id).
+        force: z.boolean().default(false),
       },
     },
-    async ({ creator, ids, placeId, grantUniverseId, dryRun }) => {
+    async ({ creator, ids, placeId, grantUniverseId, dryRun, force }) => {
       const reason = gateToolCall("rocreate_reupload_assets");
       if (reason) return blocked(reason);
       const key = rocreateKey();
       if (!key) return blocked("no RoCreate API key -- set rocreate.apiKey in config.json");
+      const apiKey: string = key; // narrowed non-null for the closures below
       const list = ids ?? [];
       if (list.length === 0) return blocked("provide ids:[{kind,id}] (or run rocreate_scan_assets first)");
 
@@ -2885,8 +2893,52 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       }
 
       const nowIso = new Date().toISOString();
+      const existing = readMap();
       const results: MapEntry[] = [];
+      const skipped: { kind: string; oldId: string; newId: string }[] = [];
+      // Once the cookie 401s mid-run it is dead for the rest of the batch -- do not
+      // re-hit it item after item (Gate 3: never loop a dead cookie).
+      let cookieDead = false;
+
+      // Grant a restricted asset (audio/animation) to the target universe and
+      // report honestly. A grant that returns 200 but does not confirm the asset
+      // (missing asset-permissions:write scope) is NOT trusted -> the item is
+      // recorded "pending" (asset exists, but is not usable in the universe yet),
+      // never "ok". Returns the status the item should carry + a note fragment.
+      async function grantRestricted(
+        assetId: string
+      ): Promise<{ status: MapEntry["status"]; note: string }> {
+        if (!grantUniverseId) {
+          return { status: "ok", note: "" };
+        }
+        const grant = await grantAssetPermission({
+          apiKey,
+          assetId,
+          subjectType: "Universe",
+          subjectId: grantUniverseId,
+        });
+        if (grant.ok) return { status: "ok", note: "; granted" };
+        return { status: "pending", note: `; grant NOT applied: ${grant.error}` };
+      }
+
       for (const item of list) {
+        // Re-run dedup: skip an id already reuploaded ok unless force.
+        const prior = existing.entries[mapKey(item.kind as MapItemKind, item.id)];
+        if (!force && prior && prior.status === "ok" && prior.newId) {
+          skipped.push({ kind: item.kind, oldId: item.id, newId: prior.newId });
+          continue;
+        }
+        const usesCookie = item.kind === "animation" || item.kind === "mesh";
+        if (usesCookie && cookieDead) {
+          results.push({
+            kind: item.kind,
+            oldId: item.id,
+            newId: "",
+            status: "failed",
+            note: "cookie expired -- re-enter in the RoCreate tab",
+          });
+          continue;
+        }
         try {
           const dl = await downloadAssetBytes({ assetId: item.id, cookie, placeId });
           if (!dl.ok || !dl.bytes) {
@@ -2901,6 +2953,7 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
           }
           let newId = "";
           let note: string | undefined;
+          let status: MapEntry["status"] = "ok";
           if (item.kind === "image" || item.kind === "audio") {
             const up = await ocUploadAsset({
               apiKey: key,
@@ -2919,15 +2972,11 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
             }
             newId = up.assetId;
             note = `moderation=${up.moderationState}`;
-            // Restricted types (audio) need a grant to the target universe.
-            if (item.kind === "audio" && grantUniverseId) {
-              const grant = await grantAssetPermission({
-                apiKey: key,
-                assetId: newId,
-                subjectType: "Universe",
-                subjectId: grantUniverseId,
-              });
-              note += grant.ok ? "; granted" : `; grant WARNING: ${grant.error}`;
+            // Audio is a restricted type -> grant + verify (status "pending" if unapplied).
+            if (item.kind === "audio") {
+              const g = await grantRestricted(newId);
+              status = g.status;
+              note += g.note;
             }
           } else {
             // mesh / animation -> legacy cookie upload of the raw bytes
@@ -2937,13 +2986,22 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
                 ? await uploadAnimationLegacy({ cookie: cookie!, bytes: dl.bytes, name: `reupload_${item.id}`, groupId: grp })
                 : await uploadMeshLegacy({ cookie: cookie!, bytes: dl.bytes, name: `reupload_${item.id}`, groupId: grp });
             if (!up.ok) {
-              if (up.cookieExpired) markCookieExpired();
+              if (up.cookieExpired) {
+                markCookieExpired();
+                cookieDead = true;
+              }
               results.push({ kind: item.kind, oldId: item.id, newId: "", status: "failed", note: up.error });
               continue;
             }
             newId = up.assetId;
+            // Animation is also a restricted type -> grant + verify, same as audio.
+            if (item.kind === "animation") {
+              const g = await grantRestricted(newId);
+              status = g.status;
+              note = (note ?? "") + g.note;
+            }
           }
-          results.push({ kind: item.kind, oldId: item.id, newId, status: "ok", note });
+          results.push({ kind: item.kind, oldId: item.id, newId, status, note });
         } catch (e) {
           results.push({
             kind: item.kind,
@@ -2954,9 +3012,17 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
           });
         }
       }
-      writeMapEntries(results, nowIso);
+      if (results.length) writeMapEntries(results, nowIso);
       const ok = results.filter((r) => r.status === "ok").length;
-      return jsonResult({ creator: cr, uploaded: ok, failed: results.length - ok, results });
+      const pending = results.filter((r) => r.status === "pending").length;
+      return jsonResult({
+        creator: cr,
+        uploaded: ok,
+        pending,
+        failed: results.filter((r) => r.status === "failed").length,
+        skipped,
+        results,
+      });
     }
   );
 
@@ -2966,11 +3032,13 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       title: "RoCreate Apply Asset Map",
       description:
         "Rewire the place from ~/.nikmcp/rocreate-map.json: set each old asset property to " +
-        "rbxassetid://<newId> in ONE ChangeHistory recording (one undo reverts all), and " +
-        "swap old->new IDs in script sources via find_and_replace_in_scripts. Only 'ok' map " +
-        "entries with a newId are applied. dryRun shows the planned property + script changes " +
-        "with no writes. Edit mode only. Pair with rocreate_scan_assets (which records the " +
-        "path/prop each id came from -- pass a scan to target exact properties).",
+        "rbxassetid://<newId>, and swap old->new IDs in script sources via " +
+        "find_and_replace_in_scripts. Only 'ok' map entries with a newId are applied (a " +
+        "'pending' entry -- e.g. an ungranted audio -- is intentionally NOT wired). NOTE: each " +
+        "property change and each script replacement is its OWN undo step (a single batched " +
+        "undo would need a dedicated plugin command); undo may take several Ctrl+Z. dryRun " +
+        "shows the planned changes with no writes. Edit mode only. Pair with rocreate_scan_assets " +
+        "(which records the path/prop each id came from -- pass a scan to target exact properties).",
       inputSchema: {
         scan: objectArg()
           .pipe(z.object({ references: z.array(z.object({ path: z.string(), prop: z.string(), id: z.string() })) }))

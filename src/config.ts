@@ -99,11 +99,14 @@ export function resolveConfig(argv: string[] = process.argv.slice(2)): AppConfig
       // ships "") to undefined so rocreateKey() honors its `string | null` contract
       // and an empty key can never reach the OC client -- same guard the openCloud
       // creator ids use above.
+      // Trim before use: a key pasted with a stray leading/trailing space or
+      // newline is sent verbatim in x-api-key and Roblox 401s it -- the exact
+      // "my valid key doesn't work" trap. `|| undefined` still coerces empty.
       apiKey:
-        (process.env.ROCREATE_API_KEY ??
+        ((process.env.ROCREATE_API_KEY ??
           fileCfg.rocreate?.apiKey ??
           process.env.ROBLOX_API_KEY ??
-          fileOpenCloud.apiKey) || undefined,
+          fileOpenCloud.apiKey) || "").trim() || undefined,
     },
   };
 }

@@ -63,7 +63,13 @@ async function fetchJson(url: string, init: RequestInit, apiKey: string): Promis
     res = await fetch(url, init);
   }
   if (res.status === 401 || res.status === 403) {
-    throw new Error("Open Cloud key invalid or missing asset:write permission for this creator");
+    // The commonest cause of a 401 with a "valid" key is a STALE key: config.json
+    // is read once at server startup, so a key edited after start is never picked
+    // up until the MCP server is restarted / reconnected.
+    throw new Error(
+      `Open Cloud key rejected (${res.status}): invalid, or missing the asset scope for this creator. ` +
+        "If you just changed the key in config.json, restart/reconnect the MCP server -- config is read once at startup."
+    );
   }
   if (!res.ok) {
     const bodyText = await res.text().catch(() => "");

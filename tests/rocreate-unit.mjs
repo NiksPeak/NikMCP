@@ -10,7 +10,7 @@ import {
   useCookie,
 } from "../dist/rocreate-secrets.js";
 import { previewRewrite, applyRewrite, verifyRewrite } from "../dist/rocreate-rewrite.js";
-import { CookieClient, mapKey } from "../dist/rocreate.js";
+import { CookieClient, mapKey, ocErrorText, grantAssetPermission } from "../dist/rocreate.js";
 
 let n = 0;
 function check(name, fn) {
@@ -131,6 +131,65 @@ await acheck("CookieClient does the reactive CSRF retry (403 -> token -> retry)"
 check("no unlock session -> isUnlocked false, useCookie null (tools must refuse)", () => {
   assert.strictEqual(isUnlocked(), false);
   assert.strictEqual(useCookie(), null);
+});
+
+// --- OC error legibility: object error shape must not collapse to [object Object] ---
+check("ocErrorText surfaces nested {error:{code,message}} (no [object Object])", () => {
+  const t = ocErrorText({ error: { code: "InvalidUniverse", message: "universe not found" } }, "", 400);
+  assert.ok(t.includes("universe not found"), t);
+  assert.ok(t.includes("InvalidUniverse"), t);
+  assert.ok(!/\[object Object\]/.test(t), t);
+});
+check("ocErrorText surfaces {errors:[{message}]} and {message}", () => {
+  assert.ok(ocErrorText({ errors: [{ message: "scope missing", code: 7 }] }, "", 403).includes("scope missing"));
+  assert.ok(ocErrorText({ message: "bad request" }, "", 400).includes("bad request"));
+});
+check("ocErrorText appends the stale-key restart hint on 401/403 only", () => {
+  assert.ok(/restart\/reconnect/.test(ocErrorText({ message: "x" }, "", 401)), "401 gets hint");
+  assert.ok(/restart\/reconnect/.test(ocErrorText({ message: "x" }, "", 403)), "403 gets hint");
+  assert.ok(!/restart\/reconnect/.test(ocErrorText({ message: "x" }, "", 429)), "429 no hint");
+});
+check("ocErrorText falls back to raw text when body has no known field", () => {
+  const t = ocErrorText({}, "Internal Server Error", 500);
+  assert.ok(t.includes("Internal Server Error"), t);
+});
+
+// --- grant-verify integrity: 200 without the asset in successAssetIds = NOT ok ---
+await acheck("grant returning 200 but NOT confirming the asset -> ok:false (unapplied)", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ successAssetIds: [] }), { status: 200 });
+  try {
+    const r = await grantAssetPermission({ apiKey: "k", assetId: "555", subjectType: "Universe", subjectId: "1" });
+    assert.strictEqual(r.ok, false, "unconfirmed grant must be ok:false");
+    assert.ok(/did not confirm|asset-permissions:write/.test(r.error ?? ""), r.error);
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+await acheck("grant confirming the asset in successAssetIds -> ok:true", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ successAssetIds: [555] }), { status: 200 });
+  try {
+    const r = await grantAssetPermission({ apiKey: "k", assetId: "555", subjectType: "Universe", subjectId: "1" });
+    assert.strictEqual(r.ok, true);
+    assert.ok(r.grantedAssetIds.includes("555"));
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+await acheck("grant 403 surfaces a legible error with the stale-key hint", async () => {
+  const orig = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: { code: "CannotManageAsset" } }), { status: 403 });
+  try {
+    const r = await grantAssetPermission({ apiKey: "k", assetId: "5", subjectType: "Universe", subjectId: "1" });
+    assert.strictEqual(r.ok, false);
+    assert.ok(/restart\/reconnect/.test(r.error ?? ""), r.error);
+  } finally {
+    globalThis.fetch = orig;
+  }
 });
 
 console.log(`rocreate-unit self-check: PASS (${n} cases)`);

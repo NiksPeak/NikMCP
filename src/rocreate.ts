@@ -259,11 +259,17 @@ export async function grantAssetPermission(opts: {
   }
   if (!res.ok) {
     const code = data?.error?.code;
+    const mapped = typeof code === "string" ? GRANT_ERROR_MESSAGES[code] : undefined;
     const msg =
       (typeof data?.error?.message === "string" && data.error.message) ||
-      GRANT_ERROR_MESSAGES[code] ||
-      `grant failed (${res.status})`;
-    return { ok: false, grantedAssetIds: [], error: redactKey(String(msg), apiKey) };
+      mapped ||
+      "";
+    const hint = res.status === 401 || res.status === 403 ? STALE_KEY_HINT : "";
+    return {
+      ok: false,
+      grantedAssetIds: [],
+      error: redactKey(`grant failed (${res.status})${msg ? `: ${msg}` : ""}${hint}`, apiKey),
+    };
   }
   const granted = Array.isArray(data?.successAssetIds) ? data.successAssetIds.map(String) : [];
   // Verify-don't-trust-the-200: if the asset id is not echoed in successAssetIds,
@@ -288,6 +294,29 @@ const RETRY_BACKOFF_MS = [1000, 2000, 4000];
 
 function isRetryable(status: number): boolean {
   return status === 429 || status >= 500;
+}
+
+// Appended on 401/403 -- the commonest "my valid key fails" cause is a STALE key
+// (config.json is read once at server startup; a key edited after start is not
+// picked up until restart/reconnect).
+const STALE_KEY_HINT =
+  " -- if you just changed the key, restart/reconnect the MCP server (config is read once at startup)";
+
+// Pull the legible OC message + code from a parsed body of ANY of the shapes the
+// OC endpoints use: { message }, { error: { code, message } }, { errors: [{ code,
+// message }] }, or raw text. Prevents the "[object Object]" collapse when `error`
+// is a nested object rather than a string.
+export function ocErrorText(data: any, rawText: string, status: number): string {
+  const msg =
+    (typeof data?.message === "string" && data.message) ||
+    (typeof data?.error?.message === "string" && data.error.message) ||
+    (Array.isArray(data?.errors) && typeof data.errors[0]?.message === "string" && data.errors[0].message) ||
+    (typeof data?.error === "string" && data.error) ||
+    (rawText ? rawText.slice(0, 200) : "");
+  const code = data?.error?.code ?? data?.errors?.[0]?.code ?? data?.code;
+  const codeStr = code !== undefined && code !== null ? ` [code ${code}]` : "";
+  const hint = status === 401 || status === 403 ? STALE_KEY_HINT : "";
+  return `(${status})${msg ? `: ${msg}` : ""}${codeStr}${hint}`;
 }
 
 async function ocCreateMultipart(
@@ -318,8 +347,7 @@ async function ocCreateMultipart(
     }
     if (res.ok) return { ok: true, data };
     if (!isRetryable(res.status) || attempt === RETRY_BACKOFF_MS.length - 1) {
-      const msg = data?.message ?? data?.error ?? `${res.status}`;
-      return { ok: false, status: res.status, error: redactKey(`create failed: ${msg}`, apiKey) };
+      return { ok: false, status: res.status, error: redactKey(`create failed ${ocErrorText(data, text, res.status)}`, apiKey) };
     }
     const ra = Number(res.headers.get("Retry-After"));
     const delay = Math.min(Math.max(Number.isFinite(ra) ? ra * 1000 : RETRY_BACKOFF_MS[attempt], 250), 8000);
@@ -352,7 +380,11 @@ async function ocListByUniverse(
     } catch {
       data = {};
     }
-    if (!res.ok) return { ok: false, error: redactKey(`list failed (${res.status})`, apiKey) };
+    if (!res.ok) {
+      // Surface the OC error body (parsed above) so scope/universe reasons are
+      // legible instead of a bare status -- needs message+code+stale-key hint.
+      return { ok: false, error: redactKey(`list failed ${ocErrorText(data, text, res.status)}`, apiKey) };
+    }
     const arr = Array.isArray(data[key]) ? data[key] : [];
     items.push(...arr);
     pageToken = typeof data.nextPageToken === "string" && data.nextPageToken ? data.nextPageToken : null;
