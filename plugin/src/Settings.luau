@@ -21,6 +21,8 @@ Settings.TOOLS = {
 	{ name = "get_attributes", group = "read", label = "Get attributes" },
 	{ name = "grep_scripts", group = "read", label = "Grep scripts" },
 	{ name = "get_script_analysis", group = "read", label = "Script analysis" },
+	-- Bucket 4 QoL: CI-style lint gate (read-only luau-lsp pipeline reuse)
+	{ name = "luau_lint_gate", group = "read", label = "Luau lint gate" },
 	{ name = "mass_get_property", group = "read", label = "Mass get property" },
 	{ name = "get_class_info", group = "read", label = "Class info" },
 	{ name = "get_services", group = "read", label = "Get services" },
@@ -31,6 +33,20 @@ Settings.TOOLS = {
 	{ name = "get_file_tree", group = "read", label = "File tree" },
 	{ name = "search_by_property", group = "read", label = "Search by property" },
 	{ name = "get_tags", group = "read", label = "Get tags" },
+	-- Bucket 2: project understanding (remote/datastore inventory, require graph,
+	-- monetization map, place digest) -- all read-only
+	{ name = "remote_inventory", group = "read", label = "Remote inventory" },
+	{ name = "datastore_inventory", group = "read", label = "Datastore inventory" },
+	{ name = "require_graph", group = "read", label = "Require graph" },
+	{ name = "monetization_map", group = "read", label = "Monetization map" },
+	{ name = "place_digest", group = "read", label = "Place digest" },
+	-- Bucket 3: style / art direction (UI/world/lighting fingerprinting + layout
+	-- solver) -- all read-only
+	{ name = "ui_style_fingerprint", group = "read", label = "UI style fingerprint" },
+	{ name = "world_style_probe", group = "read", label = "World style probe" },
+	{ name = "lighting_profile", group = "read", label = "Lighting profile" },
+	{ name = "ui_layout_probe", group = "read", label = "UI layout probe" },
+	{ name = "art_direction_report", group = "read", label = "Art direction report" },
 	-- task 25: script sync (export/status read the place; import mutates it)
 	{ name = "export_scripts", group = "read", label = "Export scripts to disk" },
 	{ name = "sync_status", group = "read", label = "Script sync status" },
@@ -49,6 +65,11 @@ Settings.TOOLS = {
 	{ name = "rocreate_apply_asset_map", group = "write", label = "RoCreate apply asset map" },
 	{ name = "rocreate_reupload_devproducts", group = "write", label = "RoCreate reupload dev products" },
 	{ name = "rocreate_create_devproducts", group = "write", label = "RoCreate create dev products" },
+	{ name = "rocreate_upload_image", group = "write", label = "RoCreate upload image (local file)" },
+	{ name = "rocreate_upload_audio", group = "write", label = "RoCreate upload audio (local file)" },
+	{ name = "rocreate_upload_model", group = "write", label = "RoCreate upload model (local .fbx)" },
+	{ name = "rocreate_upload_folder", group = "write", label = "RoCreate upload folder (bulk local)" },
+	{ name = "rocreate_grant_asset", group = "write", label = "RoCreate grant asset permission" },
 	{ name = "rocreate_reupload_gamepasses", group = "write", label = "RoCreate reupload game passes" },
 	{ name = "rocreate_rewrite_monetization_module", group = "write", label = "RoCreate rewrite monetization module" },
 	{ name = "set_selection", group = "write", label = "Set selection" },
@@ -77,6 +98,8 @@ Settings.TOOLS = {
 	{ name = "mass_set_property", group = "write", label = "Mass set property" },
 	{ name = "set_properties", group = "write", label = "Set properties (multi)" },
 	{ name = "enable_playtest_agent", group = "write", label = "Enable playtest agent" },
+	-- Bucket 4 QoL: snapshot/diff/revert (revert mode is destructive)
+	{ name = "snapshot_revert", group = "write", label = "Snapshot / diff / revert" },
 	-- assets / marketplace
 	{ name = "get_asset_details", group = "assets", label = "Asset details" },
 	{ name = "get_asset_thumbnail", group = "assets", label = "Asset thumbnail" },
@@ -97,6 +120,15 @@ Settings.TOOLS = {
 	{ name = "play_animation", group = "experimental", label = "Play animation (server)" },
 	{ name = "client_query", group = "experimental", label = "Client query (F5 play)" },
 	{ name = "verify_playtest", group = "experimental", label = "Verify playtest (composite)" },
+	-- Bucket 4 QoL: playtest smoke test + hybrid multiplayer introspection
+	{ name = "playtest_smoke", group = "experimental", label = "Playtest smoke (composite)" },
+	{ name = "multiplayer_eval", group = "experimental", label = "Multiplayer eval (hybrid)" },
+	-- Bucket 1 "Eyes in Studio": capture/diff tools, grouped with capture_viewport
+	{ name = "orbit_capture", group = "experimental", label = "Orbit capture (multi-angle)" },
+	{ name = "selection_capture", group = "experimental", label = "Selection capture (highlighted)" },
+	{ name = "visual_diff", group = "experimental", label = "Visual diff (baseline/compare)" },
+	{ name = "ui_capture", group = "experimental", label = "UI capture (unsupported)" },
+	{ name = "playtest_gif", group = "experimental", label = "Playtest GIF (unsupported)" },
 	-- build / scene / view (Task 16)
 	{ name = "export_build", group = "scene", label = "Export build" },
 	{ name = "create_build", group = "scene", label = "Create build" },

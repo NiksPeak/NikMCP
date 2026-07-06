@@ -2,7 +2,7 @@ import express from "express";
 import type { Request, Response } from "express";
 import type { Server } from "node:http";
 import type { AppConfig } from "./config.js";
-import { HOST } from "./config.js";
+import { HOST, setRoCreateApiKey } from "./config.js";
 import type { Context, CommandResult } from "./types.js";
 import { dequeue, resolveResult, markSeen, isAlive } from "./queue.js";
 import { setSettings, checkAuth } from "./settings.js";
@@ -211,6 +211,21 @@ export function startBridge(cfg: AppConfig): void {
     }
     try {
       setCookieSecret(cookie, password);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: String(e) });
+    }
+  });
+
+  app.post("/rocreate/set-api-key", (req, res) => {
+    if (!authed(req, res)) return;
+    const apiKey = (req.body as { apiKey?: unknown } | undefined)?.apiKey;
+    if (typeof apiKey !== "string" || !apiKey.trim()) {
+      res.status(400).json({ ok: false, error: "api key required" });
+      return;
+    }
+    try {
+      setRoCreateApiKey(apiKey);
       res.json({ ok: true });
     } catch (e) {
       res.status(500).json({ ok: false, error: String(e) });

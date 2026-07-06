@@ -3,6 +3,9 @@
 // Pure Node, NO network, NO Studio. Run after `npm run build`:
 //   node tests/rocreate-unit.mjs
 import assert from "node:assert";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   encryptCookie,
   decryptCookie,
@@ -11,6 +14,7 @@ import {
 } from "../dist/rocreate-secrets.js";
 import { previewRewrite, applyRewrite, verifyRewrite } from "../dist/rocreate-rewrite.js";
 import { CookieClient, mapKey, ocErrorText, grantAssetPermission } from "../dist/rocreate.js";
+import { setRoCreateApiKey } from "../dist/config.js";
 
 let n = 0;
 function check(name, fn) {
@@ -131,6 +135,31 @@ await acheck("CookieClient does the reactive CSRF retry (403 -> token -> retry)"
 check("no unlock session -> isUnlocked false, useCookie null (tools must refuse)", () => {
   assert.strictEqual(isUnlocked(), false);
   assert.strictEqual(useCookie(), null);
+});
+
+// --- config.json RoCreate key writer ----------------------------------------
+check("setRoCreateApiKey creates config.json, trims key, and merges existing fields", () => {
+  const cwd = process.cwd();
+  const dir = mkdtempSync(join(tmpdir(), "nikmcp-rocreate-config-"));
+  try {
+    process.chdir(dir);
+    setRoCreateApiKey("  rc-key-1 \n");
+    assert.deepStrictEqual(JSON.parse(readFileSync("config.json", "utf8")), {
+      rocreate: { apiKey: "rc-key-1" },
+    });
+    writeFileSync("config.json", JSON.stringify({ port: 123, portRange: 2, rocreate: { old: true } }));
+    setRoCreateApiKey("rc-key-2");
+    assert.deepStrictEqual(JSON.parse(readFileSync("config.json", "utf8")), {
+      port: 123,
+      portRange: 2,
+      rocreate: { old: true, apiKey: "rc-key-2" },
+    });
+    writeFileSync("config.json", "{ nope");
+    assert.throws(() => setRoCreateApiKey("rc-key-3"), /JSON/);
+  } finally {
+    process.chdir(cwd);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // --- OC error legibility: object error shape must not collapse to [object Object] ---

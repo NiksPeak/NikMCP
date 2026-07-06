@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
 export interface AppConfig {
   port: number; // base port; the bridge binds the first free one in [port, port+portRange)
@@ -109,6 +109,31 @@ export function resolveConfig(argv: string[] = process.argv.slice(2)): AppConfig
           fileOpenCloud.apiKey) || "").trim() || undefined,
     },
   };
+}
+
+export function setRoCreateApiKey(apiKey: string): void {
+  const key = apiKey.trim();
+  if (!key) throw new Error("api key required");
+
+  let fileCfg: Record<string, unknown> = {};
+  if (existsSync("config.json")) {
+    const parsed = JSON.parse(readFileSync("config.json", "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("config.json must contain a JSON object");
+    }
+    fileCfg = parsed as Record<string, unknown>;
+  }
+
+  const rocreate =
+    fileCfg.rocreate && typeof fileCfg.rocreate === "object" && !Array.isArray(fileCfg.rocreate)
+      ? { ...(fileCfg.rocreate as Record<string, unknown>) }
+      : {};
+  rocreate.apiKey = key;
+  fileCfg.rocreate = rocreate;
+
+  const tmp = `config.json.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  writeFileSync(tmp, JSON.stringify(fileCfg, null, 2) + "\n");
+  renameSync(tmp, "config.json");
 }
 
 function parsePortFlag(argv: string[]): number | undefined {

@@ -91,8 +91,21 @@ export const WRITE_TOOLS = new Set<string>([
   "rocreate_apply_asset_map",
   "rocreate_reupload_devproducts",
   "rocreate_create_devproducts",
+  "rocreate_upload_image",
+  "rocreate_upload_audio",
+  "rocreate_upload_model",
+  "rocreate_upload_folder",
+  "rocreate_grant_asset",
   "rocreate_reupload_gamepasses",
   "rocreate_rewrite_monetization_module",
+  // Bucket 4 QoL: playtest_smoke starts/stops playtests + runs code (mirrors
+  // verify_playtest exactly); snapshot_revert's revert mode deletes+reimports
+  // (snapshot/diff/list are reads, but gating is tool-level); multiplayer_eval's
+  // serverLuau runs arbitrary code (mirrors run_luau exactly). luau_lint_gate is
+  // read-only and intentionally NOT here.
+  "playtest_smoke",
+  "snapshot_revert",
+  "multiplayer_eval",
 ]);
 
 const DEFAULTS: Settings = {

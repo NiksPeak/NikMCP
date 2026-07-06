@@ -706,6 +706,21 @@ status.onRocreateSetCreds = function(cookie: string, password: string): string
 	return "save failed"
 end
 
+status.onRocreateSetApiKey = function(apiKey: string): string
+	local trimmed = apiKey:gsub("^%s+", ""):gsub("%s+$", "")
+	if trimmed == "" then
+		return "enter an API key"
+	end
+	local ok, data = rocreatePost("/rocreate/set-api-key", { apiKey = trimmed })
+	if ok then
+		return "API key saved -- restart the MCP server (kill node + /mcp reconnect) to apply"
+	end
+	if typeof(data) == "table" and data.error then
+		return tostring(data.error)
+	end
+	return "save failed"
+end
+
 -- == Connect / Disconnect primary button (acts on the SELECTED port only) =====
 status.onPrimary = function()
 	if not selectedPort then

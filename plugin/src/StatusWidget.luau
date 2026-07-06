@@ -327,7 +327,7 @@ function StatusWidget.new(plugin: Plugin)
 	version.Size = UDim2.fromOffset(120, 9)
 	version.BackgroundTransparency = 1
 	version.Font = Enum.Font.Merriweather -- readable serif at small sizes
-	version.Text = "version 0.1.5"
+	version.Text = "version 0.1.7"
 	version.TextColor3 = Theme.subtext
 	version.TextXAlignment = Enum.TextXAlignment.Left
 	version.TextYAlignment = Enum.TextYAlignment.Top
@@ -361,6 +361,7 @@ function StatusWidget.new(plugin: Plugin)
 	self.onRocreateUnlock = nil -- (password) -> "ok" | "wrong password" | error string
 	self.onRocreateLock = nil -- () -> ()
 	self.onRocreateSetCreds = nil -- (cookie, password) -> "ok" | error string
+	self.onRocreateSetApiKey = nil -- (apiKey) -> "ok" | error string
 
 	-- Header: lifted gradient panel with title + subtitle and a status pill.
 	local header = Instance.new("Frame")
@@ -1298,6 +1299,20 @@ function StatusWidget:_buildRoCreate(view: ScrollingFrame)
 			local res = self.onRocreateSetCreds(cookieBox.Text, credPwBox.Text)
 			cookieBox.Text = ""
 			credPwBox.Text = ""
+			self:_setRocreateResult(res)
+		end
+	end)
+
+	local apiKeyBox = makeBox("paste RoCreate API key", false)
+	local saveKeyBtn = makeBtn("Save API key", Theme.accent)
+	saveKeyBtn.Size = UDim2.new(1, 0, 0, 30)
+	saveKeyBtn.LayoutOrder = nextOrder()
+	saveKeyBtn.Parent = view
+	saveKeyBtn.MouseButton1Click:Connect(function()
+		self:_click()
+		if self.onRocreateSetApiKey then
+			local res = self.onRocreateSetApiKey(apiKeyBox.Text)
+			apiKeyBox.Text = ""
 			self:_setRocreateResult(res)
 		end
 	end)
