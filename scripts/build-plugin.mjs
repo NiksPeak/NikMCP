@@ -8,7 +8,14 @@ import { dirname, join } from "node:path";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SRC = join(ROOT, "plugin", "src");
 const ROOT_NAME = "RobloxStudioMCP";
-const CHILDREN = ["Config", "Settings", "Serializer", "Executor", "StatusWidget", "RuntimeAgentSource", "ClientAgentSource"];
+const CHILDREN = ["Config", "Settings", "Serializer", "AnalysisTools", "Executor", "StatusWidget", "RuntimeAgentSource", "ClientAgentSource"];
+
+// Luau's bytecode compiler caps a single lexical scope at 200 local-variable
+// registers ("Out of local registers... exceeded limit 200" at compile time --
+// luau-lsp's static analysis does NOT catch this). Count top-level `local`
+// statements per module as a cheap proxy and fail the build before it ships a
+// module that will not compile in Studio.
+const LOCALS_LIMIT = 195;
 
 const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 function cdata(s) {
@@ -22,10 +29,18 @@ const nextRef = () => `RBX${ref++}`;
 
 function moduleItem(name) {
   const r = nextRef();
+  const src = read(name + ".luau");
+  const localCount = (src.match(/^local /gm) || []).length;
+  if (localCount > LOCALS_LIMIT) {
+    throw new Error(
+      `${name}.luau has ${localCount} top-level local statements (limit ${LOCALS_LIMIT}) -- ` +
+        `Luau's bytecode compiler caps a scope at 200 local registers. Split this module before building.`
+    );
+  }
   return `  <Item class="ModuleScript" referent="${r}">
    <Properties>
     <string name="Name">${esc(name)}</string>
-    <ProtectedString name="Source">${cdata(read(name + ".luau"))}</ProtectedString>
+    <ProtectedString name="Source">${cdata(src)}</ProtectedString>
    </Properties>
   </Item>
 `;
