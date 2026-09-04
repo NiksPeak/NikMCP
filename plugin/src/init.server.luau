@@ -16,7 +16,7 @@ local RuntimeAgentSource = require(script.RuntimeAgentSource)
 
 local CONTEXT = "edit"
 local AGENT_NAME = "MCP_RuntimeAgent"
-local AGENT_SOURCE_VERSION = "2026-09-03-v0.2.0-lease-aware"
+local AGENT_SOURCE_VERSION = "2026-09-03-v0.2.0-multilane"
 local STUDIO_SESSION_ID = HttpService:GenerateGUID(false)
 local TARGET_ID = "studio-" .. STUDIO_SESSION_ID
 local SETTING_PORTS = "NikMCP_CandidatePorts_v2"
@@ -24,6 +24,7 @@ local SETTING_ARMED = "NikMCP_PlaytestArmed"
 local SETTING_PORT_DIR = "NikMCP_PortDir"
 local SETTING_SETTINGS = "NikMCP_Settings"
 local SETTING_SELECTED = "NikMCP_SelectedPort"
+local SETTING_AGENT_OFF = "NikMCP_AgentPortsOff" -- ports the user excluded from the F5 agent
 
 -- == Candidate ports (persisted per-user; seeded with the auto-bind range) ====
 local function loadPorts(): { number }
@@ -57,6 +58,30 @@ end
 local candidatePorts = loadPorts()
 local function savePorts()
 	plugin:SetSetting(SETTING_PORTS, candidatePorts)
+end
+
+-- Per-port agent opt-out (persisted). Default: every connected port gets the
+-- runtime agent at the same time (one poll lane each inside the playtest).
+local function loadAgentPortsOff(): { [number]: boolean }
+	local stored = plugin:GetSetting(SETTING_AGENT_OFF)
+	local out: { [number]: boolean } = {}
+	if type(stored) == "table" then
+		for _, p in ipairs(stored) do
+			if type(p) == "number" then
+				out[p] = true
+			end
+		end
+	end
+	return out
+end
+local agentPortsOff = loadAgentPortsOff()
+local function saveAgentPortsOff()
+	local list = {}
+	for p in pairs(agentPortsOff) do
+		table.insert(list, p)
+	end
+	table.sort(list)
+	plugin:SetSetting(SETTING_AGENT_OFF, list)
 end
 
 local function loadArmed(): boolean
@@ -277,10 +302,29 @@ local function runtimePortCandidates(primaryPort: number): string
 	return table.concat(out, ",")
 end
 
+-- Comma list of every CONNECTED port the user has not excluded: the runtime
+-- agent opens one poll lane per entry, so several Node sessions share one F5.
+-- Empty when nothing is connected (agent falls back to auto-resolving one).
+local function agentPortsCsv(): string
+	local list = {}
+	for port in pairs(connections) do
+		if not agentPortsOff[port] then
+			table.insert(list, port)
+		end
+	end
+	table.sort(list)
+	local out = {}
+	for _, p in ipairs(list) do
+		table.insert(out, tostring(p))
+	end
+	return table.concat(out, ",")
+end
+
 local function stampPlaytestAgent(agent: Script, port: number)
 	agent.Archivable = true
 	agent:SetAttribute("McpPort", port)
 	agent:SetAttribute("McpPortCandidates", runtimePortCandidates(port))
+	agent:SetAttribute("McpAgentPorts", agentPortsCsv())
 	agent:SetAttribute("McpToken", (settings.auth.enabled and settings.auth.token) or "")
 	agent:SetAttribute("McpTargetId", TARGET_ID)
 end
@@ -394,18 +438,38 @@ local function stateDisplayOf(port: number?): string
 	return (c and DISPLAY[c.state]) or "Disconnected"
 end
 
--- Playtest agent row reflects the SELECTED port's heartbeat `server` flag.
+-- Agent lane rows for the dock: every connected port, whether the agent serves
+-- it (user toggle) and whether that lane is live right now.
+local function agentRows(): { { port: number, enabled: boolean, live: boolean } }
+	local rows = {}
+	for _, port in ipairs(candidatePorts) do
+		local conn = connections[port]
+		if conn then
+			table.insert(rows, { port = port, enabled = not agentPortsOff[port], live = conn.serverAlive == true })
+		end
+	end
+	return rows
+end
+
+-- Playtest agent row: live if ANY served lane reports the server flag (the
+-- word shows how many), else armed/off/error.
 local function refreshAgentRow()
-	local sel = selectedPort and connections[selectedPort]
+	local live = 0
+	for port, conn in pairs(connections) do
+		if conn.serverAlive and not agentPortsOff[port] then
+			live += 1
+		end
+	end
 	if not armed then
 		status:setAgentState("off") -- gray
 	elseif not lastEnsureOk then
 		status:setAgentState("error") -- red: armed but inject failed
-	elseif sel and sel.serverAlive then
-		status:setAgentState("active") -- green: playtest live on the selected port
+	elseif live > 0 then
+		status:setAgentState("active", live) -- green: playtest live on N lane(s)
 	else
 		status:setAgentState("armed") -- amber: armed, waiting for F5
 	end
+	status:setAgentPorts(agentRows())
 end
 
 -- Push the whole UI from current state. Each chip shows its OWN connection
@@ -604,9 +668,7 @@ local function startConnection(port: number)
 	local function applyServerFlag(serverFlag: boolean)
 		if serverFlag ~= conn.serverAlive then
 			conn.serverAlive = serverFlag
-			if port == selectedPort then
-				refreshAgentRow()
-			end
+			refreshAgentRow() -- every lane counts now, not only the selected port
 		end
 	end
 
@@ -745,6 +807,21 @@ status.onSelectPort = function(port: number)
 	selectedPort = port
 	plugin:SetSetting(SETTING_SELECTED, port)
 	render()
+end
+
+-- Toggle whether a connected port's bridge gets a runtime-agent lane. Takes
+-- effect on the NEXT playtest (the running play DataModel keeps its lanes).
+status.onToggleAgentPort = function(port: number)
+	if agentPortsOff[port] then
+		agentPortsOff[port] = nil
+	else
+		agentPortsOff[port] = true
+	end
+	saveAgentPortsOff()
+	if armed then
+		ensureAgent(activeAgentPort(nil)) -- restamp McpAgentPorts immediately
+	end
+	refreshAgentRow()
 end
 
 status.onAddPort = function(port: number)

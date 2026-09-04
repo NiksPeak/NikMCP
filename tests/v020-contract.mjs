@@ -77,9 +77,17 @@ assert.match(pluginEntry, /task\.spawn\(function\(\)\s*\n\s*local result\s*\n\s*
 assert.match(pluginEntry, /AGENT_SOURCE_VERSION = "2026-09-03-v0\.2\.0/, "runtime source version must be bumped so stale agents refresh");
 assert.match(runtime, /\/heartbeat\?context=" \.\. CONTEXT \.\. "&targetId="/, "runtime agent must probe with its target id");
 assert.match(runtime, /info\.exact/);
-assert.match(runtime, /rejectedUntil\[basePort\] = os\.clock\(\) \+ REJECT_COOLDOWN/, "409/401 must park the port");
-assert.match(runtime, /lastPollStatus == 409 or lastPollStatus == 401 or lastPollStatus == 400/);
-assert.match(runtime, /if busyCommand then "&busy=1" else ""/);
+assert.match(runtime, /rejectedUntil\[lane\.port\] = os\.clock\(\) \+ REJECT_COOLDOWN/, "409/401 must park the port");
+assert.match(runtime, /lane\.lastStatus == 409 or lane\.lastStatus == 401 or lane\.lastStatus == 400/);
+assert.match(runtime, /if lane\.busy then "&busy=1" else ""/);
+// multi-lane agent: one poll lane per McpAgentPorts entry, per-lane output cursors
+assert.match(runtime, /script:GetAttribute\("McpAgentPorts"\)/);
+assert.match(runtime, /table\.insert\(lanes, newLane\(port\)\)/);
+assert.match(runtime, /drained = \{ server = 0, client = 0, pinned = 0 \}/, "each lane drains output independently");
+assert.match(runtime, /pcall\(execute, cmd, lane\)/);
+assert.match(pluginEntry, /agent:SetAttribute\("McpAgentPorts", agentPortsCsv\(\)\)/, "edit plugin must stamp the served ports");
+assert.match(pluginEntry, /status\.onToggleAgentPort = function/);
+assert.match(readFileSync("plugin/src/StatusWidget.luau", "utf8"), /function StatusWidget:setAgentPorts/);
 assert.match(runtime, /pinnedRing/);
 assert.match(runtime, /McpPinPattern/);
 assert.match(runtime, /CONSOLE_RING_CAP = 2000/);

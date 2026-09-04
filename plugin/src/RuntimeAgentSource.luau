@@ -17,13 +17,16 @@ local TOKEN = script:GetAttribute("McpToken") or ""
 local TARGET_ID = script:GetAttribute("McpTargetId") or ""
 local RUNTIME_SESSION_ID = script:GetAttribute("McpRuntimeSessionId")
 local PIN_PATTERN = script:GetAttribute("McpPinPattern")
+-- v0.2.0 multi-lane: comma list of bridge ports this agent must serve AT THE
+-- SAME TIME (one poll lane each). Stamped by the edit plugin from its live
+-- connections minus the ports the user toggled off in the dock. Empty = auto:
+-- resolve a single bridge the legacy way.
+local AGENT_PORTS = script:GetAttribute("McpAgentPorts")
 local POLL_INTERVAL = 0.5
 local BACKOFF_START = 1
 local BACKOFF_MAX = 8
 local REJECT_COOLDOWN = 30 -- seconds a bridge that answered 401/409/400 is skipped before re-probing
 local CONTEXT = "server"
-local base = nil
-local basePort = nil
 -- v0.2.0: bridges that refused this window (leased to another Studio, bad token)
 -- are parked here so the agent stops busy-looping 409s against them.
 local rejectedUntil = {}
@@ -121,17 +124,8 @@ local function resolveBridge()
 	return nil, nil
 end
 
--- Try to resolve a bridge port now (fast path). If the run DM's networking isn't
--- ready yet at t=0 (heavy boot), that's fine -- do NOT early-exit: the Heartbeat
--- scheduler below reprobes with backoff until the bridge answers.
-do
-	local port, how = resolveBridge()
-	if port then
-		base = urlFor(port)
-		basePort = port
-		print(("[MCP agent] resolved bridge :%d (%s)"):format(port, tostring(how)))
-	end
-end
+-- Bridge resolution happens per lane in the scheduler at the bottom of this
+-- file (each lane reprobes with backoff until its bridge answers).
 
 -- Minimal serializer (returned values only).
 local function serialize(v)
@@ -232,9 +226,14 @@ local CONSOLE_RING_CAP = 2000
 local PINNED_RING_CAP = 500
 local consoleRing = {}
 local pinnedRing = {}
+-- Every ring entry carries a monotonically increasing seq so each bridge lane
+-- can drain independently (per-lane cursor) without stealing lines from the
+-- other lanes. Rings themselves stay bounded and shared.
+local ringSeq = 0
 LogService.MessageOut:Connect(function(msg, mt)
 	local text = tostring(msg)
-	local entry = { text = text, level = mt.Name, t = os.time() }
+	ringSeq += 1
+	local entry = { text = text, level = mt.Name, t = os.time(), seq = ringSeq }
 	table.insert(consoleRing, entry)
 	if #consoleRing > CONSOLE_RING_CAP then
 		table.remove(consoleRing, 1)
@@ -344,6 +343,8 @@ relay.OnServerEvent:Connect(function(_player, kind, a, b)
 			end
 			if type(e) == "table" then
 				floodCount += 1
+				ringSeq += 1
+				e.seq = ringSeq
 				table.insert(clientRing, e)
 				if #clientRing > CLIENT_RING_CAP then
 					table.remove(clientRing, 1)
@@ -697,7 +698,12 @@ local playingTracks = {}
 -- Read-tool parity: these all work against the running server's DataModel so
 -- playtest debugging mirrors the edit Executor. Edit-only tools (script editing,
 -- selection, undo, asset insert) fall through to the unsupported message.
-local function execute(cmd)
+-- Filled in by the scheduler at the bottom (forward reference for get_runtime_status).
+local laneSummary = function()
+	return {}
+end
+
+local function execute(cmd, lane)
 	local p = cmd.payload or {}
 	if cmd.type == "get_runtime_status" then
 		local players = Players:GetPlayers()
@@ -713,6 +719,9 @@ local function execute(cmd)
 				universeId = game.GameId,
 				jobId = game.JobId,
 				targetId = TARGET_ID,
+				bridgePort = lane and lane.port or nil,
+				agentPorts = AGENT_PORTS,
+				agentLanes = laneSummary(),
 				runServiceIsRunning = RunService:IsRunning(),
 				dataModelState = "runtime",
 					runtimeSessionId = RUNTIME_SESSION_ID,
@@ -832,16 +841,27 @@ local function execute(cmd)
 		end
 		return { ok = true, result = { lines = picked, total = #ring } }
 	elseif cmd.type == "get_playtest_output" then
-		-- Drain (default) or peek both rings; feeds F5 read parity for get_playtest_output.
+		-- Drain (default) or peek. Rings are shared across bridge lanes, so a
+		-- drain only advances THIS lane's cursor: two sessions watching the same
+		-- playtest each see every line once.
 		local drain = p.drain ~= false
-		local lines = consoleRing
-		local clientLines = clientRing
-		local pinnedLines = pinnedRing
-		if drain then
-			consoleRing = {}
-			clientRing = {}
-			pinnedRing = {}
+		local cursor = (lane and lane.drained) or { server = 0, client = 0, pinned = 0 }
+		local function since(ring, key)
+			local out = {}
+			local last = cursor[key] or 0
+			for _, entry in ipairs(ring) do
+				if (entry.seq or 0) > last then
+					table.insert(out, entry)
+				end
+			end
+			if drain and #out > 0 then
+				cursor[key] = out[#out].seq or last
+			end
+			return out
 		end
+		local lines = since(consoleRing, "server")
+		local clientLines = since(clientRing, "client")
+		local pinnedLines = since(pinnedRing, "pinned")
 		local out = {
 			lines = lines,
 			client = clientLines,
@@ -849,6 +869,7 @@ local function execute(cmd)
 			pinPattern = PIN_PATTERN,
 			count = #lines,
 			capturing = true,
+			lanePort = lane and lane.port or nil,
 			capacity = { server = CONSOLE_RING_CAP, client = CLIENT_RING_CAP, pinned = PINNED_RING_CAP },
 		}
 		if #game:GetService("Players"):GetPlayers() == 0 then
@@ -1313,43 +1334,71 @@ local function execute(cmd)
 	end
 end
 
--- Heartbeat-driven poll scheduler. Hardened against the silent-stop deadlock:
--- the ENTIRE poll body runs inside a pcall and isPolling is reset UNCONDITIONALLY
--- after it, so a throw in a command handler or an HTTP read can never leave the
--- scheduler wedged (which silently killed the agent before). The connection lives
--- as long as the run DataModel; reprobe + backoff handle a not-yet-ready bridge.
-local lastReported = nil
-local backoff = BACKOFF_START
-local lastPoll = 0
-local isPolling = false
-local pollCount = 0
+-- Heartbeat-driven poll scheduler (v0.2.0 multi-lane). One LANE per bridge
+-- this agent serves; every lane has its own resolve/backoff/park state, busy
+-- flag, poll counter and output cursor, so two Claude sessions on two ports
+-- both get a live server agent from the same playtest. Hardened against the
+-- silent-stop deadlock: the ENTIRE poll body runs inside a pcall and
+-- lane.isPolling is reset UNCONDITIONALLY after it.
+local lanes = {}
 local pollConn = nil
--- v0.2.0: a command executes in its own task; polls continue with busy=1 so the
--- bridge keeps seeing this context alive during long server-side yields.
-local busyCommand = false
-local lastPollStatus = nil
 
 -- Preallocated header tables: no per-poll / per-frame allocation.
 local pollHeaders = authHeaders() or {}
 local responseHeaders = authHeaders() or {}
 responseHeaders["Content-Type"] = "application/json"
 
--- Self-diagnostics: POST a tiny event to the bridge (/diag) so the agent's last
--- state + drop reason are readable via get_status WITHOUT Studio Output. Never
--- throws, never blocks (pcall); skipped until a bridge is resolved.
-local function sendDiag(event, extra)
-	if not base then
+local function newLane(fixedPort)
+	return {
+		fixedPort = fixedPort, -- number = serve exactly this bridge; nil = auto-resolve one
+		port = nil,
+		base = nil,
+		lastReported = nil,
+		backoff = BACKOFF_START,
+		lastPoll = 0,
+		isPolling = false,
+		pollCount = 0,
+		busy = false, -- a command executes in its own task; poll with busy=1 meanwhile
+		lastStatus = nil,
+		drained = { server = 0, client = 0, pinned = 0 },
+	}
+end
+
+local function laneLabel(lane)
+	return if lane.port then (":" .. tostring(lane.port)) elseif lane.fixedPort then (":" .. tostring(lane.fixedPort) .. "?") else "auto"
+end
+
+laneSummary = function()
+	local out = {}
+	for _, lane in ipairs(lanes) do
+		table.insert(out, {
+			fixedPort = lane.fixedPort,
+			port = lane.port,
+			connected = lane.base ~= nil,
+			pollCount = lane.pollCount,
+			busy = lane.busy,
+			lastStatus = lane.lastStatus,
+		})
+	end
+	return out
+end
+
+-- Self-diagnostics: POST a tiny event to the lane's bridge (/diag) so the agent's
+-- last state + drop reason are readable via get_status WITHOUT Studio Output.
+-- Never throws, never blocks (pcall); skipped until the lane resolved a bridge.
+local function sendDiag(lane, event, extra)
+	if not lane.base then
 		return
 	end
 	pcall(function()
-		local payload = { event = event, t = os.time(), context = CONTEXT, pollCount = pollCount }
+		local payload = { event = event, t = os.time(), context = CONTEXT, pollCount = lane.pollCount, port = lane.port }
 		if extra then
 			for k, v in pairs(extra) do
 				payload[k] = v
 			end
 		end
 		HttpService:RequestAsync({
-			Url = base .. "/diag",
+			Url = lane.base .. "/diag",
 			Method = "POST",
 			Headers = responseHeaders,
 			Body = HttpService:JSONEncode(payload),
@@ -1357,18 +1406,43 @@ local function sendDiag(event, extra)
 	end)
 end
 
-local function reprobe()
+local function portServedByOtherLane(port, self)
+	for _, other in ipairs(lanes) do
+		if other ~= self and other.port == port then
+			return true
+		end
+	end
+	return false
+end
+
+-- Resolve the lane's bridge: a fixed lane probes only its port (lease-aware);
+-- an auto lane picks the best accepting bridge not already served by a lane.
+local function laneResolve(lane)
+	if lane.fixedPort then
+		local parked = rejectedUntil[lane.fixedPort]
+		if parked and parked > os.clock() then
+			return false
+		end
+		local info = probeBridge(lane.fixedPort)
+		if info and info.tokenOk and (info.exact or info.accepts) then
+			lane.port = lane.fixedPort
+			lane.base = urlFor(lane.port)
+			sendDiag(lane, "resolve", { how = if info.exact then "exact" else "accepting" })
+			return true
+		end
+		return false
+	end
 	local port, how = resolveBridge()
-	if port then
-		base = urlFor(port)
-		basePort = port
-		sendDiag("resolve", { port = port, how = how })
+	if port and not portServedByOtherLane(port, lane) then
+		lane.port = port
+		lane.base = urlFor(port)
+		sendDiag(lane, "resolve", { how = how })
 		return true
 	end
 	return false
 end
 
-local function handleBody(body)
+local function handleBody(lane, body)
 	if not body or body == "" then
 		return
 	end
@@ -1396,10 +1470,10 @@ local function handleBody(body)
 				finalResult = { ok = false, err = "handler returned no result table" }
 			end
 			if finalResult.ok == false then
-				warn(("[MCP agent] command %q failed: %s"):format(tostring(cmd.type), tostring(finalResult.err)))
+				warn(("[MCP agent %s] command %q failed: %s"):format(laneLabel(lane), tostring(cmd.type), tostring(finalResult.err)))
 			end
 			finalResult.id = cmd.id
-			local postBase = base
+			local postBase = lane.base
 			pcall(function()
 				HttpService:RequestAsync({
 					Url = (postBase or "") .. "/response",
@@ -1415,113 +1489,137 @@ local function handleBody(body)
 		end
 		-- Execute in a separate task: the poll scheduler keeps running (busy=1)
 		-- so a long-yielding server command cannot make the bridge drop us.
-		busyCommand = true
+		lane.busy = true
 		task.spawn(function()
-			local okExec, resultOrErr = pcall(execute, cmd)
+			local okExec, resultOrErr = pcall(execute, cmd, lane)
 			local finalResult
 			if okExec then
 				finalResult = resultOrErr
 			else
-				sendDiag("handler_error", { cmdType = tostring(cmd.type), err = tostring(resultOrErr) })
+				sendDiag(lane, "handler_error", { cmdType = tostring(cmd.type), err = tostring(resultOrErr) })
 				finalResult = { ok = false, err = "handler error: " .. tostring(resultOrErr) }
 			end
 			finish(finalResult)
-			busyCommand = false
+			lane.busy = false
 		end)
 	end
 end
 
--- One poll iteration. ENTIRE body in pcall; isPolling reset UNCONDITIONALLY after,
--- so no error path (HTTP read, JSON decode, handler) can ever wedge the scheduler.
-local function doPoll()
+-- One poll iteration for one lane. ENTIRE body in pcall; isPolling reset
+-- UNCONDITIONALLY after, so no error path can ever wedge the scheduler.
+local function doPoll(lane)
 	local ok, err = pcall(function()
-		if not base then
-			if not reprobe() then
-				if lastReported ~= "noBridge" then
-					warn("[MCP agent] no reachable bridge; ensure 'Allow HTTP Requests' is on and the server is running")
-					lastReported = "noBridge"
+		if not lane.base then
+			if not laneResolve(lane) then
+				if lane.lastReported ~= "noBridge" then
+					warn(("[MCP agent %s] no reachable/accepting bridge yet; ensure 'Allow HTTP Requests' is on and the Node session is running")
+						:format(laneLabel(lane)))
+					lane.lastReported = "noBridge"
 				end
-				backoff = math.min(backoff * 2, BACKOFF_MAX)
+				lane.backoff = math.min(lane.backoff * 2, BACKOFF_MAX)
 				return
 			end
-			lastReported = "up"
-			backoff = BACKOFF_START
-			sendDiag("connect", { base = base })
+			lane.lastReported = "up"
+			lane.backoff = BACKOFF_START
+			print(("[MCP agent] lane %s connected to %s"):format(laneLabel(lane), lane.base))
+			sendDiag(lane, "connect", { base = lane.base })
 		end
 		local res = HttpService:RequestAsync({
-			Url = base .. "/poll?context=" .. CONTEXT .. "&targetId=" .. HttpService:UrlEncode(TARGET_ID)
-				.. (if busyCommand then "&busy=1" else ""),
+			Url = lane.base .. "/poll?context=" .. CONTEXT .. "&targetId=" .. HttpService:UrlEncode(TARGET_ID)
+				.. (if lane.busy then "&busy=1" else ""),
 			Method = "GET",
 			Headers = pollHeaders,
 		})
-		lastPollStatus = res.StatusCode
+		lane.lastStatus = res.StatusCode
 		if not (res.Success or res.StatusCode == 503) then
 			error("poll HTTP status " .. tostring(res.StatusCode))
 		end
-		if lastReported == "dropped" then
-			print("[MCP agent] reconnected to " .. base)
-			sendDiag("reconnect", { base = base })
+		if lane.lastReported == "dropped" then
+			print(("[MCP agent %s] reconnected to %s"):format(laneLabel(lane), lane.base))
+			sendDiag(lane, "reconnect", { base = lane.base })
 		end
-		lastReported = "up"
-		backoff = BACKOFF_START
-		pollCount += 1
-		if pollCount == 1 or pollCount % 10 == 0 then
-			sendDiag("poll", { count = pollCount })
+		lane.lastReported = "up"
+		lane.backoff = BACKOFF_START
+		lane.pollCount += 1
+		if lane.pollCount == 1 or lane.pollCount % 10 == 0 then
+			sendDiag(lane, "poll", { count = lane.pollCount })
 		end
-		handleBody(res.Body)
+		handleBody(lane, res.Body)
 	end)
 	if not ok then
-		if lastReported ~= "dropped" then
-			warn("[MCP agent] poll error on " .. tostring(base) .. ": " .. tostring(err))
-			lastReported = "dropped"
+		if lane.lastReported ~= "dropped" then
+			warn(("[MCP agent %s] poll error on %s: %s"):format(laneLabel(lane), tostring(lane.base), tostring(err)))
+			lane.lastReported = "dropped"
 		end
-		sendDiag("poll_error", { err = tostring(err), status = lastPollStatus }) -- base still set here, so this reaches the bridge
+		sendDiag(lane, "poll_error", { err = tostring(err), status = lane.lastStatus }) -- base still set here, so this reaches the bridge
 		-- v0.2.0 graceful handoff: 409 (leased to another live Studio window), 401
 		-- (token mismatch) and 400 (protocol mismatch) are NOT transient. Park that
-		-- port and let resolveBridge() find the bridge that actually owns this
-		-- window instead of hammering the wrong one every backoff tick.
-		if basePort and (lastPollStatus == 409 or lastPollStatus == 401 or lastPollStatus == 400) then
-			rejectedUntil[basePort] = os.clock() + REJECT_COOLDOWN
+		-- port and re-resolve instead of hammering it every backoff tick.
+		if lane.port and (lane.lastStatus == 409 or lane.lastStatus == 401 or lane.lastStatus == 400) then
+			rejectedUntil[lane.port] = os.clock() + REJECT_COOLDOWN
 			warn(("[MCP agent] bridge :%d refused this Studio window (HTTP %d); parked for %ds, re-resolving")
-				:format(basePort, lastPollStatus, REJECT_COOLDOWN))
-			sendDiag("bridge_rejected", { port = basePort, status = lastPollStatus })
+				:format(lane.port, lane.lastStatus, REJECT_COOLDOWN))
+			sendDiag(lane, "bridge_rejected", { port = lane.port, status = lane.lastStatus })
 		end
-		lastPollStatus = nil
-		base = nil
-		basePort = nil
-		backoff = math.min(backoff * 2, BACKOFF_MAX)
+		lane.lastStatus = nil
+		lane.base = nil
+		lane.port = nil
+		lane.backoff = math.min(lane.backoff * 2, BACKOFF_MAX)
 	end
-	isPolling = false -- UNCONDITIONAL: an error must never leave the scheduler stuck
+	lane.isPolling = false -- UNCONDITIONAL: an error must never leave the scheduler stuck
 end
 
--- Per-frame handler allocates nothing: it compares timers and defers the yielding
--- poll to a spawned task. isPolling prevents overlap; backoff paces reconnects.
+-- Build the lane set: one fixed lane per McpAgentPorts entry, else one auto lane.
+do
+	local seen = {}
+	if type(AGENT_PORTS) == "string" then
+		for raw in string.gmatch(AGENT_PORTS, "[^,%s]+") do
+			local port = tonumber(raw)
+			if port and port > 0 and port < 65536 and not seen[port] then
+				seen[port] = true
+				table.insert(lanes, newLane(port))
+			end
+		end
+	end
+	if #lanes == 0 then
+		table.insert(lanes, newLane(nil))
+	end
+end
+
+-- Per-frame handler allocates nothing: it compares timers and defers each
+-- lane's yielding poll to a spawned task. isPolling prevents overlap per lane;
+-- backoff paces reconnects per lane.
 pollConn = RunService.Heartbeat:Connect(function()
-	if isPolling then
-		return
+	local now = tick()
+	for _, lane in ipairs(lanes) do
+		if not lane.isPolling then
+			local interval = if lane.base then POLL_INTERVAL else lane.backoff
+			if now - lane.lastPoll >= interval then
+				lane.lastPoll = now
+				lane.isPolling = true
+				task.spawn(doPoll, lane)
+			end
+		end
 	end
-	local interval = if base then POLL_INTERVAL else backoff
-	if tick() - lastPoll < interval then
-		return
-	end
-	lastPoll = tick()
-	isPolling = true
-	task.spawn(doPoll)
 end)
 
 -- Janitor: report shutdown and drop the connection when the run DataModel tears down.
 game:BindToClose(function()
-	sendDiag("shutdown", { pollCount = pollCount })
+	for _, lane in ipairs(lanes) do
+		sendDiag(lane, "shutdown", { pollCount = lane.pollCount })
+	end
 	if pollConn then
 		pollConn:Disconnect()
 		pollConn = nil
 	end
 end)
 
-if base then
-	print("[MCP agent] connected to " .. base)
-else
-	print("[MCP agent] scheduler armed; probing for bridge...")
+do
+	local labels = {}
+	for _, lane in ipairs(lanes) do
+		table.insert(labels, laneLabel(lane))
+	end
+	print(("[MCP agent] scheduler armed with %d lane(s): %s"):format(#lanes, table.concat(labels, ", ")))
 end
 ]==]
 

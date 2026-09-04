@@ -81,6 +81,8 @@ local AGENT_WORD = {
 	active = "live",
 	error = "error",
 }
+local AGENT_HINT = "F5 agent lanes: click a port to toggle. Every enabled port gets its own live agent."
+
 
 local TWEEN_FAST = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local TWEEN_SLIDE = TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
@@ -455,32 +457,22 @@ function StatusWidget.new(plugin: Plugin)
 	padding(brand, 12, 12, 0, 12)
 	brand.Parent = root
 
+	-- Logo mark: flat grey tile with the "N" glyph (no accent, no underline).
 	local mark = Instance.new("Frame")
 	mark.Name = "Mark"
 	mark.Size = UDim2.fromOffset(34, 34)
 	mark.Position = UDim2.fromOffset(0, 1)
-	mark.BackgroundColor3 = Theme.accent
+	mark.BackgroundColor3 = Theme.panelHi
 	mark.BorderSizePixel = 0
 	mark.ZIndex = 2
 	corner(mark, 10)
-	gradient(mark, Theme.accent2, Theme.accentDeep, 135)
-	stroke(mark, Theme.accent2, 0.5)
+	sheen(mark, 224)
+	stroke(mark, Theme.strokeHi, 0.3)
 	mark.Parent = brand
-	local markGlyph = label(mark, "N", FONT_DISPLAY, Color3.new(1, 1, 1), 20, 12)
+	local markGlyph = label(mark, "N", FONT_DISPLAY, Theme.text, 20, 12)
 	markGlyph.Size = UDim2.fromScale(1, 1)
 	markGlyph.TextXAlignment = Enum.TextXAlignment.Center
 	markGlyph.ZIndex = 3
-	-- tiny "bridge" tick under the glyph: two dots joined by a line
-	local markLine = Instance.new("Frame")
-	markLine.Size = UDim2.new(0.5, 0, 0, 2)
-	markLine.Position = UDim2.new(0.5, 0, 1, -6)
-	markLine.AnchorPoint = Vector2.new(0.5, 0.5)
-	markLine.BackgroundColor3 = Color3.new(1, 1, 1)
-	markLine.BackgroundTransparency = 0.45
-	markLine.BorderSizePixel = 0
-	markLine.ZIndex = 3
-	corner(markLine, 1)
-	markLine.Parent = mark
 
 	local title = label(brand, "NikMCP", FONT_DISPLAY, Theme.text, 19, 13)
 	title.Size = UDim2.new(1, -170, 0, 22)
@@ -492,23 +484,23 @@ function StatusWidget.new(plugin: Plugin)
 	subtitle.Position = UDim2.fromOffset(44, 23)
 	subtitle.ZIndex = 2
 
-	-- Version badge: mono chip right after the subtitle. Keep the text in sync
-	-- with package.json "version" (tests/version-parity.mjs pins it).
+	-- Small serif build stamp, top-right under the status pill (the classic
+	-- design). Keep the text in sync with package.json "version"
+	-- (tests/version-parity.mjs pins it).
 	local version = Instance.new("TextLabel")
 	version.Name = "VersionTag"
-	version.AnchorPoint = Vector2.new(0, 0.5)
-	version.Position = UDim2.new(0, 44, 0, 45)
-	version.Size = UDim2.fromOffset(0, 16)
-	version.AutomaticSize = Enum.AutomaticSize.X
-	version.BackgroundColor3 = Theme.panelHi
-	version.Font = FONT_MONO
+	version.AnchorPoint = Vector2.new(1, 0)
+	version.Position = UDim2.new(1, -2, 0, 36)
+	version.Size = UDim2.fromOffset(120, 10)
+	version.BackgroundTransparency = 1
+	version.Font = Enum.Font.Merriweather -- readable serif at small sizes
 	version.Text = "version 0.2.0"
-	version.TextColor3 = Theme.accent2
-	version.TextSize = 10
+	version.TextColor3 = Theme.subtext
+	version.TextXAlignment = Enum.TextXAlignment.Right
+	version.TextYAlignment = Enum.TextYAlignment.Top
+	version.TextScaled = true
 	version.ZIndex = 2
-	corner(version, 8)
-	stroke(version, Theme.accent, 0.55)
-	padding(version, 0, 7, 0, 7)
+	textConstraint(version, 9, 7)
 	version.Parent = brand
 	self.versionTag = version
 
@@ -667,6 +659,7 @@ function StatusWidget.new(plugin: Plugin)
 	self.onRemovePort = nil
 	self.onSelectPort = nil
 	self.onArm = nil
+	self.onToggleAgentPort = nil -- (port) -> () ; v0.2.0 per-port agent lane toggle
 	self.onToggleTool = nil
 	self.onSetFlag = nil
 	self.onSetAuth = nil
@@ -872,6 +865,33 @@ function StatusWidget.new(plugin: Plugin)
 			return
 		end
 		self:_openEditor(self:_suggestPort())
+	end)
+
+	-- Agent lanes: which CONNECTED ports the F5 runtime agent serves at the same
+	-- time. One mini chip per connected port; click toggles that lane. Hidden
+	-- until at least one port is connected.
+	local agentLane = Instance.new("Frame")
+	agentLane.Name = "AgentLane"
+	agentLane.Size = UDim2.new(1, 0, 0, 24)
+	agentLane.BackgroundTransparency = 1
+	agentLane.LayoutOrder = 4
+	agentLane.Visible = false
+	agentLane.Parent = bridgeCard
+	local agentTag = label(agentLane, "AGENT", FONT_BOLD, Theme.muted, 10, 8)
+	agentTag.Size = UDim2.fromOffset(44, 24)
+	local agentChips = Instance.new("Frame")
+	agentChips.Size = UDim2.new(1, -48, 1, 0)
+	agentChips.Position = UDim2.fromOffset(48, 0)
+	agentChips.BackgroundTransparency = 1
+	agentChips.ClipsDescendants = true
+	hlist(agentChips, 6)
+	agentChips.Parent = agentLane
+	self.agentLane, self.agentChips = agentLane, agentChips
+	agentTag.MouseEnter:Connect(function()
+		TweenService:Create(agentTag, TWEEN_FAST, { TextColor3 = Theme.subtext }):Play()
+	end)
+	agentTag.MouseLeave:Connect(function()
+		TweenService:Create(agentTag, TWEEN_FAST, { TextColor3 = Theme.muted }):Play()
 	end)
 
 	-- Primary Connect/Disconnect button (gradient, glow ring, hover-lighten, press-squash).
@@ -1797,8 +1817,9 @@ function StatusWidget:setCommands(ok: boolean?)
 	paintDot(self.cmdDot, self.cmdWord, ok, { "proven", "failing", "none yet" })
 end
 
--- "off" | "armed" | "active" | "error" -> gray / amber / green / red
-function StatusWidget:setAgentState(state: string)
+-- "off" | "armed" | "active" | "error" -> gray / amber / green / red.
+-- liveCount (optional) shows how many bridge lanes currently see the playtest.
+function StatusWidget:setAgentState(state: string, liveCount: number?)
 	local color = AGENT_COLOR[state] or Theme.idle
 	self.agentDot.BackgroundColor3 = color
 	local halo = self.agentDot:FindFirstChildOfClass("UIStroke")
@@ -1806,9 +1827,66 @@ function StatusWidget:setAgentState(state: string)
 		halo.Color = color
 	end
 	if self.agentWord then
-		self.agentWord.Text = AGENT_WORD[state] or state
+		local word = AGENT_WORD[state] or state
+		if state == "active" and liveCount and liveCount > 1 then
+			word = ("live x%d"):format(liveCount)
+		end
+		self.agentWord.Text = word
 		self.agentWord.TextColor3 = if state == "off" then Theme.muted else color
 	end
+end
+
+-- rows = { { port, enabled, live } } for every CONNECTED port. Rebuilds the
+-- AGENT lane chips: enabled = accent (green when that lane is live), disabled
+-- = recessed + muted. Clicking a chip calls onToggleAgentPort(port).
+function StatusWidget:setAgentPorts(rows: { { port: number, enabled: boolean, live: boolean } })
+	local chips = self.agentChips
+	if not chips then
+		return
+	end
+	for _, child in ipairs(chips:GetChildren()) do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+	self.agentLane.Visible = #rows > 0
+	for i, row in ipairs(rows) do
+		local fill = if not row.enabled then Theme.field elseif row.live then Theme.green else Theme.accentDeep
+		local fg = if not row.enabled then Theme.muted elseif row.live then Theme.bg else Color3.new(1, 1, 1)
+		local chip = Instance.new("TextButton")
+		chip.Name = "Agent" .. tostring(row.port)
+		chip.Size = UDim2.fromOffset(68, 20)
+		chip.BackgroundColor3 = fill
+		chip.AutoButtonColor = false
+		chip.Text = ":" .. tostring(row.port)
+		chip.Font = FONT_MONO
+		chip.TextColor3 = fg
+		chip.TextScaled = true
+		chip.LayoutOrder = i
+		corner(chip, 7)
+		stroke(chip, if row.enabled then fill else Theme.stroke, if row.enabled then 0.4 else 0.2)
+		if row.enabled then
+			sheen(chip, 222)
+		end
+		textConstraint(chip, 11, 8)
+		chip.Parent = chips
+		chip.MouseEnter:Connect(function()
+			TweenService:Create(chip, TWEEN_FAST, { BackgroundColor3 = fill:Lerp(Color3.new(1, 1, 1), 0.12) }):Play()
+		end)
+		chip.MouseLeave:Connect(function()
+			TweenService:Create(chip, TWEEN_FAST, { BackgroundColor3 = fill }):Play()
+		end)
+		chip.MouseButton1Click:Connect(function()
+			self:_click()
+			if self.onToggleAgentPort then
+				self.onToggleAgentPort(row.port)
+			end
+		end)
+	end
+end
+
+function StatusWidget:agentHint(): string
+	return AGENT_HINT
 end
 
 function StatusWidget:setArmed(on: boolean)
