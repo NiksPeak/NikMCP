@@ -1,6 +1,6 @@
 {
   "name": "nikmcp",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "Custom Roblox Studio MCP server (dual-context): MCP stdio server + local HTTP bridge that the Studio edit plugin and F5 runtime agent poll. Drop-in superset of robloxstudio-mcp.",
   "type": "module",
   "bin": {
@@ -21,6 +21,20 @@
     "selftest:opencloud": "node tests/open-cloud-request.mjs",
     "selftest:apidump": "node tests/api-dump-validation.mjs",
     "selftest:luau": "node tests/luau-gate.mjs",
+    "selftest:runtime": "node tests/runtime-attach-smoke.mjs",
+    "selftest:targets": "node tests/target-routing.mjs",
+    "selftest:environment": "node tests/environment-tooling.mjs",
+    "selftest:creator-store": "node tests/creator-store-guard.mjs",
+    "selftest:qa": "node tests/qa-workflows.mjs",
+    "selftest:qa-luau": "node tests/qa-luau-compile.mjs",
+    "selftest:agent-analysis": "node tests/agent-analysis-unit.mjs",
+    "selftest:patchset": "node tests/script-patchset-unit.mjs",
+    "selftest:agent-tools": "node tests/agent-tools-contract.mjs",
+    "selftest:agent-tools-static": "node tests/agent-tools-contract.mjs --static-only",
+    "selftest:version": "node tests/version-parity.mjs",
+    "selftest:script-edit": "node tests/script-edit-unit.mjs",
+    "selftest:v020": "node tests/v020-contract.mjs",
+    "selftest:v020-static": "node tests/v020-contract.mjs --static-only",
     "prepublishOnly": "npm run build",
     "selftest:sync": "node tests/sync-unit.mjs",
     "selftest:rocreate": "node tests/rocreate-unit.mjs"

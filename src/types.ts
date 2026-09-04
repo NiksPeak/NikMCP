@@ -7,6 +7,8 @@ export interface Command {
   type: string; // "run_luau" | "get_instance_tree" | ...
   context: Context;
   payload: unknown;
+  expectedTargetId?: string;
+  expiresAtMs: number;
 }
 
 export interface CommandResult {

@@ -6,6 +6,7 @@
 local HttpService = game:GetService("HttpService")
 local ServerScriptService = game:GetService("ServerScriptService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
+local Selection = game:GetService("Selection")
 
 local Config = require(script.Config)
 local Settings = require(script.Settings)
@@ -15,6 +16,9 @@ local RuntimeAgentSource = require(script.RuntimeAgentSource)
 
 local CONTEXT = "edit"
 local AGENT_NAME = "MCP_RuntimeAgent"
+local AGENT_SOURCE_VERSION = "2026-09-03-v0.2.0-lease-aware"
+local STUDIO_SESSION_ID = HttpService:GenerateGUID(false)
+local TARGET_ID = "studio-" .. STUDIO_SESSION_ID
 local SETTING_PORTS = "NikMCP_CandidatePorts_v2"
 local SETTING_ARMED = "NikMCP_PlaytestArmed"
 local SETTING_PORT_DIR = "NikMCP_PortDir"
@@ -106,11 +110,13 @@ local function saveSettings()
 end
 
 -- Auth header (only when enabled + token set); nil otherwise.
-local function authHeaders(): { [string]: string }?
+
+local function authHeaders(): { [string]: string }
+	local headers = { ["x-mcp-target-id"] = TARGET_ID }
 	if settings.auth.enabled and settings.auth.token ~= "" then
-		return { ["x-mcp-token"] = settings.auth.token }
+		headers["x-mcp-token"] = settings.auth.token
 	end
-	return nil
+	return headers
 end
 
 -- == Connection state ========================================================
@@ -125,6 +131,7 @@ type Conn = {
 	warned: string?, -- rate-limit: emit each state's diagnostic once
 	serverAlive: boolean, -- this port's `server` flag from the poll/heartbeat (playtest live)
 	commandsProven: boolean,
+	busy: boolean, -- v0.2.0: a command is executing in its own task; keep polling (busy=1) without dequeuing
 }
 local connections: { [number]: Conn } = {}
 local selectedPort: number? = loadSelectedPort()
@@ -190,7 +197,7 @@ local function pushSettingsTo(port: number, tokenOverride: string?)
 	end
 	local headers = authHeaders()
 	if tokenOverride and tokenOverride ~= "" then
-		headers = { ["x-mcp-token"] = tokenOverride }
+		headers["x-mcp-token"] = tokenOverride
 	end
 	pcall(function()
 		HttpService:PostAsync(
@@ -199,6 +206,32 @@ local function pushSettingsTo(port: number, tokenOverride: string?)
 			Enum.HttpContentType.ApplicationJson,
 			false,
 			headers
+		)
+	end)
+end
+
+-- Identify this exact Studio DataModel/window to a bridge. The bridge enriches
+-- this session id with the outbound socket's RobloxStudioBeta PID/window title.
+local function pushTargetIdentityTo(port: number)
+	local ok, json = pcall(function()
+		return HttpService:JSONEncode({
+			targetId = TARGET_ID,
+			studioSessionId = STUDIO_SESSION_ID,
+			placeId = game.PlaceId,
+			universeId = game.GameId,
+			placeName = game.Name,
+		})
+	end)
+	if not ok then
+		return
+	end
+	pcall(function()
+		HttpService:PostAsync(
+			urlFor(port) .. "/target/identity",
+			json,
+			Enum.HttpContentType.ApplicationJson,
+			false,
+			authHeaders()
 		)
 	end)
 end
@@ -222,14 +255,42 @@ end
 -- == Playtest agent ========================================================
 -- Full create-or-rewrite. Archivable so Play Solo (F5) clones it into the play
 -- server DataModel; the agent is inert in edit (`if not RunService:IsRunning()`).
+local function runtimePortCandidates(primaryPort: number): string
+	local seen: { [number]: boolean } = {}
+	local out = {}
+	local function add(port: number?)
+		if type(port) == "number" and not seen[port] then
+			seen[port] = true
+			table.insert(out, tostring(port))
+		end
+	end
+	add(primaryPort)
+	for port in pairs(connections) do
+		add(port)
+	end
+	for _, port in ipairs(candidatePorts) do
+		add(port)
+	end
+	for _, port in ipairs(Config.CANDIDATE_PORTS) do
+		add(port)
+	end
+	return table.concat(out, ",")
+end
+
+local function stampPlaytestAgent(agent: Script, port: number)
+	agent.Archivable = true
+	agent:SetAttribute("McpPort", port)
+	agent:SetAttribute("McpPortCandidates", runtimePortCandidates(port))
+	agent:SetAttribute("McpToken", (settings.auth.enabled and settings.auth.token) or "")
+	agent:SetAttribute("McpTargetId", TARGET_ID)
+end
+
 local function enablePlaytestAgent(port: number): (boolean, string?)
 	local existing = ServerScriptService:FindFirstChild(AGENT_NAME)
 	local agent = existing or Instance.new("Script")
 	agent.Name = AGENT_NAME
-	agent.Archivable = true
 	agent.Parent = ServerScriptService -- parent before writing source (UpdateSourceAsync needs DataModel)
-	agent:SetAttribute("McpPort", port)
-	agent:SetAttribute("McpToken", (settings.auth.enabled and settings.auth.token) or "")
+	stampPlaytestAgent(agent, port)
 
 	local source = (RuntimeAgentSource:gsub("{{PORT}}", tostring(port)))
 	local ok = pcall(function()
@@ -238,6 +299,7 @@ local function enablePlaytestAgent(port: number): (boolean, string?)
 		end)
 	end)
 	if ok then
+		agent:SetAttribute("McpSourceVersion", AGENT_SOURCE_VERSION)
 		return true
 	end
 	-- fallback to .Source (edit context only); bind a local first (never lead with `(`)
@@ -248,15 +310,24 @@ local function enablePlaytestAgent(port: number): (boolean, string?)
 	if not fbOk then
 		return false, tostring(fbErr)
 	end
+	agent:SetAttribute("McpSourceVersion", AGENT_SOURCE_VERSION)
 	return true
 end
 
--- Idempotent: inject only when missing, so the poll loop never re-writes source
--- every tick. Present already => no-op (just keep Archivable true).
+-- Idempotent enough for the maintenance loop: existing agents get fresh port
+-- attributes every tick, but source is rewritten only when absent/stale.
 local function ensureAgent(port: number): boolean
 	local existing = ServerScriptService:FindFirstChild(AGENT_NAME)
 	if existing then
-		existing.Archivable = true
+		stampPlaytestAgent(existing :: Script, port)
+		if existing:GetAttribute("McpSourceVersion") ~= AGENT_SOURCE_VERSION then
+			local ok, err = enablePlaytestAgent(port)
+			lastEnsureOk = ok
+			if not ok then
+				warn(("[NikMCP] playtest agent refresh failed: %s"):format(tostring(err)))
+			end
+			return ok
+		end
 		lastEnsureOk = true
 		return true
 	end
@@ -365,6 +436,16 @@ local function firstConnectedPort(): number?
 	return (next(connections))
 end
 
+local function activeAgentPort(preferredPort: number?): number
+	if preferredPort and connections[preferredPort] then
+		return preferredPort
+	end
+	if selectedPort and connections[selectedPort] then
+		return selectedPort
+	end
+	return firstConnectedPort() or selectedPort or Config.DEFAULT_PORT
+end
+
 local function countConnections(): number
 	local n = 0
 	for _ in pairs(connections) do
@@ -373,13 +454,81 @@ local function countConnections(): number
 	return n
 end
 
-local function setArmed(value: boolean)
+local function resolvePathForSelection(path: string): Instance?
+	if path == "game" then
+		return game
+	end
+	local stripped = string.gsub(path, "^game%.", "")
+	local current: Instance = game
+	for segment in string.gmatch(stripped, "[^%.]+") do
+		local nextInst: Instance? = nil
+		if current == game then
+			local ok, svc = pcall(function()
+				return game:GetService(segment)
+			end)
+			if ok then
+				nextInst = svc
+			end
+		end
+		if not nextInst then
+			nextInst = current:FindFirstChild(segment)
+		end
+		if not nextInst then
+			return nil
+		end
+		current = nextInst
+	end
+	return current
+end
+
+local function promptSaveSelection(p: any): any
+	if type(p.paths) == "table" then
+		local insts = {}
+		for _, path in ipairs(p.paths) do
+			if type(path) ~= "string" then
+				return { ok = false, err = "paths must contain strings" }
+			end
+			local inst = resolvePathForSelection(path)
+			if not inst then
+				return { ok = false, err = "path not found: " .. path }
+			end
+			table.insert(insts, inst)
+		end
+		Selection:Set(insts)
+	end
+	local selected = Selection:Get()
+	if #selected == 0 then
+		return { ok = false, err = "nothing selected; pass paths or select instances in Studio first" }
+	end
+	local suggestedFileName = tostring(p.suggestedFileName or "nikmcp_selection.rbxmx")
+	local pluginAny = plugin :: any
+	local ok, saved = pcall(function()
+		if pluginAny.PromptSaveSelectionAsync then
+			return pluginAny:PromptSaveSelectionAsync(suggestedFileName)
+		end
+		return pluginAny:PromptSaveSelection(suggestedFileName)
+	end)
+	if not ok then
+		return { ok = false, err = tostring(saved) }
+	end
+	return {
+		ok = true,
+		output = saved and "selection saved" or "save selection canceled",
+		result = {
+			saved = saved == true,
+			selectionCount = #selected,
+			suggestedFileName = suggestedFileName,
+		},
+	}
+end
+
+local function setArmed(value: boolean, preferredPort: number?)
 	armed = value
 	plugin:SetSetting(SETTING_ARMED, armed)
 	agentButton:SetActive(armed)
 	status:setArmed(armed)
 	if armed then
-		local port = selectedPort or firstConnectedPort() or Config.DEFAULT_PORT
+		local port = activeAgentPort(preferredPort)
 		lastEnsureOk = enablePlaytestAgent(port)
 		if not lastEnsureOk then
 			warn("[NikMCP] could not arm playtest agent (source write failed)")
@@ -402,7 +551,7 @@ local function markConnected(conn: Conn)
 	if armed then
 		local agent = ServerScriptService:FindFirstChild(AGENT_NAME)
 		if agent then
-			agent:SetAttribute("McpPort", conn.port) -- point the agent at a live port
+			stampPlaytestAgent(agent :: Script, conn.port) -- point the agent at a live port
 		end
 	end
 	if conn.warned ~= "connected" then
@@ -410,6 +559,7 @@ local function markConnected(conn: Conn)
 		print(("[NikMCP] connected on :%d"):format(conn.port))
 	end
 	pushSettingsTo(conn.port) -- this bridge enforces tool gating; refresh it on (re)connect
+	pushTargetIdentityTo(conn.port)
 	render()
 end
 
@@ -440,9 +590,14 @@ local function startConnection(port: number)
 		warned = nil,
 		serverAlive = false,
 		commandsProven = false,
+		busy = false,
 	}
 	connections[port] = conn
 	render()
+	-- Claim the bridge before the first command-bearing poll. Repeated on the
+	-- connected transition so a bridge that came up during backoff is enriched.
+	pushSettingsTo(port)
+	pushTargetIdentityTo(port)
 
 	-- Apply the merged liveness from a /poll response (server flag drives the
 	-- Playtest-agent row); no separate per-tick heartbeat is needed.
@@ -461,7 +616,12 @@ local function startConnection(port: number)
 			-- Merged short-poll: one immediate GET carrying status + any command.
 			local base = urlFor(port)
 			local ok, body = pcall(function()
-				return HttpService:GetAsync(base .. "/poll?context=" .. CONTEXT, true, authHeaders())
+				return HttpService:GetAsync(
+					base .. "/poll?context=" .. CONTEXT .. "&targetId=" .. HttpService:UrlEncode(TARGET_ID)
+						.. (if conn.busy then "&busy=1" else ""),
+					true,
+					authHeaders()
+				)
 			end)
 			if not conn.running then
 				break
@@ -487,42 +647,71 @@ local function startConnection(port: number)
 			applyServerFlag(decoded ~= nil and decoded.server == true)
 
 			local cmd = decoded and decoded.command or nil
-			if cmd and cmd.id then
+			if cmd and cmd.id and not conn.busy then
 				activeUntil = os.clock() + Config.ACTIVE_WINDOW -- snappier right after activity
-				local result
-				local startClock = os.clock()
-				if cmd.type == "enable_playtest_agent" then
-					setArmed(true) -- arming makes the agent persistent + F5-covered
-					result = { ok = lastEnsureOk, output = lastEnsureOk and "playtest agent armed" or "arm failed" }
-				else
-					result = Executor.execute(cmd)
-				end
-				if result and result.ok == false then
-					warn(("[NikMCP] command %q failed: %s")
-						:format(tostring(cmd.type), tostring(result.err)))
-				end
-				if settings.activityLog then
-					local ms = math.floor((os.clock() - startClock) * 1000 + 0.5)
-					status:addActivity({
-						tool = (":%d %s"):format(port, tostring(cmd.type)),
-						target = activityTarget(cmd),
-						ok = result.ok ~= false,
-						ms = ms,
-						time = os.time(),
-					})
-				end
-				result.id = cmd.id
-				postResult(base, result) -- chunks the POST if the result exceeds the 1024 KB PostAsync cap
-				conn.commandsProven = true
-				if port == selectedPort then
-					status:setCommands(true)
-				end
+				-- v0.2.0: execute in its own task so a long-yielding command (run_luau
+				-- with task.wait / *Async calls, big builds) never starves this poll
+				-- loop. While busy the loop keeps polling with busy=1 (liveness only,
+				-- no second command is dequeued), so the bridge never sees a drop.
+				conn.busy = true
+				task.spawn(function()
+					local result
+					local startClock = os.clock()
+					local okRun, runErr = pcall(function()
+						local nowMs = DateTime.now().UnixTimestampMillis
+						if type(cmd.expectedTargetId) == "string" and cmd.expectedTargetId ~= TARGET_ID then
+							result = {
+								ok = false,
+								err = ("command target mismatch: expected %s, current %s")
+									:format(cmd.expectedTargetId, TARGET_ID),
+							}
+						elseif type(cmd.expiresAtMs) == "number" and cmd.expiresAtMs <= nowMs then
+							result = {
+								ok = false,
+								err = ("command expired before execution at %d (now %d)")
+									:format(cmd.expiresAtMs, nowMs),
+							}
+						elseif cmd.type == "enable_playtest_agent" then
+							setArmed(true, port) -- arming makes the agent persistent + F5-covered
+							result = { ok = lastEnsureOk, output = lastEnsureOk and "playtest agent armed" or "arm failed" }
+						elseif cmd.type == "prompt_save_selection" then
+							result = promptSaveSelection(cmd.payload or {})
+						else
+							result = Executor.execute(cmd)
+						end
+					end)
+					if not okRun or type(result) ~= "table" then
+						result = { ok = false, err = "handler error: " .. tostring(if okRun then "no result table" else runErr) }
+					end
+					if result.ok == false then
+						warn(("[NikMCP] command %q failed: %s")
+							:format(tostring(cmd.type), tostring(result.err)))
+					end
+					if settings.activityLog then
+						local ms = math.floor((os.clock() - startClock) * 1000 + 0.5)
+						status:addActivity({
+							tool = (":%d %s"):format(port, tostring(cmd.type)),
+							target = activityTarget(cmd),
+							ok = result.ok ~= false,
+							ms = ms,
+							time = os.time(),
+						})
+					end
+					result.id = cmd.id
+					postResult(base, result) -- chunks the POST if the result exceeds the 1024 KB PostAsync cap
+					conn.busy = false
+					conn.commandsProven = true
+					if port == selectedPort then
+						status:setCommands(true)
+					end
+				end)
 			end
 
-			-- adaptive cadence: fast for ~2s after a command, else idle scaled by
-			-- the number of connected ports (keeps total req-rate under the limit)
+			-- adaptive cadence: fast for ~2s after a command (and for the whole time a
+			-- command is executing), else idle scaled by the number of connected
+			-- ports (keeps total req-rate under the limit)
 			local interval
-			if os.clock() < activeUntil then
+			if conn.busy or os.clock() < activeUntil then
 				interval = Config.POLL_ACTIVE
 			else
 				interval = math.max(Config.POLL_IDLE, 0.15 * countConnections())
@@ -645,7 +834,34 @@ local function rocreateTargetPort(): number?
 	if selectedPort and connections[selectedPort] then
 		return selectedPort
 	end
-	return firstConnectedPort()
+	local live = firstConnectedPort()
+	if live then
+		return live
+	end
+	-- No live poll connection (dock never pressed Connect, or it dropped).
+	-- The bridge answers /heartbeat regardless, so probe candidates directly
+	-- instead of failing with "no connected bridge".
+	local seen: { [number]: boolean } = {}
+	local probeOrder: { number } = {}
+	local function addProbe(port: number?)
+		if type(port) == "number" and not seen[port] then
+			seen[port] = true
+			table.insert(probeOrder, port)
+		end
+	end
+	addProbe(selectedPort)
+	for _, p in ipairs(candidatePorts) do
+		addProbe(p)
+	end
+	for _, port in ipairs(probeOrder) do
+		local ok = pcall(function()
+			return HttpService:GetAsync(urlFor(port) .. "/heartbeat", true)
+		end)
+		if ok then
+			return port
+		end
+	end
+	return nil
 end
 
 local function rocreatePost(path: string, body: any): (boolean, any)
@@ -685,6 +901,9 @@ status.onRocreateUnlock = function(password: string): string
 	if typeof(data) == "table" and data.error then
 		return tostring(data.error)
 	end
+	if typeof(data) == "string" and data ~= "" then
+		return "unlock failed: " .. data
+	end
 	return "unlock failed"
 end
 
@@ -703,6 +922,9 @@ status.onRocreateSetCreds = function(cookie: string, password: string): string
 	if typeof(data) == "table" and data.error then
 		return tostring(data.error)
 	end
+	if typeof(data) == "string" and data ~= "" then
+		return "save failed: " .. data
+	end
 	return "save failed"
 end
 
@@ -717,6 +939,9 @@ status.onRocreateSetApiKey = function(apiKey: string): string
 	end
 	if typeof(data) == "table" and data.error then
 		return tostring(data.error)
+	end
+	if typeof(data) == "string" and data ~= "" then
+		return "save failed: " .. data
 	end
 	return "save failed"
 end
@@ -751,7 +976,7 @@ render() -- shows the restored selected port, all Disconnected (no auto-connect)
 task.spawn(function()
 	while pluginRunning do
 		if armed then
-			ensureAgent(selectedPort or firstConnectedPort() or Config.DEFAULT_PORT)
+			ensureAgent(activeAgentPort(nil))
 		end
 		-- A live server context (F5 agent polling) counts as playtest activity,
 		-- so a watched run isn't auto-stopped for idleness.

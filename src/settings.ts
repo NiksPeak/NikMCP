@@ -25,6 +25,10 @@ export const WRITE_TOOLS = new Set<string>([
   "set_property",
   "write_script",
   "set_selection",
+  "prompt_save_selection",
+  "assemble_imported_chunks",
+  "backup_selection",
+  "restore_backup",
   "create_instance",
   "delete_instance",
   "clone_instance",
@@ -35,8 +39,11 @@ export const WRITE_TOOLS = new Set<string>([
   "tag_instance",
   "untag_instance",
   "insert_asset",
+  "guarded_insert_asset",
   "enable_playtest_agent",
   "playtest_control",
+  "stop_playtest",
+  "stop_playtest_settled",
   // batch 2
   "set_attribute",
   "set_attributes",
@@ -106,6 +113,22 @@ export const WRITE_TOOLS = new Set<string>([
   "playtest_smoke",
   "snapshot_revert",
   "multiplayer_eval",
+  "run_multi_client_qa",
+  "runtime_ui_regression",
+  // Agent reliability pack: transactional source apply mutates the edit
+  // DataModel; client input drives live experience state. Planning, analysis,
+  // waits, scene snapshots, and profiling do not mutate place content.
+  "apply_script_patchset",
+  "client_input_sequence",
+  // v0.2.0: exact-string/patch script edits, harness macro (starts/stops a
+  // playtest + writes the gate attribute), manifest rebase (rewrites the sync
+  // baseline and can pull Studio source to disk), GuiButton activation (drives
+  // live client state), and pre-write backup restore (writes script source).
+  "edit_script",
+  "run_harness",
+  "reconcile_manifest",
+  "client_activate",
+  "restore_script_backup",
 ]);
 
 const DEFAULTS: Settings = {

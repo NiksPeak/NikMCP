@@ -1,11 +1,12 @@
 import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import type { AppConfig } from "./config.js";
-import { enqueueAndAwait, chooseContext, isAlive } from "./queue.js";
-import { getDiag } from "./bridge.js";
+import { enqueueAndAwait, chooseContext, isAlive, contextAgeMs } from "./queue.js";
+import { getDiag, getBoundPort, bridgeUnavailableReason } from "./bridge.js";
 import { gateToolCall } from "./settings.js";
 import { rgbaToPng } from "./png-encoder.js";
 import { preflightSize, redactKey, uploadAsset } from "./open-cloud.js";
@@ -34,12 +35,22 @@ import {
   classify,
   decideImport,
   unifiedDiff,
+  isProtectedSyncPath,
+  rebaseManifest,
   MANIFEST_NAME,
   type SyncListEntry,
+  type RebaseRow,
   type Manifest,
   type ManifestEntry,
   type StatusEntry,
 } from "./sync.js";
+import {
+  applyExactReplace,
+  applyUnifiedPatch,
+  sliceLines,
+  sameIgnoringWhitespace,
+  ScriptBackupRing,
+} from "./script-edit.js";
 import {
   isUnlocked,
   useCookie,
@@ -71,6 +82,36 @@ import {
   type MonetizationIdMap,
 } from "./rocreate-rewrite.js";
 import type { Context, CommandResult } from "./types.js";
+import { resolveManifestInput } from "./environment-manifest.js";
+import {
+  discoverStudioTargets,
+  getLocalTargetIdentity,
+  getSelectedStudioTarget,
+  refreshSelectedStudioTarget,
+  selectStudioTarget,
+  selectedTargetPort,
+} from "./studio-targets.js";
+import {
+  CREATOR_STORE_ASSET_TYPES,
+  CREATOR_STORE_SORT_CATEGORIES,
+  consumeAssetScanGrant,
+  createAssetScanGrant,
+  getCreatorStoreAsset,
+  searchCreatorStore,
+  validateGuardedAssetTarget,
+} from "./creator-store.js";
+import {
+  analyzeCodeHealth,
+  buildChangeImpact,
+  buildTaskContext,
+  type AnalysisInputCompleteness,
+  type AgentScript,
+} from "./agent-analysis.js";
+import {
+  buildScriptPatchItems,
+  ScriptPatchPlanStore,
+  type ScriptPatchRequest,
+} from "./script-patchset.js";
 
 // The Claude Code MCP client JSON-stringifies object-valued args for loosely-typed
 // (z.any) fields, so serialized datatypes like {__t:"Color3",...} or a build object
@@ -179,6 +220,33 @@ interface BuildSnapshot {
 
 const SNAPSHOT_CAP = 6;
 const snapshotStore = new Map<string, BuildSnapshot>();
+
+// ----- v0.2.0: pre-write script backups + async Luau jobs ---------------------
+// Every source-writing tool records the previous source here first, so a bad
+// write is one restore_script_backup away. In-memory, this Node process only.
+const scriptBackups = new ScriptBackupRing();
+
+interface LuauJob {
+  jobId: string;
+  context: Context;
+  codePreview: string;
+  startedAt: string;
+  finishedAt: string | null;
+  state: "running" | "done" | "error";
+  result?: unknown;
+  error?: string;
+}
+const LUAU_JOB_CAP = 30;
+const luauJobs = new Map<string, LuauJob>();
+function storeLuauJob(job: LuauJob): void {
+  luauJobs.delete(job.jobId);
+  luauJobs.set(job.jobId, job);
+  while (luauJobs.size > LUAU_JOB_CAP) {
+    const oldest = luauJobs.keys().next().value;
+    if (oldest === undefined) break;
+    luauJobs.delete(oldest);
+  }
+}
 
 // LRU insert: re-inserting an existing label moves it to the MRU end (Map
 // iteration order is insertion order); eviction takes the oldest (front) key.
@@ -394,6 +462,170 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         "'client' = the F5 play-mode client (read-only; run_luau context='client' is not supported)."
     );
 
+  async function readEditPlaytestStatus(timeoutMs = 1500): Promise<Record<string, unknown>> {
+    try {
+      const r = await enqueueAndAwait("get_playtest_status", "edit", {}, timeoutMs);
+      if (r.ok && r.result && typeof r.result === "object") return r.result as Record<string, unknown>;
+    } catch {
+      // Degraded status only; canonical status reports editConnected separately.
+    }
+    return {};
+  }
+
+  async function readRuntimeStatus(timeoutMs = 1500): Promise<Record<string, unknown>> {
+    if (!isAlive("server") && !getSelectedStudioTarget()) return {};
+    try {
+      const r = await enqueueAndAwait("get_runtime_status", "server", {}, timeoutMs);
+      if (r.ok && r.result && typeof r.result === "object") return r.result as Record<string, unknown>;
+    } catch {
+      // Runtime liveness is already exposed by isAlive("server").
+    }
+    return {};
+  }
+
+  async function canonicalPlaytestStatus(): Promise<Record<string, unknown>> {
+    let targetSelectionError: string | null = null;
+    try {
+      await refreshSelectedStudioTarget();
+    } catch (e) {
+      targetSelectionError = e instanceof Error ? e.message : String(e);
+    }
+    const [studio, runtime] = await Promise.all([readEditPlaytestStatus(), readRuntimeStatus()]);
+    const editConnected = isAlive("edit");
+    const serverAgentConnected = isAlive("server");
+    const running = serverAgentConnected || studio.running === true;
+    const startedAtUnix =
+      running && typeof studio.startedAtUnix === "number" ? (studio.startedAtUnix as number) : null;
+    const durationSec = startedAtUnix
+      ? Math.max(0, Math.floor(Date.now() / 1000) - startedAtUnix)
+      : typeof studio.durationSec === "number"
+        ? (studio.durationSec as number)
+        : 0;
+    const players =
+      typeof runtime.playerCount === "number"
+        ? runtime.playerCount
+        : typeof studio.players === "number"
+          ? studio.players
+          : 0;
+    const activePlaceName =
+      (typeof runtime.placeName === "string" && runtime.placeName) ||
+      (typeof studio.placeName === "string" && studio.placeName) ||
+      null;
+    const activePlaceId =
+      typeof runtime.placeId === "number"
+        ? runtime.placeId
+        : typeof studio.placeId === "number"
+          ? studio.placeId
+          : null;
+    const selectedTarget = getSelectedStudioTarget();
+    const localTarget = getLocalTargetIdentity();
+    // v0.2.0: distinguish "launched, agent not attached yet" from "stopped".
+    // startedAtUnix / runtimeSessionId are set by playtest_control the instant a
+    // run is requested; the server agent typically attaches 2-10s later.
+    const launching =
+      !serverAgentConnected &&
+      (typeof studio.startedAtUnix === "number" ||
+        (typeof studio.runtimeSessionId === "string" && studio.runtimeSessionId !== ""));
+    const phase = serverAgentConnected ? "running" : running ? "running" : launching ? "starting" : "stopped";
+    return {
+      running,
+      mode: running ? ((studio.mode as string | undefined) ?? (players > 0 ? "play" : "run")) : null,
+      playState: phase,
+      phase,
+      phaseHint:
+        phase === "starting"
+          ? "playtest launched but the runtime agent has not attached yet (typical 2-10s); poll again or use wait_for_state runtime_running"
+          : phase === "running" && !serverAgentConnected
+            ? "RunService is running in the edit DataModel (same-DM simulation); no separate server agent"
+            : null,
+      startedAtUnix,
+      durationSec,
+      runtimeSessionId:
+        (typeof runtime.runtimeSessionId === "string" && runtime.runtimeSessionId) ||
+        (typeof studio.runtimeSessionId === "string" && studio.runtimeSessionId) ||
+        null,
+      players,
+      activePlaceName,
+      activePlaceId,
+      bridge: {
+        listening: getBoundPort() !== null,
+        port: selectedTargetPort(getBoundPort()),
+        localPort: getBoundPort(),
+        unavailableReason: bridgeUnavailableReason(),
+      },
+      target: selectedTarget ?? (localTarget
+        ? {
+            targetId: localTarget.targetId,
+            windowTitle: localTarget.windowTitle,
+            studioPid: localTarget.pid,
+            placeId: localTarget.placeId,
+            universeId: localTarget.universeId,
+            placeName: localTarget.placeName,
+            placeFilePath: localTarget.filePath,
+          }
+        : null),
+      targetSelectionError,
+      edit: {
+        connected: editConnected,
+        ageMs: contextAgeMs("edit"),
+      },
+      serverAgent: {
+        connected: serverAgentConnected,
+        ageMs: contextAgeMs("server"),
+      },
+      clientAgent: {
+        connected: typeof runtime.clientAgentConnected === "boolean" ? runtime.clientAgentConnected : false,
+        ageMs: typeof runtime.clientAgentAgeMs === "number" ? runtime.clientAgentAgeMs : null,
+      },
+      raw: { edit: studio, runtime },
+      diag: getDiag(),
+    };
+  }
+
+  async function armRuntimeAgent(): Promise<string | null> {
+    try {
+      const r = await enqueueAndAwait("enable_playtest_agent", "edit", {}, 8000);
+      if (!r.ok) return r.error ?? (r as { err?: string }).err ?? "enable_playtest_agent failed";
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function waitForRuntimeAgent(timeoutMs: number): Promise<{ ok: boolean; status: Record<string, unknown> }> {
+    const deadline = Date.now() + timeoutMs;
+    while (!isAlive("server") && Date.now() < deadline) {
+      try {
+        await refreshSelectedStudioTarget();
+      } catch {
+        // canonical status below returns the pinned-target diagnostic.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    const status = await canonicalPlaytestStatus();
+    return { ok: isAlive("server"), status };
+  }
+
+  function attachFailure(status: Record<string, unknown>): string {
+    const diag = Array.isArray(status.diag) ? status.diag.slice(-5) : [];
+    return (
+      "runtime agent never connected; status=" +
+      JSON.stringify(
+        {
+          bridge: status.bridge,
+          edit: status.edit,
+          serverAgent: status.serverAgent,
+          clientAgent: status.clientAgent,
+          players: status.players,
+          activePlaceName: status.activePlaceName,
+          recentDiag: diag,
+        },
+        null,
+        2
+      )
+    );
+  }
+
   // Gate -> enqueue -> render. The server enforces the plugin's settings here so
   // a disabled (or read-only-blocked) tool never reaches Studio.
   async function call(name: string, ctx: Context, payload: unknown) {
@@ -405,35 +637,163 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     return renderResult(r);
   }
 
-  // Stop a playtest. EndTest is only legal from the run DataModel, so route stop to
-  // the live server agent -- that is what actually ends the test. EndTest tears that
-  // DM down, so the agent's /response POST may never arrive: if the server context
-  // goes dead after we send stop, the test ended => SUCCESS (not a timeout). Falls
-  // back to the edit-side warn+EndTest for manually-started tests with no live agent.
-  async function stopPlaytest(payload: unknown) {
-    const reason = gateToolCall("playtest_control");
+  async function callWithTimeout(name: string, ctx: Context, payload: unknown, timeoutMs: number) {
+    const reason = gateToolCall(name);
     if (reason) return blocked(reason);
-    if (isAlive("server")) {
-      try {
-        const r = await enqueueAndAwait("playtest_control", "server", payload, 6000);
-        return renderResult(r);
-      } catch {
-        if (!isAlive("server")) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text:
-                  "playtest stopped: EndTest ran in the run DataModel and tore it " +
-                  "down (server agent disconnected, as expected).",
-              },
-            ],
-          };
-        }
-        // server still alive but no response -> fall through to the edit fallback
+    const r = await enqueueAndAwait(name, ctx, payload, timeoutMs);
+    return renderResult(r);
+  }
+
+  // Stop a playtest. EndTest is only legal from the run DataModel, so route stop to
+  // the live server agent, then wait for the system to settle back to edit mode.
+  // EndTest can tear down the run DataModel before /response returns, so a timeout
+  // on the stop command is treated as "signal sent"; final success comes only from
+  // the settled status checks below.
+  interface StopAttempt {
+    target: Context;
+    ok: boolean;
+    response?: unknown;
+    error?: string;
+    at: string;
+  }
+
+  function settledStop(status: Record<string, unknown>): boolean {
+    const edit = (status.edit ?? {}) as Record<string, unknown>;
+    const serverAgent = (status.serverAgent ?? {}) as Record<string, unknown>;
+    const clientAgent = (status.clientAgent ?? {}) as Record<string, unknown>;
+    const raw = (status.raw ?? {}) as Record<string, unknown>;
+    const rawEdit = (raw.edit ?? {}) as Record<string, unknown>;
+    const rawRuntime = (raw.runtime ?? {}) as Record<string, unknown>;
+    return (
+      edit.connected === true &&
+      status.running === false &&
+      rawEdit.running !== true &&
+      rawEdit.startedAtUnix == null &&
+      rawEdit.runtimeSessionId == null &&
+      status.runtimeSessionId == null &&
+      rawRuntime.runtimeSessionId == null &&
+      serverAgent.connected === false &&
+      clientAgent.connected === false
+    );
+  }
+
+  function stopSettlementStates(status: Record<string, unknown>, attempts = 0) {
+    const edit = (status.edit ?? {}) as Record<string, unknown>;
+    const serverAgent = (status.serverAgent ?? {}) as Record<string, unknown>;
+    const clientAgent = (status.clientAgent ?? {}) as Record<string, unknown>;
+    const raw = (status.raw ?? {}) as Record<string, unknown>;
+    const rawEdit = (raw.edit ?? {}) as Record<string, unknown>;
+    const rawRuntime = (raw.runtime ?? {}) as Record<string, unknown>;
+    return {
+      stop_requested: attempts > 0,
+      runservice_stopped:
+        rawEdit.runServiceIsRunning !== true &&
+        rawRuntime.runServiceIsRunning !== true &&
+        serverAgent.connected === false,
+      edit_mode_confirmed:
+        edit.connected === true &&
+        rawEdit.dataModelState === "edit" &&
+        rawEdit.runServiceIsRunning !== true,
+      server_agent_disconnected: serverAgent.connected === false,
+      client_agent_disconnected: clientAgent.connected === false,
+      stale_runtime_state_cleared:
+        status.runtimeSessionId == null &&
+        rawEdit.runtimeSessionId == null &&
+        rawRuntime.runtimeSessionId == null,
+      settlement_complete: settledStop(status),
+    };
+  }
+
+  async function waitForStopSettled(timeoutMs: number): Promise<{ settled: boolean; status: Record<string, unknown> }> {
+    const deadline = Date.now() + timeoutMs;
+    let status = await canonicalPlaytestStatus();
+    while (!settledStop(status) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      status = await canonicalPlaytestStatus();
+    }
+    return { settled: settledStop(status), status };
+  }
+
+  async function issueStop(target: Context, payload: unknown, timeoutMs: number): Promise<StopAttempt> {
+    try {
+      const r = await enqueueAndAwait("playtest_control", target, payload, timeoutMs);
+      return { target, ok: r.ok, response: r, at: new Date().toISOString() };
+    } catch (e) {
+      return { target, ok: false, error: e instanceof Error ? e.message : String(e), at: new Date().toISOString() };
+    }
+  }
+
+  async function stopPlaytest(payload: {
+    action?: string;
+    mode?: "run" | "play" | "multiplayer";
+    numPlayers?: number;
+    settleTimeoutMs?: number;
+    retries?: number;
+    force?: boolean;
+  }, gateName = "playtest_control") {
+    const reason = gateToolCall(gateName);
+    if (reason) return blocked(reason);
+    const settleTimeoutMs = Math.max(1000, Math.min(30000, payload.settleTimeoutMs ?? 10000));
+    const retries = Math.max(0, Math.min(3, payload.retries ?? 1));
+    const attempts: StopAttempt[] = [];
+    const firstStatus = await canonicalPlaytestStatus();
+
+    for (let i = 0; i <= retries; i++) {
+      if (isAlive("server")) {
+        attempts.push(await issueStop("server", payload, 6000));
+      }
+      if (payload.force || i > 0 || !isAlive("server")) {
+        attempts.push(await issueStop("edit", payload, 6000));
+      }
+
+      const settled = await waitForStopSettled(settleTimeoutMs);
+      if (settled.settled) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  stopped: true,
+                  settled: true,
+                  states: stopSettlementStates(settled.status, attempts.length),
+                  attempts,
+                  status: settled.status,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
       }
     }
-    return call("playtest_control", "edit", payload);
+
+    const finalStatus = await canonicalPlaytestStatus();
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              stopped: false,
+              settled: false,
+              error: "playtest stop did not settle before timeout",
+              hint: "retry with force:true and/or a larger settleTimeoutMs if Studio is slow to tear down the run DataModel",
+              settleTimeoutMs,
+              retries,
+              firstStatus,
+              attempts,
+              finalStatus,
+              states: stopSettlementStates(finalStatus, attempts.length),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
   }
 
   // ----- existing core tools ------------------------------------------------
@@ -451,16 +811,84 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         code: z.string(),
         context: contextArgWithClient,
         skipAnalysis: z.boolean().default(false),
+        timeoutMs: z
+          .number()
+          .int()
+          .min(1000)
+          .max(600_000)
+          .optional()
+          .describe("Per-call wait cap (default commandTimeoutMs). The plugin keeps polling while the chunk yields, so long edit scripts no longer drop the bridge."),
+        async: z
+          .boolean()
+          .default(false)
+          .describe("Return a jobId immediately; poll get_luau_job for the result (up to timeoutMs, default 10 min)."),
       },
     },
-    async ({ code, context, skipAnalysis }) => {
+    async ({ code, context, skipAnalysis, timeoutMs, async: runAsync }) => {
       if (context === "client") {
         return blocked("not supported: loadstring is server-only; use client_query");
       }
       const g = await gateLuau(code, skipAnalysis, "run_luau");
       if (g.block) return g.block;
-      const res = await call("run_luau", chooseContext(context), { code });
+      const ctx = chooseContext(context);
+      if (runAsync) {
+        const reason = gateToolCall("run_luau");
+        if (reason) return blocked(reason);
+        const jobId = randomUUID();
+        const job: LuauJob = {
+          jobId,
+          context: ctx,
+          codePreview: code.slice(0, 200),
+          startedAt: new Date().toISOString(),
+          finishedAt: null,
+          state: "running",
+        };
+        storeLuauJob(job);
+        const wait = timeoutMs ?? 600_000;
+        void enqueueAndAwait("run_luau", ctx, { code }, wait)
+          .then((r) => {
+            job.finishedAt = new Date().toISOString();
+            if (r.ok) {
+              job.state = "done";
+              job.result = { output: r.output, result: r.result };
+            } else {
+              job.state = "error";
+              job.error = r.error ?? (r as { err?: string }).err ?? "run_luau failed";
+            }
+          })
+          .catch((e: unknown) => {
+            job.finishedAt = new Date().toISOString();
+            job.state = "error";
+            job.error = e instanceof Error ? e.message : String(e);
+          });
+        return withLuauWarnings(
+          jsonResult({ jobId, context: ctx, state: "running", timeoutMs: wait, hint: "poll get_luau_job { jobId }" }),
+          g.warnings,
+        );
+      }
+      const res = await callWithTimeout("run_luau", ctx, { code }, timeoutMs ?? cfg.commandTimeoutMs);
       return withLuauWarnings(res, g.warnings);
+    }
+  );
+
+  server.registerTool(
+    "get_luau_job",
+    {
+      title: "Get Luau Job",
+      description:
+        "Read the state/result of a run_luau async:true job (running | done | error). Jobs live in " +
+        "this Node process only (last 30). Omit jobId to list them.",
+      inputSchema: { jobId: z.string().optional() },
+    },
+    async ({ jobId }) => {
+      if (!jobId) {
+        return jsonResult({
+          jobs: [...luauJobs.values()].map(({ result: _r, ...rest }) => rest),
+        });
+      }
+      const job = luauJobs.get(jobId);
+      if (!job) return blocked(`unknown jobId ${jobId} (expired or never created in this Node process)`);
+      return jsonResult(job);
     }
   );
 
@@ -515,16 +943,37 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         "the write with line/col diagnostics (skipAnalysis:true bypasses the gate).",
       inputSchema: {
         path: z.string(),
-        source: z.string(),
+        source: z.string().optional(),
+        sourceFile: z
+          .string()
+          .optional()
+          .describe("Read the source from this local file instead of sending it inline (exactly one of source/sourceFile)."),
         className: z.enum(["Script", "LocalScript", "ModuleScript"]).optional(),
         skipAnalysis: z.boolean().default(false),
       },
     },
-    async ({ path, source, className, skipAnalysis }) => {
-      const g = await gateLuau(source, skipAnalysis, "write_script");
+    async ({ path, source, sourceFile, className, skipAnalysis }) => {
+      if ((source === undefined) === (sourceFile === undefined)) {
+        return blocked("provide exactly one of source or sourceFile");
+      }
+      if (isProtectedSyncPath(path)) {
+        return blocked(`${path} is a bridge-managed NikMCP script; use enable_playtest_agent to refresh it instead of writing it`);
+      }
+      let text = source ?? "";
+      if (sourceFile !== undefined) {
+        try {
+          text = normalizeSource(readFileSync(sourceFile, "utf8"));
+        } catch (e) {
+          return blocked(`sourceFile unreadable: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      const g = await gateLuau(text, skipAnalysis, "write_script");
       if (g.block) return g.block;
-      const res = await call("write_script", "edit", { path, source, className });
-      return withLuauWarnings(res, g.warnings);
+      const reason = gateToolCall("write_script");
+      if (reason) return blocked(reason);
+      const backup = await backupScriptBeforeWrite(path, "write_script");
+      const res = await call("write_script", "edit", { path, source: text, className });
+      return withBackupNote(withLuauWarnings(res, g.warnings), backup);
     }
   );
 
@@ -607,11 +1056,30 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     {
       title: "Get Script Source",
       description:
-        "Read a script's source (ScriptEditorService:GetEditorSource, fallback .Source).",
-      inputSchema: { path: z.string(), context: contextArg },
+        "Read a script's source (ScriptEditorService:GetEditorSource, fallback .Source). " +
+        "Pass startLine/lineCount (and/or maxBytes) to read a window of a large script instead " +
+        "of the whole file; the response then carries totalLines and the exact range returned.",
+      inputSchema: {
+        path: z.string(),
+        context: contextArg,
+        startLine: z.number().int().min(1).optional(),
+        lineCount: z.number().int().min(1).max(20_000).optional(),
+        maxBytes: z.number().int().min(256).max(2_000_000).optional(),
+      },
     },
-    async ({ path, context }) =>
-      call("get_script_source", chooseContext(context), { path })
+    async ({ path, context, startLine, lineCount, maxBytes }) => {
+      if (startLine === undefined && lineCount === undefined && maxBytes === undefined) {
+        return call("get_script_source", chooseContext(context), { path });
+      }
+      const reason = gateToolCall("get_script_source");
+      if (reason) return blocked(reason);
+      const r = await enqueueAndAwait("get_script_source", chooseContext(context), { path }, cfg.commandTimeoutMs);
+      if (!r.ok) return renderResult(r);
+      const res = r.result as { path?: string; source?: unknown } | undefined;
+      if (typeof res?.source !== "string") return blocked("get_script_source returned no source text");
+      const slice = sliceLines(res.source, startLine, lineCount, maxBytes);
+      return jsonResult({ path: res.path ?? path, ...slice });
+    }
   );
 
   server.registerTool(
@@ -673,6 +1141,23 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       inputSchema: { paths: z.array(z.string()), context: contextArg },
     },
     async ({ paths, context }) => call("set_selection", chooseContext(context), { paths })
+  );
+
+  server.registerTool(
+    "prompt_save_selection",
+    {
+      title: "Prompt Save Selection",
+      description:
+        "Open Studio's native Save Selection dialog for the current selection, or first " +
+        "select the provided paths. This is the reliable PluginSecurity path for RBXM/RBXMX " +
+        "backups; Studio still requires the user to confirm the file dialog.",
+      inputSchema: {
+        paths: z.array(z.string()).optional(),
+        suggestedFileName: z.string().default("nikmcp_selection.rbxmx"),
+      },
+    },
+    async ({ paths, suggestedFileName }) =>
+      call("prompt_save_selection", "edit", { paths, suggestedFileName })
   );
 
   server.registerTool(
@@ -860,25 +1345,69 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       title: "Playtest Control",
       description:
         "Start a playtest via StudioTestService (mode='run' = F8/Run, mode='play' = " +
-        "F5/Play Solo, optional numPlayers 1-8). It runs in a SEPARATE DataModel, so " +
+        "F5/Play Solo, mode='multiplayer' = one server plus 1-8 real client DataModels). " +
+        "It runs in a SEPARATE DataModel, so " +
         "confirm it is live with get_playtest_status (running/agentConnected) -- not the " +
         "start return alone. Do checks via get_playtest_output / run_luau context='server', " +
         "then call action='stop' when done -- DO NOT leave a playtest running. Use " +
         "get_playtest_status first to see if one is already live before starting another.",
       inputSchema: {
         action: z.enum(["start", "stop"]),
-        mode: z.enum(["play", "run"]).default("run"),
+        mode: z.enum(["play", "run", "multiplayer"]).default("run"),
         numPlayers: z.number().int().min(1).max(8).optional(),
+        testArgs: objectArg().optional(),
+        settleTimeoutMs: z.number().int().min(1000).max(30000).default(10000),
+        retries: z.number().int().min(0).max(3).default(1),
+        force: z.boolean().default(false),
         context: contextArg,
       },
     },
-    async ({ action, mode, numPlayers, context: _context }) =>
+    async ({ action, mode, numPlayers, testArgs, settleTimeoutMs, retries, force, context: _context }) =>
       // start: StudioTestService start runs in the edit plugin. stop: route to the
       // live server agent so EndTest runs from the run DataModel (the only context
       // where EndTest is legal); stopPlaytest falls back to edit when no agent is up.
       action === "stop"
-        ? stopPlaytest({ action, mode, numPlayers })
-        : call("playtest_control", "edit", { action, mode, numPlayers })
+        ? stopPlaytest({ action, mode, numPlayers, settleTimeoutMs, retries, force })
+        : call("playtest_control", "edit", { action, mode, numPlayers, testArgs })
+  );
+
+  server.registerTool(
+    "stop_playtest",
+    {
+      title: "Stop Playtest",
+      description:
+        "Settled stop handshake for an active playtest. Sends stop, waits until edit mode is " +
+        "confirmed, RunService is not running, server/client runtime agents are disconnected, " +
+        "and no runtime session id remains active. Retries once by default; pass force:true " +
+        "to also send the edit-side stop path on every attempt.",
+      inputSchema: {
+        mode: z.enum(["play", "run", "multiplayer"]).default("run"),
+        settleTimeoutMs: z.number().int().min(1000).max(30000).default(10000),
+        retries: z.number().int().min(0).max(3).default(1),
+        force: z.boolean().default(false),
+      },
+    },
+    async ({ mode, settleTimeoutMs, retries, force }) =>
+      stopPlaytest({ action: "stop", mode, settleTimeoutMs, retries, force })
+  );
+
+  server.registerTool(
+    "stop_playtest_settled",
+    {
+      title: "Stop Playtest Settled",
+      description:
+        "Engine-truth stop handshake pinned to the selected Studio target. Requests stop from the run DataModel, " +
+        "waits for RunService stopped, edit mode restored, server/client agents disconnected, and stale runtime ids cleared. " +
+        "Returns every settlement state explicitly and actionable diagnostics on timeout.",
+      inputSchema: {
+        mode: z.enum(["play", "run"]).default("run"),
+        settleTimeoutMs: z.number().int().min(1000).max(30000).default(10000),
+        retries: z.number().int().min(0).max(3).default(1),
+        force: z.boolean().default(false),
+      },
+    },
+    async ({ mode, settleTimeoutMs, retries, force }) =>
+      stopPlaytest({ action: "stop", mode, settleTimeoutMs, retries, force })
   );
 
   server.registerTool(
@@ -893,14 +1422,79 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         "or no live agent: falls back to the edit plugin's captured ring and `client` is " +
         "empty with a note. Once you have what you need, stop the playtest with " +
         "playtest_control action='stop' so it doesn't keep running.",
-      inputSchema: { drain: z.boolean().default(true), context: contextArg },
+      inputSchema: {
+        drain: z.boolean().default(true),
+        context: contextArg,
+        pattern: z
+          .string()
+          .max(500)
+          .optional()
+          .describe("JS regex; only lines whose text matches are returned (server+client). Filtering happens Node-side after the ring is read."),
+        ignoreCase: z.boolean().default(true),
+        levelFilter: z.enum(["error", "warning", "output"]).optional(),
+        sinceMarker: z
+          .string()
+          .max(500)
+          .optional()
+          .describe("Return only lines AFTER the last line containing this substring."),
+        limit: z.number().int().min(1).max(5000).optional().describe("Keep only the last N matching lines."),
+      },
     },
-    async ({ drain, context: _context }) =>
+    async ({ drain, context: _context, pattern, ignoreCase, levelFilter, sinceMarker, limit }) => {
       // Live F5 agent is the truth for a real playtest; the edit ring is the fallback
       // for Run mode / no agent connected (same class as the playtest_control pin).
-      isAlive("server")
-        ? call("get_playtest_output", "server", { drain })
-        : call("get_playtest_output", "edit", { drain })
+      const ctx: Context = isAlive("server") ? "server" : "edit";
+      const filtering = pattern !== undefined || levelFilter !== undefined || sinceMarker !== undefined || limit !== undefined;
+      if (!filtering) return call("get_playtest_output", ctx, { drain });
+      const reason = gateToolCall("get_playtest_output");
+      if (reason) return blocked(reason);
+      let re: RegExp | null = null;
+      if (pattern !== undefined) {
+        try {
+          re = new RegExp(pattern, ignoreCase ? "i" : "");
+        } catch (e) {
+          return blocked(`invalid pattern: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      const r = await enqueueAndAwait("get_playtest_output", ctx, { drain }, cfg.commandTimeoutMs);
+      if (!r.ok) return renderResult(r);
+      const raw = (r.result ?? {}) as Record<string, unknown>;
+      const levelWant = levelFilter
+        ? { error: "MessageError", warning: "MessageWarning", output: "MessageOutput" }[levelFilter]
+        : null;
+      const filterLines = (arr: unknown): { lines: Record<string, unknown>[]; before: number } => {
+        const list = Array.isArray(arr) ? (arr as Record<string, unknown>[]) : [];
+        let picked = list;
+        if (sinceMarker !== undefined) {
+          let idx = -1;
+          for (let i = picked.length - 1; i >= 0; i -= 1) {
+            if (String(picked[i]?.text ?? "").includes(sinceMarker)) {
+              idx = i;
+              break;
+            }
+          }
+          picked = idx >= 0 ? picked.slice(idx + 1) : picked;
+        }
+        picked = picked.filter((l) => {
+          const text = String(l?.text ?? "");
+          if (levelWant && l?.level !== levelWant) return false;
+          if (re && !re.test(text)) return false;
+          return true;
+        });
+        if (limit !== undefined && picked.length > limit) picked = picked.slice(-limit);
+        return { lines: picked, before: list.length };
+      };
+      const server = filterLines(raw.lines);
+      const client = filterLines(raw.client);
+      return jsonResult({
+        ...raw,
+        lines: server.lines,
+        client: client.lines,
+        count: server.lines.length,
+        unfiltered: { server: server.before, client: client.before },
+        filter: { pattern, ignoreCase, levelFilter, sinceMarker, limit },
+      });
+    }
   );
 
   // ----- Batch 2: attributes ------------------------------------------------
@@ -982,8 +1576,12 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         newText: z.string(),
       },
     },
-    async ({ path, startLine, endLine, newText }) =>
-      call("edit_script_lines", "edit", { path, startLine, endLine, newText })
+    async ({ path, startLine, endLine, newText }) => {
+      const reason = gateToolCall("edit_script_lines");
+      if (reason) return blocked(reason);
+      const backup = await backupScriptBeforeWrite(path, "edit_script_lines");
+      return withBackupNote(await call("edit_script_lines", "edit", { path, startLine, endLine, newText }), backup);
+    }
   );
 
   server.registerTool(
@@ -994,8 +1592,12 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         "Insert newText before 1-based line (append if beyond end). Edit context only.",
       inputSchema: { path: z.string(), line: z.number().int().min(1), newText: z.string() },
     },
-    async ({ path, line, newText }) =>
-      call("insert_script_lines", "edit", { path, line, newText })
+    async ({ path, line, newText }) => {
+      const reason = gateToolCall("insert_script_lines");
+      if (reason) return blocked(reason);
+      const backup = await backupScriptBeforeWrite(path, "insert_script_lines");
+      return withBackupNote(await call("insert_script_lines", "edit", { path, line, newText }), backup);
+    }
   );
 
   server.registerTool(
@@ -1009,8 +1611,12 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         endLine: z.number().int().min(1),
       },
     },
-    async ({ path, startLine, endLine }) =>
-      call("delete_script_lines", "edit", { path, startLine, endLine })
+    async ({ path, startLine, endLine }) => {
+      const reason = gateToolCall("delete_script_lines");
+      if (reason) return blocked(reason);
+      const backup = await backupScriptBeforeWrite(path, "delete_script_lines");
+      return withBackupNote(await call("delete_script_lines", "edit", { path, startLine, endLine }), backup);
+    }
   );
 
   server.registerTool(
@@ -1399,18 +2005,142 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
   server.registerTool(
     "search_assets",
     {
-      title: "Search Assets",
+      title: "Search Creator Store Assets",
       description:
-        "Catalog search. UNSUPPORTED from a plugin (needs Open Cloud / web API) — " +
-        "returns a clear reason.",
+        "Search-only Roblox Creator Store discovery through the official toolbox-service API. " +
+        "Supports asset type, verified-creator filtering, creator user/group filters, ratings/relevance sorts, " +
+        "pagination, and bounded results. Search never inserts or mutates Studio.",
       inputSchema: {
-        query: z.string(),
-        type: z.string().optional(),
-        context: contextArg,
+        query: z.string().min(1),
+        assetType: z.enum(CREATOR_STORE_ASSET_TYPES).optional(),
+        includeOnlyVerifiedCreators: z.boolean().default(false),
+        creatorUserId: z.number().int().positive().optional(),
+        creatorGroupId: z.number().int().positive().optional(),
+        sortCategory: z.enum(CREATOR_STORE_SORT_CATEGORIES).default("Relevance"),
+        sortDirection: z.enum(["Ascending", "Descending"]).optional(),
+        maxPageSize: z.number().int().min(1).max(100).default(25),
+        pageToken: z.string().optional(),
       },
     },
-    async ({ query, type, context }) =>
-      call("search_assets", chooseContext(context), { query, type })
+    async (input) => {
+      const reason = gateToolCall("search_assets");
+      if (reason) return blocked(reason);
+      if (input.creatorUserId !== undefined && input.creatorGroupId !== undefined) {
+        return blocked("creatorUserId and creatorGroupId are mutually exclusive");
+      }
+      try {
+        const result = await searchCreatorStore(input, cfg.openCloud.apiKey);
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      } catch (error) {
+        return blocked(error instanceof Error ? error.message : String(error));
+      }
+    }
+  );
+
+  server.registerTool(
+    "inspect_creator_store_asset",
+    {
+      title: "Inspect Creator Store Asset",
+      description:
+        "Fetch Creator Store metadata and load the exact asset into an unparented Studio quarantine container for a " +
+        "static hierarchy/source risk scan. Returns a short-lived scanToken bound to assetId, targetPath, and a content " +
+        "fingerprint. This tool never parents the asset into the place and cannot prove that code is safe.",
+      inputSchema: {
+        assetId: z.number().int().positive(),
+        targetPath: z.string().min(1),
+      },
+    },
+    async ({ assetId, targetPath }) => {
+      const reason = gateToolCall("inspect_creator_store_asset");
+      if (reason) return blocked(reason);
+      const target = validateGuardedAssetTarget(targetPath);
+      if (!target.allowed) return blocked(target.reason ?? "targetPath is not allowed");
+      try {
+        const [metadata, scan] = await Promise.all([
+          getCreatorStoreAsset(assetId, cfg.openCloud.apiKey).catch((error) => ({
+            unavailable: true,
+            error: error instanceof Error ? error.message : String(error),
+          })),
+          enqueueAndAwait(
+            "guarded_asset_scan",
+            "edit",
+            { assetId, targetPath: target.normalized },
+            120_000,
+          ),
+        ]);
+        if (!scan.ok || !scan.result || typeof scan.result !== "object") {
+          return blocked(scan.error ?? (scan as { err?: string }).err ?? "Studio asset scan failed");
+        }
+        const report = scan.result as Record<string, unknown>;
+        if (typeof report.fingerprint !== "string" || !report.fingerprint) {
+          return blocked("Studio asset scan did not return a content fingerprint");
+        }
+        const grant = createAssetScanGrant(assetId, target.normalized, report.fingerprint);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              metadata,
+              scan: report,
+              approval: {
+                scanToken: grant.token,
+                targetPath: grant.targetPath,
+                expiresAt: new Date(grant.expiresAt).toISOString(),
+                oneTimeUse: true,
+              },
+              limitation:
+                "Static metadata, hierarchy, and source signatures reduce risk but do not guarantee that an asset is safe.",
+            }, null, 2),
+          }],
+        };
+      } catch (error) {
+        return blocked(error instanceof Error ? error.message : String(error));
+      }
+    }
+  );
+
+  server.registerTool(
+    "guarded_insert_asset",
+    {
+      title: "Guarded Insert Asset",
+      description:
+        "WRITE tool for an already-inspected Creator Store asset. Requires explicit assetId, approved targetPath, " +
+        "one-time scanToken, and confirm=true. Studio reloads and rescans the asset, refuses fingerprint drift, " +
+        "quarantines all script and remote descendants in ServerStorage.NikMCPQuarantine, then post-scans inserted roots.",
+      inputSchema: {
+        assetId: z.number().int().positive(),
+        targetPath: z.string().min(1),
+        scanToken: z.string().uuid(),
+        confirm: z.literal(true),
+        allowCriticalRisk: z.boolean().default(false).describe(
+          "Must remain false unless a human reviewed the critical findings and intentionally accepts them.",
+        ),
+      },
+    },
+    async ({ assetId, targetPath, scanToken, confirm, allowCriticalRisk }) => {
+      const reason = gateToolCall("guarded_insert_asset");
+      if (reason) return blocked(reason);
+      const target = validateGuardedAssetTarget(targetPath);
+      if (!target.allowed) return blocked(target.reason ?? "targetPath is not allowed");
+      try {
+        const grant = consumeAssetScanGrant(scanToken, assetId, target.normalized);
+        const result = await enqueueAndAwait(
+          "guarded_asset_insert",
+          "edit",
+          {
+            assetId,
+            targetPath: target.normalized,
+            expectedFingerprint: grant.fingerprint,
+            confirm,
+            allowCriticalRisk,
+          },
+          120_000,
+        );
+        return renderResult(result);
+      } catch (error) {
+        return blocked(error instanceof Error ? error.message : String(error));
+      }
+    }
   );
 
   server.registerTool(
@@ -1444,16 +2174,44 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     {
       title: "Simulate Keyboard Input",
       description:
-        "Send a key event via VirtualInputManager. Restricted (RobloxScriptSecurity) — " +
-        "typically unsupported from a plugin; returns a clear reason when blocked.",
+        "Compatibility wrapper over the official F5-client VirtualInput path. Sends one key " +
+        "tap/down/up event; prefer client_input_sequence for multi-step flows and assertions.",
       inputSchema: {
         key: z.string(),
         action: z.enum(["press", "down", "up"]).default("press"),
         context: contextArg,
       },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
     },
-    async ({ key, action, context }) =>
-      call("simulate_keyboard_input", chooseContext(context), { key, action })
+    async ({ key, action }) => {
+      const oldGate = gateToolCall("simulate_keyboard_input");
+      if (oldGate) return blocked(oldGate);
+      const newGate = gateToolCall("client_input_sequence");
+      if (newGate) return blocked(newGate);
+      if (!isAlive("server")) {
+        return blocked("simulate_keyboard_input requires a running F5 client");
+      }
+      const response = await enqueueAndAwait(
+        "client_input_sequence",
+        "server",
+        {
+          steps: [{
+            kind: "key",
+            keyCode: key,
+            action: action === "press" ? "tap" : action,
+            holdSeconds: 0.05,
+          }],
+          timeoutSec: 5,
+        },
+        10_000,
+      );
+      return renderResult(response);
+    }
   );
 
   server.registerTool(
@@ -1461,8 +2219,9 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     {
       title: "Simulate Mouse Input",
       description:
-        "Send a mouse move/button event via VirtualInputManager. Restricted " +
-        "(RobloxScriptSecurity) — typically unsupported; returns a clear reason when blocked.",
+        "Compatibility wrapper over the official F5-client VirtualInput path. Move is supported; " +
+        "legacy isolated down/up is refused because safe cleanup requires a bounded click. Use " +
+        "client_input_sequence kind='click' for button interaction.",
       inputSchema: {
         action: z.enum(["move", "down", "up"]).default("move"),
         x: z.number().default(0),
@@ -1470,9 +2229,33 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         button: z.number().int().min(0).max(2).default(0),
         context: contextArg,
       },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
     },
-    async ({ action, x, y, button, context }) =>
-      call("simulate_mouse_input", chooseContext(context), { action, x, y, button })
+    async ({ action, x, y }) => {
+      const oldGate = gateToolCall("simulate_mouse_input");
+      if (oldGate) return blocked(oldGate);
+      const newGate = gateToolCall("client_input_sequence");
+      if (newGate) return blocked(newGate);
+      if (action !== "move") {
+        return blocked(
+          "isolated mouse down/up is intentionally unsupported; use client_input_sequence " +
+            "kind='click' so the button is always released during cleanup",
+        );
+      }
+      if (!isAlive("server")) return blocked("simulate_mouse_input requires a running F5 client");
+      const response = await enqueueAndAwait(
+        "client_input_sequence",
+        "server",
+        { steps: [{ kind: "move", x, y }], timeoutSec: 5 },
+        10_000,
+      );
+      return renderResult(response);
+    }
   );
 
   server.registerTool(
@@ -1907,6 +2690,259 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       call("measure_distance", chooseContext(context), { pathA, pathB })
   );
 
+  // ----- Blender environment import / audit / recovery ---------------------
+  server.registerTool(
+    "assemble_imported_chunks",
+    {
+      title: "Assemble Imported Chunks",
+      description:
+        "Dry-run-first reassembly for Blender FBX chunks whose X/Z survived import but Y was independently offset. " +
+        "Groups only the requested roots under one Model, reconstructs vertical origins from an inline/disk JSON manifest " +
+        "or a reference chunk, records original pivots and Y deltas as attributes, optionally backs up first, and can anchor all parts.",
+      inputSchema: {
+        importedRoots: z.array(z.string()).optional().describe("Workspace child names from the Studio importer."),
+        paths: z.array(z.string()).optional().describe("Explicit instance paths; takes precedence over importedRoots."),
+        parentRootName: z.string().min(1).default("LobbyEnvironment"),
+        parentPath: z.string().default("Workspace"),
+        manifestPath: z.string().optional().describe("Local JSON manifest path, read by the Node MCP process."),
+        manifest: objectArg().optional().describe("Inline manifest object/array; mutually exclusive with manifestPath."),
+        referenceChunk: z.string().optional().describe("Imported root name/path used as the vertical anchor, usually terrain."),
+        dryRun: z.boolean().default(true),
+        backupName: z.string().min(1).optional(),
+        replaceBackup: z.boolean().default(false),
+        anchorParts: z.boolean().default(true),
+      },
+    },
+    async (input) => {
+      if ((!input.paths || input.paths.length === 0) && (!input.importedRoots || input.importedRoots.length === 0)) {
+        return blocked("provide importedRoots or paths");
+      }
+      try {
+        const manifest = resolveManifestInput({
+          manifestPath: input.manifestPath,
+          manifest: input.manifest,
+        });
+        return callWithTimeout("assemble_imported_chunks", "edit", {
+          paths: input.paths,
+          importedRoots: input.importedRoots,
+          parentRootName: input.parentRootName,
+          parentPath: input.parentPath,
+          manifest,
+          referenceChunk: input.referenceChunk,
+          dryRun: input.dryRun,
+          backupName: input.backupName,
+          replaceBackup: input.replaceBackup,
+          anchorParts: input.anchorParts,
+        }, 120_000);
+      } catch (e) {
+        return blocked(e instanceof Error ? e.message : String(e));
+      }
+    }
+  );
+
+  server.registerTool(
+    "audit_environment",
+    {
+      title: "Audit Environment",
+      description:
+        "Read-only spatial/material audit of one environment root. Reports exact paths for likely Z-fighting, " +
+        "floating/unsupported parts, deep intersections, duplicate geometry, unanchored parts, detectable non-uniform " +
+        "mesh scaling, configured bounds escapes, triangle-limit breaches when Studio exposes TriangleCount, and texture dependencies. " +
+        "Geometry findings are conservative heuristics and never mutate the place.",
+      inputSchema: {
+        path: z.string().min(1),
+        sceneBounds: objectArg().optional().describe("Optional {min:[x,y,z],max:[x,y,z]} bounds."),
+        maxParts: z.number().int().min(1).max(10000).default(2000),
+        maxPairs: z.number().int().min(1).max(1000000).default(250000),
+        maxFindings: z.number().int().min(1).max(5000).default(500),
+        triangleLimit: z.number().int().min(1).default(20000),
+        deepTriangleScan: z.boolean().default(false).describe(
+          "Opt in to yielding EditableMesh:GetFaces() counts. Requires mesh/image API permission and asset access."
+        ),
+        maxTriangleMeshes: z.number().int().min(0).max(1000).default(100),
+        floatingDistance: z.number().positive().default(5),
+        floatingTolerance: z.number().nonnegative().default(0.08),
+        nearCoplanarTolerance: z.number().positive().default(0.02),
+        deepIntersectionRatio: z.number().min(0).max(1).default(0.5),
+        nonUniformScaleRatio: z.number().min(1).default(1.05),
+      },
+    },
+    async (input) => callWithTimeout("audit_environment", "edit", input, 120_000)
+  );
+
+  server.registerTool(
+    "inspect_texture_health",
+    {
+      title: "Inspect Texture Health",
+      description:
+        "Read-only dependency audit for imported meshes: MeshId/TextureID, SurfaceAppearance maps, MaterialVariant usage, " +
+        "invalid-looking references, per-mesh material state, and likely fallback plastic. This cannot repair Blender UVs; " +
+        "UV unwrap/channel defects must be fixed in Blender and re-exported.",
+      inputSchema: {
+        path: z.string().min(1),
+        maxMeshes: z.number().int().min(1).max(10000).default(2000),
+      },
+    },
+    async (input) => callWithTimeout("inspect_texture_health", "edit", input, 60_000)
+  );
+
+  server.registerTool(
+    "world_health_report",
+    {
+      title: "World Health Report",
+      description:
+        "Unified read-only world QA report composed from the existing environment and texture scanners. " +
+        "Normalizes exact paths, issue type, severity, details, and recommendations for missing/failed asset state, " +
+        "unanchored parts, floating/support gaps, duplicate/coplanar/deep overlaps, invisible collision, bounds/scale, " +
+        "mesh/material dependencies, and conservative environment hazards. No remediation is performed.",
+      inputSchema: {
+        path: z.string().min(1),
+        sceneBounds: objectArg().optional(),
+        maxParts: z.number().int().min(1).max(10000).default(2000),
+        maxMeshes: z.number().int().min(1).max(10000).default(2000),
+        maxPairs: z.number().int().min(1).max(1000000).default(250000),
+        maxFindings: z.number().int().min(1).max(5000).default(500),
+        triangleLimit: z.number().int().min(1).default(20000),
+        deepTriangleScan: z.boolean().default(false),
+        maxTriangleMeshes: z.number().int().min(0).max(1000).default(100),
+        floatingDistance: z.number().positive().default(5),
+        floatingTolerance: z.number().nonnegative().default(0.08),
+        nearCoplanarTolerance: z.number().positive().default(0.02),
+        deepIntersectionRatio: z.number().min(0).max(1).default(0.5),
+        nonUniformScaleRatio: z.number().min(1).default(1.05),
+      },
+    },
+    async (input) => {
+      const reason = gateToolCall("world_health_report");
+      if (reason) return blocked(reason);
+      const [environment, textures] = await Promise.all([
+        enqueueAndAwait("audit_environment", "edit", input, 120_000),
+        enqueueAndAwait(
+          "inspect_texture_health",
+          "edit",
+          { path: input.path, maxMeshes: input.maxMeshes },
+          60_000,
+        ),
+      ]);
+      if (!environment.ok) {
+        return blocked(environment.error ?? (environment as { err?: string }).err ?? "environment audit failed");
+      }
+      if (!textures.ok) {
+        return blocked(textures.error ?? (textures as { err?: string }).err ?? "texture health scan failed");
+      }
+      const environmentResult = (environment.result ?? {}) as Record<string, unknown>;
+      const textureResult = (textures.result ?? {}) as Record<string, unknown>;
+      const rows: Record<string, unknown>[] = [];
+      const seen = new Set<string>();
+      const appendGroups = (groups: unknown, source: string) => {
+        if (!groups || typeof groups !== "object") return;
+        for (const severity of ["critical", "warning", "info"] as const) {
+          const findings = (groups as Record<string, unknown>)[severity];
+          if (!Array.isArray(findings)) continue;
+          for (const finding of findings) {
+            if (!finding || typeof finding !== "object") continue;
+            const raw = finding as Record<string, unknown>;
+            const path = typeof raw.path === "string" ? raw.path : null;
+            const paths = Array.isArray(raw.paths) ? raw.paths : path ? [path] : [];
+            const issueType =
+              typeof raw.kind === "string"
+                ? raw.kind
+                : typeof raw.issueType === "string"
+                  ? raw.issueType
+                  : "unknown";
+            const key = JSON.stringify([severity, issueType, paths, raw.property ?? null]);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            rows.push({
+              path,
+              paths,
+              issueType,
+              severity,
+              detail: raw.detail ?? null,
+              recommendation: raw.suggestedFix ?? raw.recommendation ?? null,
+              source,
+              evidence: raw,
+            });
+          }
+        }
+      };
+      appendGroups(environmentResult.findings, "audit_environment");
+      appendGroups(textureResult.issues, "inspect_texture_health");
+      const severityCount = { critical: 0, warning: 0, info: 0 };
+      for (const row of rows) {
+        const severity = row.severity as keyof typeof severityCount;
+        severityCount[severity] += 1;
+      }
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            ok: true,
+            readOnly: true,
+            root: input.path,
+            summary: {
+              ...severityCount,
+              total: rows.length,
+              environment: environmentResult.summary ?? null,
+              textureMeshCount: textureResult.meshCount ?? null,
+            },
+            findings: rows,
+            assetFetchStatuses:
+              ((textureResult.usageCounts ?? {}) as Record<string, unknown>).fetchStatuses ?? {},
+            heuristics: environmentResult.heuristics ?? null,
+            limitations: {
+              assetFetch:
+                textureResult.fetchStatusLimitation ??
+                "Engine fetch status is current-state evidence, not a guarantee for every client or permission context.",
+              uv: textureResult.uvLimitation ?? null,
+              geometry:
+                "Overlap and support findings are conservative heuristics; inspect exact reported paths before changing gameplay geometry.",
+            },
+            remediation: {
+              performed: false,
+              availableInThisTool: false,
+              reason:
+                "World health is read-only by design. NikMCP does not auto-anchor or rewrite gameplay geometry from heuristic findings.",
+            },
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  server.registerTool(
+    "backup_selection",
+    {
+      title: "Backup Selection",
+      description:
+        "Clone explicit paths or the current Studio selection into ServerStorage.NikMCPBackups.<name>. " +
+        "Preserves descendants, attributes, transforms, material children, and originally non-Archivable descendants. " +
+        "Never overwrites a named backup unless replace=true.",
+      inputSchema: {
+        name: z.string().min(1),
+        paths: z.array(z.string()).optional(),
+        replace: z.boolean().default(false),
+      },
+    },
+    async (input) => callWithTimeout("backup_selection", "edit", input, 120_000)
+  );
+
+  server.registerTool(
+    "restore_backup",
+    {
+      title: "Restore Backup",
+      description:
+        "Restore only one named ServerStorage.NikMCPBackups entry to its recorded parent paths. " +
+        "Requires confirm=true, retains the backup, and refuses existing-name collisions unless replaceExisting=true.",
+      inputSchema: {
+        name: z.string().min(1),
+        confirm: z.boolean().default(false),
+        replaceExisting: z.boolean().default(false),
+      },
+    },
+    async (input) => callWithTimeout("restore_backup", "edit", input, 120_000)
+  );
+
   // ----- Task 17 Batch A: playtest lifecycle awareness ----------------------
   // Ungated (like get_status). Studio-side fields come from the edit Executor;
   // agentConnected is the bridge's `server` liveness. The agent polls this to
@@ -1916,47 +2952,57 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     {
       title: "Get Playtest Status",
       description:
-        "Report whether a playtest is live: { running, mode, startedAtUnix, durationSec, " +
-        "players, agentConnected }. Poll this to decide when to stop a playtest you started " +
-        "with playtest_control — stop it once you have what you need.",
+        "Canonical playtest/runtime status: edit plugin connected, F5 server agent connected, " +
+        "client agent connected, player count, active place, bridge port, and recent runtime diag. " +
+        "Poll this to decide whether runtime tools can attach and when to stop a playtest.",
       inputSchema: {},
     },
     async () => {
-      let studio: Record<string, unknown> = {};
-      try {
-        const r = await enqueueAndAwait("get_playtest_status", "edit", {}, 5000);
-        if (r.ok && r.result && typeof r.result === "object") {
-          studio = r.result as Record<string, unknown>;
-        }
-      } catch {
-        // no edit context polling (Studio closed / not connected) -> degraded status
-      }
-      // Authoritative liveness: the runtime agent's `server` heartbeat. A real
-      // playtest (StudioTestService run) lives in a separate DataModel, so the
-      // edit Executor's RunService:IsRunning() stays false -- server liveness is
-      // the truth. Also accept a same-DataModel sim (studio.running) as a fallback.
-      const serverLive = isAlive("server");
-      const running = serverLive || studio.running === true;
-      const startedAtUnix =
-        running && typeof studio.startedAtUnix === "number"
-          ? (studio.startedAtUnix as number)
-          : null;
-      const durationSec = startedAtUnix
-        ? Math.max(0, Math.floor(Date.now() / 1000) - startedAtUnix)
-        : 0;
-      const mode = running
-        ? ((studio.mode as string | undefined) ?? (serverLive ? "run" : null))
-        : null;
-      const merged = {
-        running,
-        mode,
-        startedAtUnix,
-        durationSec,
-        players: typeof studio.players === "number" ? studio.players : 0,
-        agentConnected: serverLive,
-      };
+      const merged = await canonicalPlaytestStatus();
       return {
         content: [{ type: "text" as const, text: JSON.stringify(merged, null, 2) }],
+      };
+    }
+  );
+
+  server.registerTool(
+    "get_settled_runtime_status",
+    {
+      title: "Get Settled Runtime Status",
+      description:
+        "Read engine-truth runtime state for the selected Studio target: RunService:IsRunning from the active DataModel, " +
+        "edit/runtime DataModel identity, server/client attachment, place/universe/port, and whether stop settlement is complete.",
+      inputSchema: {},
+    },
+    async () => {
+      const status = await canonicalPlaytestStatus();
+      const raw = (status.raw ?? {}) as Record<string, unknown>;
+      const rawEdit = (raw.edit ?? {}) as Record<string, unknown>;
+      const rawRuntime = (raw.runtime ?? {}) as Record<string, unknown>;
+      const serverAgent = (status.serverAgent ?? {}) as Record<string, unknown>;
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            target: status.target,
+            bridge: status.bridge,
+            placeId: status.activePlaceId,
+            universeId:
+              (typeof rawRuntime.universeId === "number" && rawRuntime.universeId) ||
+              (typeof rawEdit.universeId === "number" && rawEdit.universeId) ||
+              null,
+            runServiceIsRunning:
+              serverAgent.connected === true
+                ? rawRuntime.runServiceIsRunning === true
+                : rawEdit.runServiceIsRunning === true,
+            dataModelState:
+              serverAgent.connected === true
+                ? (rawRuntime.dataModelState ?? "runtime")
+                : (rawEdit.dataModelState ?? "edit"),
+            status,
+            states: stopSettlementStates(status),
+          }, null, 2),
+        }],
       };
     }
   );
@@ -1971,11 +3017,13 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         "server -> client over a RemoteEvent (arbitrary client code is impossible: " +
         "loadstring is server-only, so there is no client run_luau). name: 'fps' (avg " +
         "1/RenderStepped over ~30 frames), 'camera' (CFrame + FieldOfView), 'gui_tree' " +
-        "({maxDepth?}, PlayerGui summary), 'local_player' (character present?, HRP " +
+        "({maxDepth?}, PlayerGui summary), 'gui_object' ({path,maxDepth?}, one PlayerGui " +
+        "object with screen-space layout/state), 'ui_regression' (live PlayerGui clipping, offscreen, " +
+        "overlap, touch-target, safe-area, Offset, and constraint evidence), 'local_player' (character present?, HRP " +
         "position, Humanoid state/health), 'ping' (GetNetworkPing). Requires a running " +
         "F5 play-mode playtest with the agent connected; unknown name lists the valid set.",
       inputSchema: {
-        name: z.enum(["fps", "camera", "gui_tree", "local_player", "ping"]),
+        name: z.enum(["fps", "camera", "gui_tree", "gui_object", "ui_regression", "local_player", "ping"]),
         args: objectArg().optional(),
       },
     },
@@ -2068,6 +3116,12 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     // Steps 2-5, wrapped so any early return / timeout / thrown error still stops
     // the playtest we started (task-17 auto-stop is the backstop, not the mechanism).
     async function body(): Promise<void> {
+      const armErr = await armRuntimeAgent();
+      if (armErr) {
+        failures.push(`enable_playtest_agent: ${armErr}`);
+        return;
+      }
+
       // Step 2: start, then wait for the agent to connect (cap 20s).
       const startRes = await enqueueAndAwait(
         "playtest_control",
@@ -2081,12 +3135,9 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       }
       weStarted = true;
 
-      const connectDeadline = Date.now() + 20000;
-      while (!isAlive("server") && Date.now() < connectDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-      if (!isAlive("server")) {
-        failures.push("agent never connected (check Allow HTTP Requests)");
+      const attach = await waitForRuntimeAgent(20000);
+      if (!attach.ok) {
+        failures.push(attachFailure(attach.status));
         return;
       }
       if (timedOut()) {
@@ -2558,6 +3609,13 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
   interface SyncStatusRow extends StatusEntry {
     diskHash: string | null;
     studioHash: string | null;
+    manifestHash: string;
+    // v0.2.0: both sides are the same code modulo whitespace (state forced clean)
+    whitespaceEqual: boolean;
+    // v0.2.0: state is clean but the manifest baseline is not the live hash
+    // (convergent edit / stale manifest) -- reconcile_manifest fixes it
+    manifestStale: boolean;
+    protected: boolean;
   }
 
   async function computeSyncStatus(dir: string): Promise<
@@ -2591,14 +3649,45 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       if (disk !== null) diskSources.set(relPath, disk);
       const diskHash = disk === null ? null : fnv1a32(disk);
       const studioHash = studioHashes.get(me.dataModelPath) ?? null;
+      const state = classify(me.hash, diskHash, studioHash);
       rows.push({
         relPath,
         dataModelPath: me.dataModelPath,
         className: me.className,
-        state: classify(me.hash, diskHash, studioHash),
+        state,
         diskHash,
         studioHash,
+        manifestHash: me.hash,
+        whitespaceEqual: false,
+        manifestStale: state === "clean" && studioHash !== null && studioHash !== me.hash,
+        protected: isProtectedSyncPath(me.dataModelPath),
       });
+    }
+    // v0.2.0: a CONFLICT whose two sides differ only by whitespace is the same
+    // code -- report it clean (manifest stale) instead of refusing the import.
+    const conflictRows = rows.filter((r) => r.state === "conflict" && diskSources.has(r.relPath));
+    if (conflictRows.length) {
+      try {
+        const r = await enqueueAndAwait(
+          "sync_get_sources",
+          "edit",
+          { paths: conflictRows.map((row) => row.dataModelPath) },
+          cfg.commandTimeoutMs
+        );
+        const arr = r.ok && Array.isArray(r.result) ? (r.result as { path: string; source?: string }[]) : [];
+        const byPath = new Map(arr.map((it) => [it.path, it.source]));
+        for (const row of conflictRows) {
+          const studioSrc = byPath.get(row.dataModelPath);
+          const diskSrc = diskSources.get(row.relPath);
+          if (typeof studioSrc === "string" && diskSrc !== undefined && sameIgnoringWhitespace(studioSrc, diskSrc)) {
+            row.state = "clean";
+            row.whitespaceEqual = true;
+            row.manifestStale = true;
+          }
+        }
+      } catch {
+        // classification degrades to the hash-only verdict
+      }
     }
     return { manifest, rows, newOnDisk: findUnknownFiles(dir, manifest), diskSources };
   }
@@ -2623,24 +3712,42 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       inputSchema: {
         root: z.string().optional(),
         dir: z.string().optional(),
+        paths: z
+          .array(z.string().min(1))
+          .max(200)
+          .optional()
+          .describe("Export ONLY these DataModel paths (or manifest relPaths). Other manifest entries are preserved untouched -- single-file pull from Studio."),
       },
     },
-    async ({ root, dir }) => {
+    async ({ root, dir, paths }) => {
       const reason = gateToolCall("export_scripts");
       if (reason) return blocked(reason);
       const guard = syncPlaytestGuard();
       if (guard) return guard;
       const outDir = dir || cfg.syncDir;
       if (!outDir) return blocked("dir required (or set syncDir in config.json)");
-      const roots = root ? [root] : SYNC_DEFAULT_ROOTS;
+      const existingManifest = readManifest(outDir);
+      const roots = root ? [root] : existingManifest?.roots?.length && paths ? existingManifest.roots : SYNC_DEFAULT_ROOTS;
       let entries: SyncListEntry[];
       try {
         entries = await syncListEntries(roots);
       } catch (e) {
         return blocked(e instanceof Error ? e.message : String(e));
       }
+      const protectedSkipped = entries.filter((e) => isProtectedSyncPath(e.path)).map((e) => e.path);
+      entries = entries.filter((e) => !isProtectedSyncPath(e.path));
       const plan = planExport(entries);
-      const files: Record<string, ManifestEntry> = {};
+      let ignoredOutsidePaths = 0;
+      if (paths) {
+        const want = new Set(paths);
+        const before = plan.files.length;
+        plan.files = plan.files.filter((f) => want.has(f.entry.path) || want.has(f.relPath));
+        ignoredOutsidePaths = before - plan.files.length;
+        if (plan.files.length === 0) {
+          return blocked(`none of the requested paths resolved to an exportable script under roots ${JSON.stringify(roots)}`);
+        }
+      }
+      const files: Record<string, ManifestEntry> = paths && existingManifest ? { ...existingManifest.files } : {};
       let bytes = 0;
       const errors: string[] = [];
       for (let i = 0; i < plan.files.length; i += 30) {
@@ -2689,10 +3796,13 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       });
       const out: Record<string, unknown> = {
         files: Object.keys(files).length,
+        written: plan.files.length,
         bytes,
         duplicates: plan.duplicates,
         dir: outDir,
       };
+      if (paths) out.ignoredOutsidePaths = ignoredOutsidePaths;
+      if (protectedSkipped.length) out.protectedSkipped = protectedSkipped;
       if (errors.length) out.errors = errors;
       return jsonResult(out);
     }
@@ -2726,6 +3836,9 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
           dataModelPath: row.dataModelPath,
         });
       }
+      const staleManifest = s.rows
+        .filter((row) => row.manifestStale)
+        .map((row) => ({ relPath: row.relPath, dataModelPath: row.dataModelPath, whitespaceEqual: row.whitespaceEqual }));
       return jsonResult({
         dir: target,
         total: s.rows.length,
@@ -2737,6 +3850,11 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         missingInStudio: byState.missingInStudio ?? [],
         missingOnDisk: byState.missingOnDisk ?? [],
         newOnDisk: s.newOnDisk,
+        staleManifest,
+        protectedEntries: s.rows.filter((row) => row.protected).map((row) => row.dataModelPath),
+        hint: staleManifest.length
+          ? "staleManifest entries are clean in content but the manifest baseline is behind; run reconcile_manifest (accept:'equal') to rebase without touching any file"
+          : undefined,
       });
     }
   );
@@ -2746,7 +3864,7 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     {
       title: "Import Scripts From Disk",
       description:
-        "Apply diskAhead files from an export_scripts dir back to Studio in ONE undo step. " +
+        "Apply diskAhead files from an export_scripts dir back to Studio as one guarded transaction. " +
         "Drift-safe: ANY conflict (disk AND Studio both changed since export) aborts the " +
         "ENTIRE import with a whitespace-normalized unified diff per conflict -- never " +
         "auto-resolves. studioAhead / missing entries are reported and skipped, not " +
@@ -2758,18 +3876,52 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         dir: z.string().optional(),
         dryRun: z.boolean().default(false),
         skipAnalysis: z.boolean().default(false),
+        paths: z
+          .array(z.string().min(1))
+          .max(200)
+          .optional()
+          .describe("Allowlist of DataModel paths or manifest relPaths. Only these are considered; conflicts OUTSIDE the list no longer abort the import."),
+        force: z
+          .boolean()
+          .default(false)
+          .describe("With paths: also overwrite studioAhead/conflict entries in the list with the disk version (still hash-checked at write time). Never touches bridge-managed NikMCP scripts."),
       },
     },
-    async ({ dir, dryRun, skipAnalysis }) => {
+    async ({ dir, dryRun, skipAnalysis, paths, force }) => {
       const reason = gateToolCall("import_scripts");
       if (reason) return blocked(reason);
       const guard = syncPlaytestGuard();
       if (guard) return guard;
       const target = dir || cfg.syncDir;
       if (!target) return blocked("dir required (or set syncDir in config.json)");
+      if (force && !paths) return blocked("force:true requires an explicit paths allowlist");
       const s = await computeSyncStatus(target);
       if ("error" in s) return blocked(s.error);
-      const decision = decideImport(s.rows);
+      const protectedSkipped = s.rows.filter((row) => row.protected).map((row) => row.dataModelPath);
+      let selected = s.rows.filter((row) => !row.protected);
+      let ignoredOutsidePaths: string[] = [];
+      if (paths) {
+        const want = new Set(paths);
+        const unknown = paths.filter((p) => !s.rows.some((row) => row.relPath === p || row.dataModelPath === p));
+        if (unknown.length) {
+          return blocked(`paths not present in the manifest: ${JSON.stringify(unknown)} (export_scripts them first)`);
+        }
+        ignoredOutsidePaths = selected
+          .filter((row) => !(want.has(row.relPath) || want.has(row.dataModelPath)))
+          .map((row) => row.relPath);
+        selected = selected.filter((row) => want.has(row.relPath) || want.has(row.dataModelPath));
+      }
+      const decision = decideImport(selected);
+      const forced: typeof decision.apply = [];
+      if (force) {
+        for (const row of [...decision.conflicts, ...decision.skippedStudioAhead]) {
+          if (s.diskSources.has(row.relPath)) forced.push(row);
+        }
+        decision.apply = [...decision.apply, ...forced];
+        decision.conflicts = [];
+        decision.skippedStudioAhead = [];
+        decision.action = "proceed";
+      }
 
       if (decision.action === "abort") {
         // Fetch the Studio side of each conflict for the diff (disk side is local).
@@ -2838,9 +3990,12 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
           relPath: r.relPath,
           dataModelPath: r.dataModelPath,
         })),
+        forced: forced.map((r) => ({ relPath: r.relPath, dataModelPath: r.dataModelPath, state: r.state })),
         skippedStudioAhead: decision.skippedStudioAhead.map((r) => r.relPath),
         missing: decision.missing.map((r) => ({ relPath: r.relPath, state: r.state })),
         newOnDisk: s.newOnDisk,
+        protectedSkipped,
+        ignoredOutsidePaths: paths ? ignoredOutsidePaths.length : undefined,
         analyzed,
       };
       if (dryRun) return jsonResult({ dryRun: true, ...plan });
@@ -2848,10 +4003,15 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         return jsonResult({ applied: [], note: "nothing is diskAhead", ...plan });
       }
 
+      const studioHashByRelPath = new Map(
+        s.rows.map((row) => [row.relPath, row.studioHash] as const),
+      );
       const items = decision.apply.map((row) => ({
         path: row.dataModelPath,
         source: s.diskSources.get(row.relPath) ?? "",
+        expectedHash: studioHashByRelPath.get(row.relPath) ?? "",
       }));
+      const backups = await backupScriptsBeforeWrite(items.map((it) => it.path), "import_scripts");
       const r = await enqueueAndAwait(
         "sync_set_sources",
         "edit",
@@ -2878,10 +4038,13 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       return jsonResult({
         applied: results.filter((x) => x.ok).map((x) => x.path),
         failed: results.filter((x) => !x.ok),
+        forced: plan.forced,
         skippedStudioAhead: plan.skippedStudioAhead,
         missing: plan.missing,
         newOnDisk: plan.newOnDisk,
+        protectedSkipped,
         analyzed,
+        backups,
       });
     }
   );
@@ -3194,8 +4357,8 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         "rbxassetid://<newId>, and swap old->new IDs in script sources via " +
         "find_and_replace_in_scripts. Only 'ok' map entries with a newId are applied (a " +
         "'pending' entry -- e.g. an ungranted audio -- is intentionally NOT wired). NOTE: each " +
-        "property change and each script replacement is its OWN undo step (a single batched " +
-        "undo would need a dedicated plugin command); undo may take several Ctrl+Z. dryRun " +
+        "property change has its own undo step. Roblox does not capture script source replacements " +
+        "in Studio undo history. dryRun " +
         "shows the planned changes with no writes. Edit mode only. Pair with rocreate_scan_assets " +
         "(which records the path/prop each id came from -- pass a scan to target exact properties).",
       inputSchema: {
@@ -5437,6 +6600,1082 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     return analyzeLuau(code);
   }
 
+  // ----- Agent reliability + 2026 Studio automation ------------------------
+  // These tools collapse high-frequency multi-call agent workflows into
+  // bounded, evidence-rich operations. Static analysis stays Node-side; engine
+  // capabilities remain behind fixed Studio command schemas.
+  const scriptPatchPlans = new ScriptPatchPlanStore();
+
+  function currentTargetId(): string | null {
+    return getSelectedStudioTarget()?.targetId ?? getLocalTargetIdentity()?.targetId ?? null;
+  }
+
+  interface AgentSnapshot {
+    scripts: AgentScript[];
+    listed: number;
+    truncated: boolean;
+    errors: { path: string; error: string }[];
+  }
+
+  async function readAgentSnapshot(
+    root: string,
+    maxScripts: number,
+    priorityPaths: string[] = [],
+  ): Promise<AgentSnapshot> {
+    const entries = await syncListEntries([root]);
+    const firstByPath = new Map<string, SyncListEntry>();
+    for (const entry of entries) {
+      if (!firstByPath.has(entry.path)) firstByPath.set(entry.path, entry);
+    }
+    const priority = new Set(priorityPaths);
+    const ordered = [...firstByPath.values()].sort((a, b) => {
+      const ap = priority.has(a.path) ? 0 : 1;
+      const bp = priority.has(b.path) ? 0 : 1;
+      return ap - bp || a.path.localeCompare(b.path);
+    });
+    const selected = ordered.slice(0, maxScripts);
+    const scripts: AgentScript[] = [];
+    const errors: { path: string; error: string }[] = [];
+    for (let index = 0; index < selected.length; index += 30) {
+      const batch = selected.slice(index, index + 30);
+      const result = await enqueueAndAwait(
+        "sync_get_sources",
+        "edit",
+        { paths: batch.map((entry) => entry.path) },
+        QOL_STEP_TIMEOUT_MS,
+      );
+      if (!result.ok) {
+        throw new Error(
+          result.error ?? (result as { err?: string }).err ?? "sync_get_sources failed",
+        );
+      }
+      const returned = Array.isArray(result.result)
+        ? (result.result as { path?: unknown; source?: unknown; err?: unknown }[])
+        : [];
+      const byPath = new Map(returned.map((item) => [String(item.path ?? ""), item]));
+      for (const entry of batch) {
+        const item = byPath.get(entry.path);
+        if (!item || typeof item.source !== "string") {
+          errors.push({
+            path: entry.path,
+            error: String(item?.err ?? "source was not returned"),
+          });
+          continue;
+        }
+        scripts.push({
+          path: entry.path,
+          className: entry.className,
+          name: entry.path.split(".").at(-1),
+          source: normalizeSource(item.source),
+        });
+      }
+    }
+    return {
+      scripts,
+      listed: ordered.length,
+      truncated: ordered.length > selected.length,
+      errors,
+    };
+  }
+
+  function requireGraphForAnalysis(raw: unknown) {
+    const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    const edges = Array.isArray(record.edges)
+      ? record.edges.flatMap((edge) => {
+          if (!edge || typeof edge !== "object") return [];
+          const item = edge as Record<string, unknown>;
+          return item.kind === "resolved" &&
+            typeof item.from === "string" &&
+            typeof item.to === "string"
+            ? [{ from: item.from, to: item.to }]
+            : [];
+        })
+      : [];
+    return {
+      items: edges,
+      truncated: record.truncated === true,
+    };
+  }
+
+  function remoteInventoryForAnalysis(raw: unknown) {
+    const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    const remotes = Array.isArray(record.remotes) ? record.remotes : [];
+    let nestedTruncated = false;
+    const items = remotes.flatMap((remote) => {
+      if (!remote || typeof remote !== "object") return [];
+      const item = remote as Record<string, unknown>;
+      if (typeof item.name !== "string") return [];
+      if (item.usagesTruncated === true) nestedTruncated = true;
+      const paths = new Set<string>();
+      if (Array.isArray(item.usages)) {
+        for (const usage of item.usages) {
+          if (!usage || typeof usage !== "object") continue;
+          const script = (usage as Record<string, unknown>).script;
+          if (typeof script === "string") paths.add(script);
+        }
+      }
+      return [{
+        name: item.name,
+        kind: typeof item.className === "string" ? item.className : undefined,
+        paths: [...paths],
+      }];
+    });
+    return {
+      items,
+      truncated: record.truncated === true || nestedTruncated,
+    };
+  }
+
+  function datastoreInventoryForAnalysis(raw: unknown) {
+    const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    const stores = Array.isArray(record.stores) ? record.stores : [];
+    let nestedTruncated = record.unattributedOperationsTruncated === true;
+    const items = stores.flatMap((store) => {
+      if (!store || typeof store !== "object") return [];
+      const item = store as Record<string, unknown>;
+      if (item.declaredInTruncated === true || item.operationsTruncated === true) {
+        nestedTruncated = true;
+      }
+      const name =
+        typeof item.name === "string"
+          ? item.name
+          : typeof item.storeName === "string"
+            ? item.storeName
+            : null;
+      if (!name) return [];
+      const paths = new Set<string>();
+      const collectScripts = (value: unknown) => {
+        if (!Array.isArray(value)) return;
+        for (const entry of value) {
+          if (typeof entry === "string") {
+            paths.add(entry);
+          } else if (entry && typeof entry === "object") {
+            const script = (entry as Record<string, unknown>).script;
+            if (typeof script === "string") paths.add(script);
+          }
+        }
+      };
+      collectScripts(item.declaredIn);
+      collectScripts(item.operations);
+      return [{
+        name,
+        kind: typeof item.className === "string" ? item.className : undefined,
+        paths: [...paths],
+      }];
+    });
+    return {
+      items,
+      truncated: record.truncated === true || nestedTruncated,
+    };
+  }
+
+  async function readAgentRelationships(root: string) {
+    const [graph, remotes, datastores] = await Promise.all([
+      enqueueAndAwait("require_graph", "edit", { root, includeUnresolved: false }, QOL_STEP_TIMEOUT_MS),
+      enqueueAndAwait("remote_inventory", "edit", { root }, QOL_STEP_TIMEOUT_MS),
+      enqueueAndAwait("datastore_inventory", "edit", { root }, QOL_STEP_TIMEOUT_MS),
+    ]);
+    const graphError = graph.ok
+      ? undefined
+      : graph.error ?? (graph as { err?: string }).err ?? "require_graph failed";
+    const remoteError = remotes.ok
+      ? undefined
+      : remotes.error ?? (remotes as { err?: string }).err ?? "remote_inventory failed";
+    const datastoreError = datastores.ok
+      ? undefined
+      : datastores.error ?? (datastores as { err?: string }).err ?? "datastore_inventory failed";
+    const graphParsed = graph.ok
+      ? requireGraphForAnalysis(graph.result)
+      : { items: [], truncated: false };
+    const remotesParsed = remotes.ok
+      ? remoteInventoryForAnalysis(remotes.result)
+      : { items: [], truncated: false };
+    const datastoresParsed = datastores.ok
+      ? datastoreInventoryForAnalysis(datastores.result)
+      : { items: [], truncated: false };
+    return {
+      graph: graphParsed.items,
+      remotes: remotesParsed.items,
+      datastores: datastoresParsed.items,
+      completeness: {
+        requireGraph: graphError
+          ? { state: "unknown" as const, reason: graphError }
+          : {
+              state: graphParsed.truncated ? "truncated" as const : "complete" as const,
+              returned: graphParsed.items.length,
+              reason: graphParsed.truncated ? "require graph edge cap reached" : undefined,
+            },
+        remoteInventory: remoteError
+          ? { state: "unknown" as const, reason: remoteError }
+          : {
+              state: remotesParsed.truncated ? "truncated" as const : "complete" as const,
+              returned: remotesParsed.items.length,
+              reason: remotesParsed.truncated
+                ? "remote or per-remote usage cap reached"
+                : undefined,
+            },
+        datastoreInventory: datastoreError
+          ? { state: "unknown" as const, reason: datastoreError }
+          : {
+              state: datastoresParsed.truncated ? "truncated" as const : "complete" as const,
+              returned: datastoresParsed.items.length,
+              reason: datastoresParsed.truncated
+                ? "datastore, declaration, operation, or unattributed-operation cap reached"
+                : undefined,
+            },
+      } satisfies AnalysisInputCompleteness,
+      errors: {
+        graph: graphError,
+        remotes: remoteError,
+        datastores: datastoreError,
+      },
+    };
+  }
+
+  function snapshotCompleteness(
+    snapshot: AgentSnapshot,
+  ): NonNullable<AnalysisInputCompleteness["scripts"]> {
+    const reasons = [
+      snapshot.truncated ? "script count exceeded the requested maxScripts cap" : undefined,
+      snapshot.errors.length > 0
+        ? `${snapshot.errors.length} script sources could not be loaded`
+        : undefined,
+    ].filter((value): value is string => !!value);
+    return {
+      state: reasons.length > 0 ? "truncated" : "complete",
+      returned: snapshot.scripts.length,
+      totalAvailable: snapshot.listed,
+      reason: reasons.length > 0 ? reasons.join("; ") : undefined,
+    };
+  }
+
+  const READ_ONLY_ANNOTATIONS = {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  };
+
+  server.registerTool(
+    "task_context_bundle",
+    {
+      title: "Task Context Bundle",
+      description:
+        "Rank the live scripts most relevant to a task and return bounded excerpts, source " +
+        "hashes, direct require dependencies/dependents, remote peers, DataStore peers, and " +
+        "explicit ranking reasons. Replaces repeated grep/source/graph/inventory calls while " +
+        "preserving heuristic confidence and truncation evidence. Edit mode only.",
+      inputSchema: {
+        query: z.string().min(1).max(500),
+        seedPaths: z.array(z.string()).max(25).default([]),
+        root: z.string().default("game"),
+        maxScripts: z.number().int().min(1).max(500).default(300),
+        maxResults: z.number().int().min(1).max(50).default(15),
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async ({ query, seedPaths, root, maxScripts, maxResults }) => {
+      const reason = gateToolCall("task_context_bundle");
+      if (reason) return blocked(reason);
+      if (syncPlaytestGuard()) return syncPlaytestGuard()!;
+      try {
+        const [snapshot, relationships] = await Promise.all([
+          readAgentSnapshot(root, maxScripts, seedPaths),
+          readAgentRelationships(root),
+        ]);
+        const result = buildTaskContext(
+          query,
+          seedPaths,
+          snapshot.scripts,
+          relationships.graph,
+          relationships.remotes,
+          relationships.datastores,
+          {
+            maxScripts,
+            maxResults,
+            inputCompleteness: {
+              scripts: snapshotCompleteness(snapshot),
+              ...relationships.completeness,
+            },
+          },
+        );
+        const hashes = new Map(
+          snapshot.scripts.map((script) => [script.path, fnv1a32(normalizeSource(script.source))]),
+        );
+        return jsonResult({
+          ...result,
+          scripts: result.scripts.map((script) => ({
+            ...script,
+            sourceHash: hashes.get(script.path),
+          })),
+          snapshot: {
+            listed: snapshot.listed,
+            loaded: snapshot.scripts.length,
+            truncated: snapshot.truncated,
+            errors: snapshot.errors,
+          },
+          relationshipErrors: relationships.errors,
+        });
+      } catch (error) {
+        return blocked(error instanceof Error ? error.message : String(error));
+      }
+    },
+  );
+
+  server.registerTool(
+    "change_impact_report",
+    {
+      title: "Change Impact Report",
+      description:
+        "Before editing a script, trace direct/transitive require dependencies and dependents, " +
+        "remote/DataStore contract peers, literal references, cycles, and a bounded risk score " +
+        "with concrete regression recommendations. Evidence is from the current edit DataModel; " +
+        "truncated or unavailable scans are surfaced and prevent a misleading low-risk verdict.",
+      inputSchema: {
+        path: z.string().min(1),
+        root: z.string().default("game"),
+        maxScripts: z.number().int().min(1).max(500).default(400),
+        maxDepth: z.number().int().min(1).max(12).default(6),
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async ({ path, root, maxScripts, maxDepth }) => {
+      const reason = gateToolCall("change_impact_report");
+      if (reason) return blocked(reason);
+      if (syncPlaytestGuard()) return syncPlaytestGuard()!;
+      try {
+        const [snapshot, relationships] = await Promise.all([
+          readAgentSnapshot(root, maxScripts, [path]),
+          readAgentRelationships(root),
+        ]);
+        const result = buildChangeImpact(
+          path,
+          snapshot.scripts,
+          relationships.graph,
+          relationships.remotes,
+          relationships.datastores,
+          {
+            maxScripts,
+            maxDepth,
+            inputCompleteness: {
+              scripts: snapshotCompleteness(snapshot),
+              ...relationships.completeness,
+            },
+          },
+        );
+        return jsonResult({
+          ...result,
+          snapshot: {
+            listed: snapshot.listed,
+            loaded: snapshot.scripts.length,
+            truncated: snapshot.truncated,
+            errors: snapshot.errors,
+          },
+          relationshipErrors: relationships.errors,
+        });
+      } catch (error) {
+        return blocked(error instanceof Error ? error.message : String(error));
+      }
+    },
+  );
+
+  server.registerTool(
+    "code_health_report",
+    {
+      title: "Code Health Report",
+      description:
+        "Scan the current live script snapshot for exact or clearly-labeled heuristic risks: " +
+        "deprecated scheduler globals, numeric requires, dynamic environment access, risky " +
+        "SetAsync/InvokeClient calls, TODO markers, oversized scripts, and exact duplicate " +
+        "source groups. Deterministic and capped; it does not mutate code.",
+      inputSchema: {
+        root: z.string().default("game"),
+        maxScripts: z.number().int().min(1).max(500).default(400),
+        maxFindings: z.number().int().min(1).max(1000).default(250),
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async ({ root, maxScripts, maxFindings }) => {
+      const reason = gateToolCall("code_health_report");
+      if (reason) return blocked(reason);
+      if (syncPlaytestGuard()) return syncPlaytestGuard()!;
+      try {
+        const snapshot = await readAgentSnapshot(root, maxScripts);
+        return jsonResult({
+          ...analyzeCodeHealth(snapshot.scripts, { maxScripts, maxFindings }),
+          snapshot: {
+            listed: snapshot.listed,
+            loaded: snapshot.scripts.length,
+            truncated: snapshot.truncated,
+            errors: snapshot.errors,
+          },
+        });
+      } catch (error) {
+        return blocked(error instanceof Error ? error.message : String(error));
+      }
+    },
+  );
+
+  const patchOperationSchema = z.discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("replace"),
+      oldText: z.string().min(1).max(500_000),
+      newText: z.string().max(1_000_000),
+      expectedMatches: z.number().int().min(1).max(1000).default(1),
+    }),
+    z.object({
+      kind: z.literal("replace_lines"),
+      startLine: z.number().int().min(1),
+      endLine: z.number().int().min(1),
+      newText: z.string().max(1_000_000),
+    }),
+    z.object({
+      kind: z.literal("full_source"),
+      source: z.string().max(1_000_000),
+    }),
+  ]);
+
+  server.registerTool(
+    "plan_script_patchset",
+    {
+      title: "Plan Transactional Script Patchset",
+      description:
+        "Preflight an expected-source multi-script edit without mutating Studio. Literal " +
+        "replace counts and line ranges must match exactly; every resulting source is " +
+        "luau-lsp analyzed. Success returns diffs, before/after hashes, diagnostics, and a " +
+        "10-minute one-use token bound to the exact Studio target for apply_script_patchset.",
+      inputSchema: {
+        patches: z
+          .array(z.object({ path: z.string().min(1), operations: z.array(patchOperationSchema).min(1).max(100) }))
+          .min(1)
+          .max(50),
+        failOn: z.enum(["error", "warning"]).default("error"),
+      },
+      annotations: { ...READ_ONLY_ANNOTATIONS, idempotentHint: false },
+    },
+    async ({ patches, failOn }) => {
+      const reason = gateToolCall("plan_script_patchset");
+      if (reason) return blocked(reason);
+      const playtestGuard = syncPlaytestGuard();
+      if (playtestGuard) return playtestGuard;
+      const targetId = currentTargetId();
+      if (!targetId) return blocked("no concrete Studio target is connected");
+      try {
+        const paths = patches.map((patch) => patch.path);
+        const response = await enqueueAndAwait(
+          "sync_get_sources",
+          "edit",
+          { paths },
+          QOL_STEP_TIMEOUT_MS,
+        );
+        if (!response.ok) {
+          return blocked(
+            response.error ?? (response as { err?: string }).err ?? "sync_get_sources failed",
+          );
+        }
+        const sourceMap = new Map<string, string>();
+        const sourceErrors: { path: string; error: string }[] = [];
+        const returned = Array.isArray(response.result)
+          ? (response.result as { path?: unknown; source?: unknown; err?: unknown }[])
+          : [];
+        for (const item of returned) {
+          const path = String(item.path ?? "");
+          if (typeof item.source === "string") sourceMap.set(path, item.source);
+          else sourceErrors.push({ path, error: String(item.err ?? "source was not returned") });
+        }
+        if (sourceErrors.length) {
+          return blocked(`source preflight failed: ${JSON.stringify(sourceErrors)}`);
+        }
+        const items = buildScriptPatchItems(
+          patches as ScriptPatchRequest[],
+          sourceMap,
+        ).filter((item) => item.changed);
+        if (!items.length) return blocked("patchset produces no source changes");
+
+        const diagnostics: {
+          path: string;
+          errors: Diagnostic[];
+          warnings: Diagnostic[];
+        }[] = [];
+        for (const item of items) {
+          const analysis = await analyzeSource(item.source);
+          if (!analysis.available) {
+            return blocked("luau analyzer is unavailable; transactional preflight cannot be proven");
+          }
+          diagnostics.push({
+            path: item.path,
+            errors: analysis.errors,
+            warnings: analysis.warnings,
+          });
+        }
+        const failed = diagnostics.filter(
+          (item) => item.errors.length > 0 || (failOn === "warning" && item.warnings.length > 0),
+        );
+        if (failed.length) {
+          return blocked(
+            `patchset compile gate failed (${failOn}): ${JSON.stringify(failed, null, 2)}`,
+          );
+        }
+
+        const plan = scriptPatchPlans.create(targetId, items);
+        return jsonResult({
+          token: plan.token,
+          targetId: plan.targetId,
+          createdAt: plan.createdAt,
+          expiresAt: plan.expiresAt,
+          failOn,
+          scripts: plan.items.map(({ source: _source, ...item }) => item),
+          diagnostics,
+        });
+      } catch (error) {
+        return blocked(error instanceof Error ? error.message : String(error));
+      }
+    },
+  );
+
+  server.registerTool(
+    "apply_script_patchset",
+    {
+      title: "Apply Transactional Script Patchset",
+      description:
+        "Consume a target-bound one-use token from plan_script_patchset and transactionally update " +
+        "all existing scripts. Every before-hash is rechecked inside UpdateSourceAsync. Any write " +
+        "or verification failure conditionally restores every changed source and verifies rollback. " +
+        "Script source writes are not recorded by Studio undo history. " +
+        "Requires confirm:true; edit mode only.",
+      inputSchema: {
+        token: z.string().uuid(),
+        confirm: z.boolean().default(false),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ token, confirm }) => {
+      const reason = gateToolCall("apply_script_patchset");
+      if (reason) return blocked(reason);
+      if (!confirm) return blocked("apply_script_patchset requires confirm:true");
+      const playtestGuard = syncPlaytestGuard();
+      if (playtestGuard) return playtestGuard;
+      const targetId = currentTargetId();
+      if (!targetId) return blocked("no concrete Studio target is connected");
+      let plan;
+      try {
+        plan = scriptPatchPlans.consume(token, targetId);
+      } catch (error) {
+        return blocked(error instanceof Error ? error.message : String(error));
+      }
+      const backups = await backupScriptsBeforeWrite(plan.items.map((item) => item.path), "apply_script_patchset");
+      const response = await enqueueAndAwait(
+        "apply_script_patchset",
+        "edit",
+        {
+          confirm: true,
+          items: plan.items.map((item) => ({
+            path: item.path,
+            expectedHash: item.beforeHash,
+            source: item.source,
+          })),
+        },
+        Math.max(QOL_STEP_TIMEOUT_MS, 120_000),
+        plan.targetId,
+      );
+      return withBackupNote(renderResult(response), backups);
+    },
+  );
+
+  const waitConditionSchema = z.discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("instance_exists"),
+      path: z.string().min(1),
+      exists: z.boolean().default(true),
+    }),
+    z.object({
+      kind: z.literal("property_equals"),
+      path: z.string().min(1),
+      property: z.string().min(1),
+      equals: objectArg(),
+    }),
+    z.object({
+      kind: z.literal("attribute_equals"),
+      path: z.string().min(1),
+      name: z.string().min(1),
+      equals: objectArg(),
+    }),
+    z.object({
+      kind: z.literal("player_count"),
+      comparison: z.enum(["eq", "gte", "lte"]).default("eq"),
+      value: z.number().int().min(0).max(100),
+    }),
+    z.object({
+      kind: z.literal("runtime_running"),
+      value: z.boolean(),
+    }),
+    z.object({
+      kind: z.literal("console_match"),
+      query: z.string().min(1).max(500),
+      level: z.enum(["error", "warning", "output"]).optional(),
+    }),
+    z.object({
+      kind: z.literal("gui_equals"),
+      path: z.string().min(1),
+      property: z.enum(["name", "className", "visible", "enabled", "active", "text", "image"]),
+      equals: objectArg(),
+    }),
+  ]);
+
+  function sameJsonValue(a: unknown, b: unknown): boolean {
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  function boundedObservationValue(value: unknown): unknown {
+    if (value === undefined) return null;
+    let encoded: string;
+    try {
+      encoded = JSON.stringify(value);
+    } catch {
+      return { truncated: true, preview: String(value).slice(0, 2000) };
+    }
+    if (encoded.length <= 2000) return value;
+    return {
+      truncated: true,
+      encodedChars: encoded.length,
+      preview: encoded.slice(0, 2000),
+    };
+  }
+
+  server.registerTool(
+    "wait_for_state",
+    {
+      title: "Wait For State",
+      description:
+        "Declaratively poll bounded Studio/runtime conditions until all remain true for the " +
+        "requested stable sample count or timeout. Supports instance existence, property/" +
+        "attribute equality, player count, runtime state, console text, and live PlayerGui " +
+        "state. Returns timestamped observations; never runs arbitrary Luau.",
+      inputSchema: {
+        conditions: z.array(waitConditionSchema).min(1).max(10),
+        context: contextArgWithClient,
+        timeoutSec: z.number().min(0.1).max(120).default(15),
+        intervalMs: z.number().int().min(50).max(2000).default(250),
+        stableSamples: z.number().int().min(1).max(10).default(1),
+      },
+      annotations: {
+        ...READ_ONLY_ANNOTATIONS,
+        idempotentHint: false,
+      },
+    },
+    async ({ conditions, context, timeoutSec, intervalMs, stableSamples }) => {
+      const reason = gateToolCall("wait_for_state");
+      if (reason) return blocked(reason);
+      if (
+        context === "client" &&
+        conditions.some((condition) => !["console_match", "gui_equals"].includes(condition.kind))
+      ) {
+        return blocked("context='client' only supports console_match and gui_equals conditions");
+      }
+      const startedAt = Date.now();
+      const deadline = startedAt + timeoutSec * 1000;
+      const remainingTimeout = () =>
+        Math.max(100, Math.min(8000, Math.ceil(deadline - Date.now())));
+      let attempts = 0;
+      let consecutive = 0;
+      const observations: unknown[] = [];
+
+      const observe = async (condition: (typeof conditions)[number]) => {
+        if (condition.kind === "runtime_running" || condition.kind === "player_count") {
+          const status = await canonicalPlaytestStatus();
+          if (condition.kind === "runtime_running") {
+            const actual = status.running === true;
+            return { passed: actual === condition.value, actual, expected: condition.value };
+          }
+          const actual = typeof status.players === "number" ? status.players : 0;
+          const passed =
+            condition.comparison === "gte"
+              ? actual >= condition.value
+              : condition.comparison === "lte"
+                ? actual <= condition.value
+                : actual === condition.value;
+          return {
+            passed,
+            actual,
+            expected: { comparison: condition.comparison, value: condition.value },
+          };
+        }
+
+        if (condition.kind === "gui_equals") {
+          if (!isAlive("server")) {
+            return { passed: false, error: "runtime/client agent is not connected" };
+          }
+          const result = await enqueueAndAwait(
+            "client_query",
+            "server",
+            { name: "gui_object", args: { path: condition.path, maxDepth: 0 } },
+            remainingTimeout(),
+          );
+          if (!result.ok) {
+            return {
+              passed: false,
+              error: result.error ?? (result as { err?: string }).err ?? "client_query failed",
+            };
+          }
+          const object = result.result as Record<string, unknown> | undefined;
+          if (typeof object?.err === "string") {
+            return { passed: false, error: object.err };
+          }
+          const actual = object?.[condition.property];
+          return {
+            passed: sameJsonValue(actual, condition.equals),
+            actual,
+            expected: condition.equals,
+          };
+        }
+
+        const targetContext: Context =
+          context === "client" ? "server" : chooseContext(context as "auto" | "edit" | "server");
+        if (condition.kind === "console_match") {
+          const payload =
+            context === "client"
+              ? { count: 500, levelFilter: condition.level, context: "client" }
+              : { count: 500, levelFilter: condition.level };
+          const result = await enqueueAndAwait(
+            "read_console",
+            targetContext,
+            payload,
+            remainingTimeout(),
+          );
+          if (!result.ok) {
+            return {
+              passed: false,
+              error: result.error ?? (result as { err?: string }).err ?? "read_console failed",
+            };
+          }
+          const lines = Array.isArray((result.result as Record<string, unknown> | undefined)?.lines)
+            ? ((result.result as { lines: { text?: unknown; level?: unknown }[] }).lines)
+            : [];
+          const expectedLevel = condition.level
+            ? {
+                error: "MessageError",
+                warning: "MessageWarning",
+                output: "MessageOutput",
+              }[condition.level]
+            : undefined;
+          const match = lines.find(
+            (line) =>
+              typeof line.text === "string" &&
+              line.text.includes(condition.query) &&
+              (!expectedLevel || line.level === expectedLevel),
+          );
+          return {
+            passed: !!match,
+            actual: match ?? null,
+            expected: { contains: condition.query, level: condition.level },
+          };
+        }
+
+        if (condition.kind === "instance_exists") {
+          const result = await enqueueAndAwait(
+            "get_properties",
+            targetContext,
+            { path: condition.path, propertyNames: [] },
+            remainingTimeout(),
+          );
+          if (!result.ok) {
+            const error =
+              result.error ?? (result as { err?: string }).err ?? "get_properties failed";
+            if (!/^path not found(?::|$)/i.test(error.trim())) {
+              return { passed: false, error };
+            }
+            const actual = false;
+            return { passed: actual === condition.exists, actual, expected: condition.exists };
+          }
+          const actual = true;
+          return { passed: actual === condition.exists, actual, expected: condition.exists };
+        }
+
+        if (condition.kind === "property_equals") {
+          const result = await enqueueAndAwait(
+            "get_properties",
+            targetContext,
+            { path: condition.path, propertyNames: [condition.property] },
+            remainingTimeout(),
+          );
+          if (!result.ok) {
+            return {
+              passed: false,
+              error: result.error ?? (result as { err?: string }).err ?? "get_properties failed",
+            };
+          }
+          const properties = (result.result as { properties?: Record<string, unknown> } | undefined)
+            ?.properties;
+          const actual = properties?.[condition.property];
+          return {
+            passed: sameJsonValue(actual, condition.equals),
+            actual,
+            expected: condition.equals,
+          };
+        }
+
+        const result = await enqueueAndAwait(
+          "get_attribute",
+          targetContext,
+          { path: condition.path, name: condition.name },
+          remainingTimeout(),
+        );
+        if (!result.ok) {
+          return {
+            passed: false,
+            error: result.error ?? (result as { err?: string }).err ?? "get_attribute failed",
+          };
+        }
+        const actual = (result.result as { value?: unknown } | undefined)?.value;
+        return {
+          passed: sameJsonValue(actual, condition.equals),
+          actual,
+          expected: condition.equals,
+        };
+      };
+
+      let finalConditions: unknown[] = [];
+      while (Date.now() <= deadline) {
+        attempts += 1;
+        finalConditions = [];
+        for (const condition of conditions) {
+          if (Date.now() >= deadline) {
+            finalConditions.push({
+              kind: condition.kind,
+              passed: false,
+              error: "wait_for_state timeout reached before this condition could be sampled",
+            });
+            continue;
+          }
+          try {
+            const observed = (await observe(condition)) as Record<string, unknown>;
+            finalConditions.push({
+              kind: condition.kind,
+              ...observed,
+              actual:
+                "actual" in observed ? boundedObservationValue(observed.actual) : undefined,
+              expected:
+                "expected" in observed ? boundedObservationValue(observed.expected) : undefined,
+              error:
+                typeof observed.error === "string"
+                  ? observed.error.slice(0, 2000)
+                  : observed.error,
+            });
+          } catch (error) {
+            finalConditions.push({
+              kind: condition.kind,
+              passed: false,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+        const passed = finalConditions.every(
+          (entry) => (entry as { passed?: unknown }).passed === true,
+        );
+        consecutive = passed ? consecutive + 1 : 0;
+        if (observations.length < 20 || passed || Date.now() >= deadline) {
+          observations.push({
+            at: new Date().toISOString(),
+            elapsedMs: Date.now() - startedAt,
+            passed,
+            consecutive,
+            conditions: finalConditions,
+          });
+        }
+        if (consecutive >= stableSamples) {
+          return jsonResult({
+            ok: true,
+            timedOut: false,
+            attempts,
+            stableSamples,
+            elapsedMs: Date.now() - startedAt,
+            finalConditions,
+            observations,
+          });
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, remaining)));
+      }
+      return blocked(
+        JSON.stringify(
+          {
+            ok: false,
+            timedOut: true,
+            attempts,
+            stableSamples,
+            elapsedMs: Date.now() - startedAt,
+            finalConditions,
+            observations,
+          },
+          null,
+          2,
+        ),
+      );
+    },
+  );
+
+  const inputPosition = {
+    path: z.string().optional(),
+    x: z.number().min(-100_000).max(100_000).optional(),
+    y: z.number().min(-100_000).max(100_000).optional(),
+  };
+  const inputStepSchema = z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("wait"), seconds: z.number().min(0).max(5) }),
+    z.object({
+      kind: z.literal("key"),
+      keyCode: z.string().min(1),
+      action: z.enum(["tap", "down", "up"]).default("tap"),
+      holdSeconds: z.number().min(0).max(2).default(0.05),
+    }),
+    z.object({ kind: z.literal("move"), ...inputPosition }),
+    z.object({
+      kind: z.literal("click"),
+      ...inputPosition,
+      button: z.enum(["MouseButton1", "MouseButton2", "MouseButton3"]).default("MouseButton1"),
+      holdSeconds: z.number().min(0).max(2).default(0.05),
+      repeatCount: z.number().int().min(0).max(3).default(0),
+    }),
+    z.object({ kind: z.literal("text"), text: z.string().max(1000) }),
+    z.object({
+      kind: z.literal("pointer"),
+      ...inputPosition,
+      wheel: z.number().min(-100).max(100).default(0),
+      panX: z.number().min(-2000).max(2000).default(0),
+      panY: z.number().min(-2000).max(2000).default(0),
+      pinch: z.number().min(-100).max(100).default(0),
+    }),
+    z.object({
+      kind: z.literal("assert_gui"),
+      path: z.string().min(1),
+      property: z.enum([
+        "className",
+        "visible",
+        "effectiveVisible",
+        "enabled",
+        "active",
+        "selectable",
+        "selected",
+        "text",
+      ]),
+      equals: objectArg(),
+    }),
+  ]);
+
+  server.registerTool(
+    "client_input_sequence",
+    {
+      title: "Run Client Input Sequence",
+      description:
+        "Run a bounded end-to-end input flow in the live F5 client using Roblox's official " +
+        "VirtualInput API. Supports key, move, click, text, wheel/pan/pinch, waits, and " +
+        "PlayerGui assertions. Targets PlayerGui paths or explicit screen coordinates, stops " +
+        "on first failure, returns per-step evidence, and never accepts arbitrary client code.",
+      inputSchema: {
+        steps: z.array(inputStepSchema).min(1).max(40),
+        timeoutSec: z.number().min(1).max(30).default(30),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ steps, timeoutSec }) => {
+      if (!isAlive("server")) {
+        return blocked("client_input_sequence requires a running F5 playtest with the runtime agent");
+      }
+      return callWithTimeout(
+        "client_input_sequence",
+        "server",
+        { steps, timeoutSec },
+        Math.ceil(timeoutSec * 1000) + 8000,
+      );
+    },
+  );
+
+  const sceneAnalysisMode = z.enum([
+    "instanceComposition",
+    "scriptMemory",
+    "unparentedInstances",
+    "triangleComposition",
+    "animationMemory",
+    "audioMemory",
+  ]);
+
+  server.registerTool(
+    "scene_analysis_snapshot",
+    {
+      title: "Scene Analysis Snapshot",
+      description:
+        "Capture engine-native SceneAnalysisService evidence from the live playtest server, " +
+        "client, or both: instance composition, per-script memory, unparented leaks, triangle/" +
+        "draw-call composition, animation memory, and audio memory. Output is depth/node capped " +
+        "and identifies truncation. The service is not replicated, so sides are sampled separately.",
+      inputSchema: {
+        side: z.enum(["server", "client", "both"]).default("both"),
+        include: z.array(sceneAnalysisMode).min(1).max(6).default([
+          "instanceComposition",
+          "scriptMemory",
+          "unparentedInstances",
+          "triangleComposition",
+        ]),
+        maxNodes: z.number().int().min(100).max(20_000).default(5000),
+        maxDepth: z.number().int().min(2).max(16).default(10),
+        maxOutputBytes: z.number().int().min(10_000).max(1_000_000).default(250_000),
+        timeoutSec: z.number().min(1).max(60).default(30),
+      },
+      annotations: {
+        ...READ_ONLY_ANNOTATIONS,
+        idempotentHint: false,
+      },
+    },
+    async (input) => {
+      if (!isAlive("server")) {
+        return blocked("scene_analysis_snapshot requires a running F5 playtest with the runtime agent");
+      }
+      return callWithTimeout("scene_analysis_snapshot", "server", input, 120_000);
+    },
+  );
+
+  server.registerTool(
+    "capture_script_profile",
+    {
+      title: "Capture Script Profile",
+      description:
+        "Capture a bounded ScriptProfilerService sample from the active playtest server or first " +
+        "client, deserialize the engine JSON, and return capped call-graph evidence. The profiler " +
+        "is always stopped and listeners disconnected on success or failure. ScriptProfilerService " +
+        "is global, so do not run this beside Studio's manual Script Profiler.",
+      inputSchema: {
+        side: z.enum(["server", "client"]).default("server"),
+        durationSec: z.number().min(0.25).max(10).default(2),
+        maxNodes: z.number().int().min(100).max(20_000).default(5000),
+      },
+      annotations: {
+        ...READ_ONLY_ANNOTATIONS,
+        idempotentHint: false,
+      },
+    },
+    async (input) => {
+      if (!isAlive("server")) {
+        return blocked("capture_script_profile requires a running F5 playtest with the runtime agent");
+      }
+      return callWithTimeout(
+        "capture_script_profile",
+        "edit",
+        input,
+        Math.ceil(input.durationSec * 1000) + 20_000,
+      );
+    },
+  );
+
   server.registerTool(
     "luau_lint_gate",
     {
@@ -5448,14 +7687,17 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         "LocalScript/ModuleScript under it, via list_scripts). failOn='error' (default) fails " +
         "only on blocking diagnostics (SyntaxError/TypeError); failOn='warning' fails on any " +
         "lint warning too. Capped at 100 scripts (truncated flag) and 10 diagnostics per " +
-        "script. Always scans the edit-context place.",
+        "script. Always scans the edit-context place. Analyzer noise that is statically " +
+        "unknowable (Unknown require from WaitForChild chains, dot-child DataModel access) is " +
+        "classed as INFO and never fails the gate unless ignoreInfo:false.",
       inputSchema: {
         paths: z.array(z.string()).optional(),
         root: z.string().optional(),
         failOn: z.enum(["error", "warning"]).default("error"),
+        ignoreInfo: z.boolean().default(true),
       },
     },
-    async ({ paths, root, failOn }) => {
+    async ({ paths, root, failOn, ignoreInfo }) => {
       const reason = gateToolCall("luau_lint_gate");
       if (reason) return blocked(reason);
       if (!!paths === !!root) {
@@ -5482,16 +7724,18 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
         path: string;
         errors: number;
         warnings: number;
+        infos: number;
         firstDiagnostics: Diagnostic[];
         error?: string;
       }[] = [];
       let totalErrors = 0;
       let totalWarnings = 0;
+      let totalInfos = 0;
 
       for (const path of targets) {
         const src = await fetchScriptSource(path, "edit");
         if (!src.ok) {
-          scripts.push({ path, errors: 0, warnings: 0, firstDiagnostics: [], error: src.error });
+          scripts.push({ path, errors: 0, warnings: 0, infos: 0, firstDiagnostics: [], error: src.error });
           continue;
         }
         const res = await analyzeSource(src.source);
@@ -5500,33 +7744,39 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
             path,
             errors: 0,
             warnings: 0,
+            infos: 0,
             firstDiagnostics: [],
             error: "luau analyzer not available (binary/definitions missing or still downloading)",
           });
           continue;
         }
+        const warningsHere = ignoreInfo ? res.warnings : [...res.warnings, ...res.infos];
         totalErrors += res.errors.length;
-        totalWarnings += res.warnings.length;
+        totalWarnings += warningsHere.length;
+        totalInfos += res.infos.length;
         scripts.push({
           path,
           errors: res.errors.length,
-          warnings: res.warnings.length,
-          firstDiagnostics: [...res.errors, ...res.warnings].slice(0, 10),
+          warnings: warningsHere.length,
+          infos: res.infos.length,
+          firstDiagnostics: [...res.errors, ...warningsHere, ...(ignoreInfo ? res.infos : [])].slice(0, 10),
         });
       }
 
       const verdictPass = failOn === "warning" ? totalErrors === 0 && totalWarnings === 0 : totalErrors === 0;
       const summary =
         `LINT GATE: ${verdictPass ? "PASS" : "FAIL"} -- ${totalErrors} error(s), ${totalWarnings} ` +
-        `warning(s) across ${targets.length} script(s)` +
+        `warning(s), ${totalInfos} info(s) across ${targets.length} script(s)` +
         (truncated ? ` (truncated to first ${SCRIPT_CAP})` : "");
       const details = {
         verdict: verdictPass ? "pass" : "fail",
         failOn,
+        ignoreInfo,
         scriptCount: targets.length,
         truncated,
         totalErrors,
         totalWarnings,
+        totalInfos,
         scripts,
       };
       return {
@@ -5606,6 +7856,12 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     }
 
     async function body(): Promise<void> {
+      const armErr = await armRuntimeAgent();
+      if (armErr) {
+        setupError = `enable_playtest_agent: ${armErr}`;
+        return;
+      }
+
       const startRes = await enqueueAndAwait(
         "playtest_control",
         "edit",
@@ -5618,12 +7874,9 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
       }
       weStarted = true;
 
-      const connectDeadline = Date.now() + 20000;
-      while (!isAlive("server") && Date.now() < connectDeadline) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-      if (!isAlive("server")) {
-        setupError = "agent never connected (check Allow HTTP Requests)";
+      const attach = await waitForRuntimeAgent(20000);
+      if (!attach.ok) {
+        setupError = attachFailure(attach.status);
         return;
       }
 
@@ -5915,6 +8168,536 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     }
   );
 
+  const multiClientQaStepSchema = z.object({
+    type: z.enum([
+      "wait",
+      "wait_for_players",
+      "checkpoint",
+      "add_players",
+      "disconnect_player",
+      "server_assertion",
+    ]),
+    name: z.string().optional(),
+    seconds: z.number().min(0).max(120).optional(),
+    count: z.number().int().min(1).max(8).optional(),
+    timeoutSec: z.number().min(1).max(120).optional(),
+    playerName: z.string().optional(),
+    userId: z.number().int().optional(),
+    playerIndex: z.number().int().min(1).max(8).optional(),
+    luau: z.string().optional(),
+    expectTruthy: z.boolean().default(true),
+    requireClientAgents: z.boolean().default(true),
+  });
+
+  async function qaRuntimeState(timeoutMs = 8000): Promise<CommandResult> {
+    return enqueueAndAwait("qa_runtime_control", "server", { action: "state" }, timeoutMs);
+  }
+
+  async function waitForQaPlayers(
+    expected: number,
+    requireClientAgents: boolean,
+    timeoutSec: number,
+  ): Promise<{ ok: boolean; state?: unknown; error?: string }> {
+    const deadline = Date.now() + Math.max(1, timeoutSec) * 1000;
+    let last: CommandResult | null = null;
+    while (Date.now() < deadline) {
+      try {
+        last = await qaRuntimeState();
+        if (last.ok && last.result && typeof last.result === "object") {
+          const state = last.result as Record<string, unknown>;
+          const players = typeof state.playerCount === "number" ? state.playerCount : 0;
+          const ready = typeof state.readyClientCount === "number" ? state.readyClientCount : 0;
+          if (players === expected && (!requireClientAgents || ready === expected)) {
+            return { ok: true, state };
+          }
+        }
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return {
+      ok: false,
+      state: last?.result,
+      error:
+        `timed out waiting for ${expected} players` +
+        (requireClientAgents ? " with all client agents ready" : ""),
+    };
+  }
+
+  server.registerTool(
+    "run_multi_client_qa",
+    {
+      title: "Run Multi-Client QA",
+      description:
+        "Launch a true StudioTestService multiplayer session with one server and 1-8 client DataModels. " +
+        "Runs bounded join/leave/checkpoint/server-assertion steps, forwards serializable testArgs, records " +
+        "per-step evidence, drains output, and always performs the settled teardown handshake. Refuses to " +
+        "start over an active or stale prior test.",
+      inputSchema: {
+        name: z.string().default("NikMCP multi-client QA"),
+        startup: z.object({
+          initialPlayers: z.number().int().min(1).max(8).default(2),
+          testArgs: objectArg().optional(),
+          timeoutSec: z.number().min(5).max(120).default(30),
+          requireClientAgents: z.boolean().default(true),
+        }),
+        steps: z.array(multiClientQaStepSchema).max(100).default([]),
+        teardown: z.object({
+          luau: z.string().optional(),
+          timeoutSec: z.number().min(1).max(120).default(30),
+        }).default({ timeoutSec: 30 }),
+        settleTimeoutSec: z.number().min(3).max(30).default(15),
+        skipAnalysis: z.boolean().default(false),
+      },
+    },
+    async ({ name, startup, steps, teardown, settleTimeoutSec, skipAnalysis }) => {
+      const reason = gateToolCall("run_multi_client_qa");
+      if (reason) return blocked(reason);
+      const initialStatus = await canonicalPlaytestStatus();
+      const initialEdit = (initialStatus.edit ?? {}) as Record<string, unknown>;
+      if (initialStatus.running === true || initialEdit.connected !== true || isAlive("server")) {
+        return blocked(
+          "multi-client QA requires a fully settled edit-mode target; stop the active/stale test first. status=" +
+            JSON.stringify(initialStatus),
+        );
+      }
+      const assertionSources = [
+        ...steps.filter((step) => step.type === "server_assertion" && step.luau).map((step) => step.luau as string),
+        ...(teardown.luau ? [teardown.luau] : []),
+      ];
+      for (const source of assertionSources) {
+        const gate = await gateLuau(source, skipAnalysis, "run_multi_client_qa");
+        if (gate.block) return gate.block;
+      }
+
+      const report: Record<string, unknown> = {
+        name,
+        startedAt: new Date().toISOString(),
+        engine: "StudioTestService.ExecuteMultiplayerTestAsync",
+        initialStatus,
+        startup: null,
+        steps: [],
+        teardown: null,
+        output: null,
+      };
+      const stepResults = report.steps as Record<string, unknown>[];
+      let started = false;
+      let failed: string | null = null;
+
+      try {
+        const armError = await armRuntimeAgent();
+        if (armError) throw new Error(`runtime agent arm failed: ${armError}`);
+        const start = await enqueueAndAwait(
+          "playtest_control",
+          "edit",
+          {
+            action: "start",
+            mode: "multiplayer",
+            numPlayers: startup.initialPlayers,
+            testArgs: startup.testArgs ?? { name },
+          },
+          12_000,
+        );
+        if (!start.ok) {
+          throw new Error(start.error ?? (start as { err?: string }).err ?? "multiplayer start failed");
+        }
+        started = true;
+        const attached = await waitForRuntimeAgent(startup.timeoutSec * 1000);
+        if (!attached.ok) throw new Error(attachFailure(attached.status));
+        const ready = await waitForQaPlayers(
+          startup.initialPlayers,
+          startup.requireClientAgents,
+          startup.timeoutSec,
+        );
+        if (!ready.ok) throw new Error(ready.error ?? "initial clients did not become ready");
+        report.startup = {
+          ok: true,
+          requestedPlayers: startup.initialPlayers,
+          testArgs: startup.testArgs ?? { name },
+          state: ready.state,
+          status: await canonicalPlaytestStatus(),
+        };
+
+        for (let index = 0; index < steps.length; index++) {
+          const step = steps[index];
+          const startedAt = Date.now();
+          const row: Record<string, unknown> = {
+            index: index + 1,
+            type: step.type,
+            name: step.name ?? null,
+            ok: false,
+          };
+          try {
+            if (step.type === "wait") {
+              await new Promise((resolve) => setTimeout(resolve, (step.seconds ?? 1) * 1000));
+              row.result = { waitedSec: step.seconds ?? 1 };
+            } else if (step.type === "wait_for_players") {
+              if (!step.count) throw new Error("wait_for_players requires count");
+              const waited = await waitForQaPlayers(
+                step.count,
+                step.requireClientAgents,
+                step.timeoutSec ?? 30,
+              );
+              if (!waited.ok) throw new Error(waited.error ?? "player wait failed");
+              row.result = waited.state;
+            } else if (step.type === "checkpoint") {
+              const result = await enqueueAndAwait(
+                "qa_runtime_control",
+                "server",
+                { action: "checkpoint", name: step.name ?? `checkpoint_${index + 1}` },
+                (step.timeoutSec ?? 10) * 1000,
+              );
+              if (!result.ok) throw new Error(result.error ?? (result as { err?: string }).err ?? "checkpoint failed");
+              row.result = result.result;
+            } else if (step.type === "add_players") {
+              if (!step.count) throw new Error("add_players requires count");
+              const beforeResult = await qaRuntimeState();
+              const beforeState = (beforeResult.result ?? {}) as Record<string, unknown>;
+              const before = typeof beforeState.playerCount === "number" ? beforeState.playerCount : 0;
+              const add = await enqueueAndAwait(
+                "qa_runtime_control",
+                "server",
+                { action: "add_players", count: step.count },
+                (step.timeoutSec ?? 30) * 1000,
+              );
+              if (!add.ok) throw new Error(add.error ?? (add as { err?: string }).err ?? "AddPlayers failed");
+              const waited = await waitForQaPlayers(
+                before + step.count,
+                step.requireClientAgents,
+                step.timeoutSec ?? 30,
+              );
+              if (!waited.ok) throw new Error(waited.error ?? "added clients did not become ready");
+              row.result = { command: add.result, state: waited.state };
+            } else if (step.type === "disconnect_player") {
+              if (!step.playerName && step.userId === undefined && step.playerIndex === undefined) {
+                throw new Error("disconnect_player requires playerName, userId, or playerIndex");
+              }
+              const disconnected = await enqueueAndAwait(
+                "qa_runtime_control",
+                "server",
+                {
+                  action: "disconnect_player",
+                  playerName: step.playerName,
+                  userId: step.userId,
+                  playerIndex: step.playerIndex,
+                  timeoutSec: step.timeoutSec ?? 15,
+                },
+                (step.timeoutSec ?? 15) * 1000 + 2000,
+              );
+              if (!disconnected.ok) {
+                throw new Error(disconnected.error ?? (disconnected as { err?: string }).err ?? "LeaveTest failed");
+              }
+              row.result = disconnected.result;
+            } else if (step.type === "server_assertion") {
+              if (!step.luau) throw new Error("server_assertion requires luau");
+              const assertion = await enqueueAndAwait(
+                "run_luau",
+                "server",
+                { code: step.luau },
+                (step.timeoutSec ?? 30) * 1000,
+              );
+              if (!assertion.ok) {
+                throw new Error(assertion.error ?? (assertion as { err?: string }).err ?? "server assertion errored");
+              }
+              if (step.expectTruthy && assertion.result !== true) {
+                throw new Error(`server assertion returned ${JSON.stringify(assertion.result)} instead of true`);
+              }
+              row.result = { output: assertion.output, value: assertion.result };
+            }
+            row.ok = true;
+          } catch (error) {
+            row.error = error instanceof Error ? error.message : String(error);
+            failed = `step ${index + 1} (${step.type}) failed: ${row.error}`;
+          }
+          row.durationMs = Date.now() - startedAt;
+          row.state = (await qaRuntimeState().catch(() => ({ ok: false } as CommandResult))).result ?? null;
+          stepResults.push(row);
+          if (failed) break;
+        }
+      } catch (error) {
+        failed = error instanceof Error ? error.message : String(error);
+      } finally {
+        if (started && teardown.luau && isAlive("server")) {
+          const teardownResult = await enqueueAndAwait(
+            "run_luau",
+            "server",
+            { code: teardown.luau },
+            teardown.timeoutSec * 1000,
+          ).catch((error) => ({
+            id: "teardown",
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          } as CommandResult));
+          report.teardown = {
+            assertion: teardownResult,
+          };
+          if (!teardownResult.ok && !failed) {
+            failed = teardownResult.error ?? "teardown Luau failed";
+          }
+        }
+        if (started && isAlive("server")) {
+          report.output = await enqueueAndAwait(
+            "get_playtest_output",
+            "server",
+            { drain: true },
+            8000,
+          ).catch((error) => ({
+            id: "output",
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          }));
+        }
+        if (started) {
+          report.teardown = {
+            ...((report.teardown ?? {}) as Record<string, unknown>),
+            stop: await stopPlaytest({
+              action: "stop",
+              mode: "multiplayer",
+              settleTimeoutMs: settleTimeoutSec * 1000,
+              retries: 1,
+              force: true,
+            }, "run_multi_client_qa"),
+          };
+        }
+      }
+
+      report.finishedAt = new Date().toISOString();
+      report.ok = failed === null;
+      report.failure = failed;
+      report.finalStatus = await canonicalPlaytestStatus();
+      return {
+        isError: failed !== null,
+        content: [{ type: "text" as const, text: JSON.stringify(report, null, 2) }],
+      };
+    }
+  );
+
+  const defaultUiRegressionProfiles = [
+    {
+      label: "phone_portrait",
+      width: 844,
+      height: 390,
+      pixelDensity: 460,
+      deviceForm: "Phone" as const,
+      orientation: "Portrait" as const,
+    },
+    {
+      label: "phone_landscape",
+      width: 844,
+      height: 390,
+      pixelDensity: 460,
+      deviceForm: "Phone" as const,
+      orientation: "LandscapeLeft" as const,
+    },
+    {
+      label: "tablet_portrait",
+      width: 1366,
+      height: 1024,
+      pixelDensity: 264,
+      deviceForm: "Tablet" as const,
+      orientation: "Portrait" as const,
+    },
+    {
+      label: "desktop",
+      width: 1920,
+      height: 1080,
+      pixelDensity: 96,
+      deviceForm: "Desktop" as const,
+      orientation: "LandscapeLeft" as const,
+    },
+  ];
+
+  server.registerTool(
+    "runtime_ui_regression",
+    {
+      title: "Runtime UI Regression",
+      description:
+        "Sweep live PlayerGui layouts through StudioDeviceSimulatorService device profiles. Each profile starts a " +
+        "real F5 client, waits for the fixed client agent, inspects screen-space state for clipping, offscreen layout, " +
+        "interactive overlap, tiny touch targets, safe-area handling, heavy Offset sizing, and missing constraints, " +
+        "then performs a settled stop before the next profile. Returns state/layout evidence only, not screenshots.",
+      inputSchema: {
+        profiles: z.array(z.object({
+          label: z.string().min(1),
+          width: z.number().int().min(100).max(10000),
+          height: z.number().int().min(100).max(10000),
+          pixelDensity: z.number().int().min(1).max(1000),
+          deviceForm: z.enum(["Phone", "Tablet", "Desktop"]),
+          orientation: z.enum(["Portrait", "LandscapeLeft", "LandscapeRight"]),
+        })).min(1).max(8).default(defaultUiRegressionProfiles),
+        minTouchTarget: z.number().min(24).max(80).default(44),
+        maxObjects: z.number().int().min(1).max(5000).default(1500),
+        maxFindings: z.number().int().min(1).max(2000).default(500),
+        maxOverlapPairs: z.number().int().min(1).max(50000).default(5000),
+        settleSeconds: z.number().min(0).max(3).default(0.5),
+        startupTimeoutSec: z.number().min(5).max(60).default(25),
+        settleTimeoutSec: z.number().min(3).max(30).default(15),
+      },
+    },
+    async ({
+      profiles,
+      minTouchTarget,
+      maxObjects,
+      maxFindings,
+      maxOverlapPairs,
+      settleSeconds,
+      startupTimeoutSec,
+      settleTimeoutSec,
+    }) => {
+      const reason = gateToolCall("runtime_ui_regression");
+      if (reason) return blocked(reason);
+      const initialStatus = await canonicalPlaytestStatus();
+      const initialEdit = (initialStatus.edit ?? {}) as Record<string, unknown>;
+      if (initialStatus.running === true || initialEdit.connected !== true || isAlive("server")) {
+        return blocked(
+          "runtime UI regression requires a fully settled edit-mode target; stop the active/stale test first. status=" +
+            JSON.stringify(initialStatus),
+        );
+      }
+      const snapshotResult = await enqueueAndAwait("qa_device_snapshot", "edit", {}, 15_000);
+      if (!snapshotResult.ok) {
+        return blocked(
+          snapshotResult.error ??
+            (snapshotResult as { err?: string }).err ??
+            "could not snapshot Studio device simulator state",
+        );
+      }
+      const snapshot = snapshotResult.result;
+      const matrix: Record<string, unknown>[] = [];
+      let restore: CommandResult | null = null;
+
+      try {
+        for (const profile of profiles) {
+          const row: Record<string, unknown> = {
+            profile,
+            ok: false,
+            device: null,
+            runtime: null,
+            layout: null,
+            output: null,
+            stop: null,
+          };
+          let started = false;
+          try {
+            const applied = await enqueueAndAwait(
+              "qa_device_apply",
+              "edit",
+              { ...profile, scalingMode: "FitToWindow" },
+              30_000,
+            );
+            if (!applied.ok) {
+              throw new Error(applied.error ?? (applied as { err?: string }).err ?? "device apply failed");
+            }
+            row.device = applied.result;
+            const armError = await armRuntimeAgent();
+            if (armError) throw new Error(`runtime agent arm failed: ${armError}`);
+            const start = await enqueueAndAwait(
+              "playtest_control",
+              "edit",
+              { action: "start", mode: "play", numPlayers: 1 },
+              12_000,
+            );
+            if (!start.ok) {
+              throw new Error(start.error ?? (start as { err?: string }).err ?? "play start failed");
+            }
+            started = true;
+            const attached = await waitForRuntimeAgent(startupTimeoutSec * 1000);
+            if (!attached.ok) throw new Error(attachFailure(attached.status));
+            const clientDeadline = Date.now() + startupTimeoutSec * 1000;
+            let clientStatus = attached.status;
+            for (;;) {
+              const client = (clientStatus.clientAgent ?? {}) as Record<string, unknown>;
+              if (client.connected === true) break;
+              if (Date.now() >= clientDeadline) {
+                throw new Error("F5 client agent did not connect before timeout");
+              }
+              await new Promise((resolve) => setTimeout(resolve, 250));
+              clientStatus = await canonicalPlaytestStatus();
+            }
+            row.runtime = clientStatus;
+            const layout = await enqueueAndAwait(
+              "client_query",
+              "server",
+              {
+                name: "ui_regression",
+                args: {
+                  minTouchTarget,
+                  maxObjects,
+                  maxFindings,
+                  maxOverlapPairs,
+                  settleSeconds,
+                },
+              },
+              30_000,
+            );
+            if (!layout.ok) {
+              throw new Error(layout.error ?? (layout as { err?: string }).err ?? "client layout query failed");
+            }
+            row.layout = layout.result;
+            row.ok = true;
+          } catch (error) {
+            row.error = error instanceof Error ? error.message : String(error);
+          } finally {
+            if (started && isAlive("server")) {
+              row.output = await enqueueAndAwait(
+                "get_playtest_output",
+                "server",
+                { drain: true },
+                8000,
+              ).catch((error) => ({
+                id: "output",
+                ok: false,
+                error: error instanceof Error ? error.message : String(error),
+              }));
+            }
+            if (started) {
+              row.stop = await stopPlaytest({
+                action: "stop",
+                mode: "play",
+                settleTimeoutMs: settleTimeoutSec * 1000,
+                retries: 1,
+                force: true,
+              }, "runtime_ui_regression");
+            }
+          }
+          matrix.push(row);
+        }
+      } finally {
+        restore = await enqueueAndAwait(
+          "qa_device_restore",
+          "edit",
+          { snapshot },
+          30_000,
+        ).catch((error) => ({
+          id: "restore",
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      }
+
+      const ok = matrix.every((row) => row.ok === true) && restore?.ok === true;
+      return {
+        isError: !ok,
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            ok,
+            evidenceType: "live_state_and_layout",
+            screenshots: {
+              supported: false,
+              reason:
+                "The current fixed client protocol can inspect live PlayerGui state but has no truthful client pixel-capture path.",
+            },
+            matrix,
+            deviceRestore: restore,
+            finalStatus: await canonicalPlaytestStatus(),
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
   // multiplayer_eval feasibility verdict (investigated RuntimeAgentSource.luau +
   // ClientAgentSource.luau end-to-end before writing this):
   // (a) serverLuau: RuntimeAgentSource's run_luau branch runs arbitrary code in
@@ -6060,27 +8843,757 @@ export async function startMcpServer(cfg: AppConfig): Promise<void> {
     }
   );
 
+  // ===== v0.2.0: token-cheap script edits, harness macro, server introspection,
+  // client activation, manifest reconcile, pre-write backups ===================
+
+  interface BackupInfo {
+    path: string;
+    backedUp: boolean;
+    hash?: string;
+    note?: string;
+  }
+
+  // Snapshot the CURRENT source of a script into the in-memory backup ring
+  // before any tool overwrites it. Best-effort: a missing script (write_script
+  // creating a new one) or a read failure never blocks the write.
+  async function backupScriptBeforeWrite(path: string, tool: string): Promise<BackupInfo> {
+    try {
+      const r = await enqueueAndAwait("get_script_source", "edit", { path }, Math.min(cfg.commandTimeoutMs, 20_000));
+      const src = (r.result as { source?: unknown } | undefined)?.source;
+      if (!r.ok || typeof src !== "string") {
+        return { path, backedUp: false, note: r.ok ? "no source returned" : (r.error ?? (r as { err?: string }).err ?? "read failed") };
+      }
+      const entry = scriptBackups.record(path, src, tool);
+      return { path, backedUp: true, hash: entry?.hash ?? fnv1a32(normalizeSource(src)), note: entry ? undefined : "identical to newest backup" };
+    } catch (e) {
+      return { path, backedUp: false, note: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  async function backupScriptsBeforeWrite(paths: string[], tool: string): Promise<BackupInfo[]> {
+    const out: BackupInfo[] = [];
+    for (let i = 0; i < paths.length; i += 30) {
+      const batch = paths.slice(i, i + 30);
+      try {
+        const r = await enqueueAndAwait("sync_get_sources", "edit", { paths: batch }, QOL_STEP_TIMEOUT_MS);
+        const arr = r.ok && Array.isArray(r.result) ? (r.result as { path: string; source?: string; err?: string }[]) : [];
+        const byPath = new Map(arr.map((it) => [it.path, it]));
+        for (const p of batch) {
+          const it = byPath.get(p);
+          if (!it || typeof it.source !== "string") {
+            out.push({ path: p, backedUp: false, note: it?.err ?? "no source returned" });
+            continue;
+          }
+          const entry = scriptBackups.record(p, it.source, tool);
+          out.push({ path: p, backedUp: true, hash: entry?.hash ?? fnv1a32(it.source), note: entry ? undefined : "identical to newest backup" });
+        }
+      } catch (e) {
+        for (const p of batch) out.push({ path: p, backedUp: false, note: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return out;
+  }
+
+  function withBackupNote<T extends { isError?: boolean; content: unknown[] }>(
+    res: T,
+    backup: BackupInfo | BackupInfo[],
+  ): T {
+    const list = Array.isArray(backup) ? backup : [backup];
+    const ok = list.filter((b) => b.backedUp);
+    if (res.isError || list.length === 0) return res;
+    const text =
+      ok.length === 0
+        ? `backup: none taken (${list.map((b) => `${b.path}: ${b.note ?? "unknown"}`).join("; ")})`
+        : `backup: ${ok.length}/${list.length} previous source(s) saved in this Node process -- restore with restore_script_backup { path, confirm:true }` +
+          (ok.length <= 3 ? ` [${ok.map((b) => `${b.path}@${b.hash}`).join(", ")}]` : "");
+    return { ...res, content: [...res.content, { type: "text" as const, text }] };
+  }
+
+  server.registerTool(
+    "edit_script",
+    {
+      title: "Edit Script (exact string / unified patch)",
+      description:
+        "Token-cheap script edit: replace an EXACT oldString with newString (must match exactly " +
+        "once unless replaceAll/expectedMatches), OR apply a unified diff via patch. Reads the " +
+        "live source, applies the change Node-side, luau-lsp gates the result, then writes it " +
+        "back through the drift-safe hash-checked transaction (refuses if the script changed " +
+        "underneath). The previous source is backed up first (restore_script_backup). Returns " +
+        "before/after hashes and a unified diff. dryRun:true previews without writing. Edit " +
+        "mode only. Use this instead of re-sending a whole file through write_script.",
+      inputSchema: {
+        path: z.string().min(1),
+        oldString: z.string().optional(),
+        newString: z.string().optional(),
+        replaceAll: z.boolean().default(false),
+        expectedMatches: z.number().int().min(1).max(1000).optional(),
+        patch: z
+          .string()
+          .max(1_000_000)
+          .optional()
+          .describe("Unified diff (@@ hunks). Hunks are located exactly, then by nearest offset, then whitespace-fuzzily; any unlocatable hunk aborts before writing."),
+        skipAnalysis: z.boolean().default(false),
+        dryRun: z.boolean().default(false),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ path, oldString, newString, replaceAll, expectedMatches, patch, skipAnalysis, dryRun }) => {
+      const reason = gateToolCall("edit_script");
+      if (reason) return blocked(reason);
+      const guard = syncPlaytestGuard();
+      if (guard) return guard;
+      const replaceMode = oldString !== undefined || newString !== undefined;
+      if (replaceMode === (patch !== undefined)) {
+        return blocked("provide exactly one edit mode: oldString+newString, or patch");
+      }
+      if (replaceMode && (oldString === undefined || newString === undefined)) {
+        return blocked("oldString and newString are both required for replace mode");
+      }
+      if (isProtectedSyncPath(path)) {
+        return blocked(`${path} is a bridge-managed NikMCP script; use enable_playtest_agent to refresh it instead of editing it`);
+      }
+      const read = await enqueueAndAwait("sync_get_sources", "edit", { paths: [path] }, QOL_STEP_TIMEOUT_MS);
+      if (!read.ok) return blocked(read.error ?? (read as { err?: string }).err ?? "sync_get_sources failed");
+      const item = (Array.isArray(read.result) ? (read.result as { path: string; source?: string; err?: string }[]) : [])[0];
+      if (!item || typeof item.source !== "string") {
+        return blocked(`${path}: ${item?.err ?? "not found or not a script"}`);
+      }
+      const before = normalizeSource(item.source);
+      let after: string;
+      let detail: Record<string, unknown>;
+      try {
+        if (replaceMode) {
+          const out = applyExactReplace(before, oldString as string, newString as string, { replaceAll, expectedMatches });
+          after = out.source;
+          detail = { mode: "replace", matches: out.matches };
+        } else {
+          const out = applyUnifiedPatch(before, patch as string);
+          after = out.source;
+          detail = { mode: "patch", hunks: out.hunks };
+        }
+      } catch (e) {
+        return blocked(`edit_script: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      if (after === before) return blocked("edit produces no change");
+      if (Buffer.byteLength(after, "utf8") > 1_000_000) return blocked("resulting source exceeds the 1,000,000-byte cap");
+      const g = await gateLuau(after, skipAnalysis, "edit_script");
+      if (g.block) return g.block;
+      const beforeHash = fnv1a32(before);
+      const afterHash = fnv1a32(after);
+      const diffText = unifiedDiff(before, after);
+      const diff = diffText.length <= 20_000 ? diffText : `${diffText.slice(0, 20_000)}\n... diff truncated (${diffText.length - 20_000} chars omitted)`;
+      const base = {
+        path,
+        ...detail,
+        beforeHash,
+        afterHash,
+        linesBefore: before.split("\n").length,
+        linesAfter: after.split("\n").length,
+        diff,
+      };
+      if (dryRun) return withLuauWarnings(jsonResult({ dryRun: true, ...base }), g.warnings);
+      const backup = scriptBackups.record(path, before, "edit_script");
+      const w = await enqueueAndAwait(
+        "sync_set_sources",
+        "edit",
+        { items: [{ path, source: after, expectedHash: beforeHash }], gateAs: "edit_script" },
+        QOL_STEP_TIMEOUT_MS,
+      );
+      if (!w.ok) {
+        return blocked(
+          `edit_script write refused (nothing changed): ${w.error ?? (w as { err?: string }).err ?? "sync_set_sources failed"}` +
+            (w.result ? `\n${JSON.stringify(w.result, null, 2)}` : ""),
+        );
+      }
+      const rows = Array.isArray(w.result) ? (w.result as { path: string; ok: boolean; err?: string }[]) : [];
+      const row = rows[0];
+      if (!row || !row.ok) {
+        return blocked(`edit_script write failed: ${row?.err ?? "transaction returned no evidence"}`);
+      }
+      return withLuauWarnings(
+        jsonResult({
+          applied: true,
+          ...base,
+          backup: backup ? { hash: backup.hash, restore: "restore_script_backup { path, confirm:true }" } : { hash: beforeHash, note: "identical to newest backup" },
+        }),
+        g.warnings,
+      );
+    },
+  );
+
+  server.registerTool(
+    "list_script_backups",
+    {
+      title: "List Script Backups",
+      description:
+        "List the automatic pre-write script backups held by this Node process (taken by " +
+        "write_script, edit_script, edit/insert/delete_script_lines, import_scripts, " +
+        "apply_script_patchset, restore_script_backup). Newest first per path; index 0 = most recent.",
+      inputSchema: { path: z.string().optional() },
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async ({ path }) =>
+      jsonResult({
+        count: scriptBackups.size,
+        totalBytes: scriptBackups.totalBytes(),
+        backups: scriptBackups.list(path).map((b, i) => ({ ...b, index: undefined, order: i })),
+        note: "in-memory only; lost on Node restart. index for restore_script_backup counts per path, 0 = newest",
+      }),
+  );
+
+  server.registerTool(
+    "restore_script_backup",
+    {
+      title: "Restore Script Backup",
+      description:
+        "Write a pre-write backup back into the script (index 0 = most recent for that path). " +
+        "The current source is backed up first, then written through the drift-safe hash " +
+        "transaction. Requires confirm:true. Edit mode only.",
+      inputSchema: {
+        path: z.string().min(1),
+        index: z.number().int().min(0).max(4).default(0),
+        confirm: z.boolean().default(false),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ path, index, confirm }) => {
+      const reason = gateToolCall("restore_script_backup");
+      if (reason) return blocked(reason);
+      if (!confirm) return blocked("restore_script_backup requires confirm:true");
+      const guard = syncPlaytestGuard();
+      if (guard) return guard;
+      const backup = scriptBackups.get(path, index);
+      if (!backup) return blocked(`no backup #${index} for ${path} (see list_script_backups)`);
+      const read = await enqueueAndAwait("sync_get_sources", "edit", { paths: [path] }, QOL_STEP_TIMEOUT_MS);
+      if (!read.ok) return blocked(read.error ?? (read as { err?: string }).err ?? "sync_get_sources failed");
+      const item = (Array.isArray(read.result) ? (read.result as { path: string; source?: string; err?: string }[]) : [])[0];
+      if (!item || typeof item.source !== "string") return blocked(`${path}: ${item?.err ?? "not found or not a script"}`);
+      const current = normalizeSource(item.source);
+      const currentHash = fnv1a32(current);
+      if (currentHash === backup.hash) return jsonResult({ restored: false, note: "current source already equals that backup", hash: currentHash });
+      scriptBackups.record(path, current, "restore_script_backup");
+      const w = await enqueueAndAwait(
+        "sync_set_sources",
+        "edit",
+        { items: [{ path, source: backup.source, expectedHash: currentHash }], gateAs: "restore_script_backup" },
+        QOL_STEP_TIMEOUT_MS,
+      );
+      if (!w.ok) return blocked(`restore refused: ${w.error ?? (w as { err?: string }).err ?? "sync_set_sources failed"}`);
+      const row = (Array.isArray(w.result) ? (w.result as { ok: boolean; err?: string }[]) : [])[0];
+      if (!row || !row.ok) return blocked(`restore failed: ${row?.err ?? "no transaction evidence"}`);
+      return jsonResult({
+        restored: true,
+        path,
+        restoredHash: backup.hash,
+        restoredFrom: { takenAt: backup.takenAt, tool: backup.tool },
+        previousHash: currentHash,
+        diff: unifiedDiff(current, backup.source).slice(0, 20_000),
+      });
+    },
+  );
+
+  const attrValueTruthy = (v: unknown): boolean => v !== false && v !== null && v !== undefined && v !== 0 && v !== "";
+
+  server.registerTool(
+    "run_harness",
+    {
+      title: "Run Harness (arm -> play -> wait Done -> collect -> stop)",
+      description:
+        "One-call test harness macro. Optionally sets a gate attribute (e.g. Workspace SF_Run=true) " +
+        "in edit mode, arms the runtime agent, starts a playtest (run or play), waits for the " +
+        "runtime agent, optionally runs setupLuau on the server, then polls the server for " +
+        "`<resultPrefix>_Done` (or doneAttribute) on resultPath until truthy or timeout. Returns " +
+        "EVERY `<resultPrefix>*` attribute as structured results, the playtest output filtered by " +
+        "outputPattern plus a pinned ring of lines matching pinPattern (default: resultPrefix, never " +
+        "evicted by noise), server errors, and then stops the playtest and restores the gate " +
+        "attribute. Replaces the set_attribute -> playtest_control -> wait_for_state -> " +
+        "get_playtest_output -> stop_playtest dance.",
+      inputSchema: {
+        resultPrefix: z.string().min(1).max(64),
+        resultPath: z.string().min(1).default("Workspace"),
+        doneAttribute: z.string().min(1).optional(),
+        gate: objectArg()
+          .pipe(z.object({ path: z.string().min(1), name: z.string().min(1), value: objectArg().default(true) }))
+          .optional()
+          .describe("Attribute set in EDIT mode before launch (persists into the playtest DataModel); restored after stop."),
+        mode: z.enum(["run", "play"]).default("run"),
+        setupLuau: z.string().optional(),
+        timeoutSec: z.number().min(1).max(600).default(120),
+        pollIntervalMs: z.number().int().min(100).max(5000).default(500),
+        outputPattern: z.string().max(500).optional(),
+        pinPattern: z.string().max(200).optional(),
+        maxOutputLines: z.number().int().min(10).max(5000).default(300),
+        stopAfter: z.boolean().default(true),
+        skipAnalysis: z.boolean().default(false),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (input) => {
+      const reason = gateToolCall("run_harness");
+      if (reason) return blocked(reason);
+      if (isAlive("server")) return blocked("a playtest is already running (server agent connected); stop it first");
+      if (input.setupLuau) {
+        const g = await gateLuau(input.setupLuau, input.skipAnalysis, "run_harness setupLuau");
+        if (g.block) return g.block;
+      }
+      let outputRe: RegExp | null = null;
+      if (input.outputPattern !== undefined) {
+        try {
+          outputRe = new RegExp(input.outputPattern, "i");
+        } catch (e) {
+          return blocked(`invalid outputPattern: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      const doneAttr = input.doneAttribute ?? `${input.resultPrefix}_Done`;
+      const pinPattern = input.pinPattern ?? input.resultPrefix;
+      const startedAt = Date.now();
+      const phases: { phase: string; ok: boolean; ms: number; detail?: unknown }[] = [];
+      const mark = (phase: string, ok: boolean, t0: number, detail?: unknown) =>
+        phases.push({ phase, ok, ms: Date.now() - t0, detail });
+      let gatePrevious: { existed: boolean; value: unknown } | null = null;
+      let weStarted = false;
+      let setupError: string | null = null;
+      let done = false;
+      let results: Record<string, unknown> = {};
+      let polls = 0;
+      let lastAttrError: string | null = null;
+      let output: { lines: string[]; pinned: unknown[]; errors: string[]; unfiltered: number } = {
+        lines: [],
+        pinned: [],
+        errors: [],
+        unfiltered: 0,
+      };
+      let stopped: boolean | null = null;
+      let gateRestored: boolean | null = null;
+
+      const body = async () => {
+        let t0 = Date.now();
+        const armErr = await armRuntimeAgent();
+        mark("arm_runtime_agent", !armErr, t0, armErr ?? undefined);
+        if (armErr) {
+          setupError = `enable_playtest_agent: ${armErr}`;
+          return;
+        }
+        if (input.gate) {
+          t0 = Date.now();
+          const prev = await enqueueAndAwait("get_attribute", "edit", { path: input.gate.path, name: input.gate.name }, 10_000);
+          const prevValue = (prev.result as { value?: unknown } | undefined)?.value;
+          gatePrevious = { existed: prev.ok && prevValue !== undefined && prevValue !== null, value: prevValue };
+          const set = await enqueueAndAwait(
+            "set_attribute",
+            "edit",
+            { path: input.gate.path, name: input.gate.name, value: input.gate.value },
+            10_000,
+          );
+          mark("set_gate_attribute", set.ok, t0, set.ok ? { path: input.gate.path, name: input.gate.name, value: input.gate.value } : set.error);
+          if (!set.ok) {
+            setupError = `gate set failed: ${set.error ?? (set as { err?: string }).err ?? "set_attribute failed"}`;
+            return;
+          }
+        }
+        t0 = Date.now();
+        const start = await enqueueAndAwait(
+          "playtest_control",
+          "edit",
+          { action: "start", mode: input.mode, pinPattern },
+          QOL_STEP_TIMEOUT_MS,
+        );
+        mark("playtest_start", start.ok, t0, start.ok ? undefined : start.error);
+        if (!start.ok) {
+          setupError = start.error ?? (start as { err?: string }).err ?? "playtest_control start failed";
+          return;
+        }
+        weStarted = true;
+        t0 = Date.now();
+        const attach = await waitForRuntimeAgent(25_000);
+        mark("runtime_agent_attach", attach.ok, t0);
+        if (!attach.ok) {
+          setupError = attachFailure(attach.status);
+          return;
+        }
+        if (input.setupLuau) {
+          t0 = Date.now();
+          const r = await enqueueAndAwait("run_luau", "server", { code: input.setupLuau }, QOL_STEP_TIMEOUT_MS);
+          mark("setup_luau", r.ok, t0, r.ok ? r.output : r.error);
+          if (!r.ok) {
+            setupError = `setupLuau: ${r.error ?? (r as { err?: string }).err ?? "run_luau failed"}`;
+            return;
+          }
+        }
+        const deadline = startedAt + input.timeoutSec * 1000;
+        t0 = Date.now();
+        while (Date.now() < deadline) {
+          polls += 1;
+          if (!isAlive("server")) {
+            lastAttrError = "runtime agent disconnected while waiting";
+            break;
+          }
+          try {
+            const r = await enqueueAndAwait(
+              "get_attributes",
+              "server",
+              { path: input.resultPath },
+              Math.max(2000, Math.min(8000, deadline - Date.now())),
+            );
+            if (r.ok) {
+              const attrs = ((r.result as { attributes?: Record<string, unknown> } | undefined)?.attributes ??
+                (r.result as Record<string, unknown> | undefined) ??
+                {}) as Record<string, unknown>;
+              results = Object.fromEntries(Object.entries(attrs).filter(([k]) => k.startsWith(input.resultPrefix)));
+              lastAttrError = null;
+              if (attrValueTruthy(attrs[doneAttr])) {
+                done = true;
+                break;
+              }
+            } else {
+              lastAttrError = r.error ?? (r as { err?: string }).err ?? "get_attributes failed";
+            }
+          } catch (e) {
+            lastAttrError = e instanceof Error ? e.message : String(e);
+          }
+          await new Promise((resolve) => setTimeout(resolve, input.pollIntervalMs));
+        }
+        mark("wait_done", done, t0, { polls, doneAttribute: doneAttr, lastError: lastAttrError });
+        t0 = Date.now();
+        try {
+          const r = await enqueueAndAwait("get_playtest_output", "server", { drain: true }, QOL_STEP_TIMEOUT_MS);
+          if (r.ok && r.result && typeof r.result === "object") {
+            const res = r.result as { lines?: unknown; pinned?: unknown };
+            const all = Array.isArray(res.lines) ? (res.lines as Record<string, unknown>[]) : [];
+            output.unfiltered = all.length;
+            for (const l of all) {
+              const level = String(l.level ?? "");
+              const text = String(l.text ?? "");
+              if (level.includes("Error")) output.errors.push(text);
+              if (!outputRe || outputRe.test(text)) output.lines.push(`[${level}] ${text}`);
+            }
+            output.lines = output.lines.slice(-input.maxOutputLines);
+            output.errors = output.errors.slice(-100);
+            output.pinned = Array.isArray(res.pinned) ? res.pinned.slice(-input.maxOutputLines) : [];
+          }
+          mark("collect_output", r.ok, t0, r.ok ? { lines: output.unfiltered } : r.error);
+        } catch (e) {
+          mark("collect_output", false, t0, e instanceof Error ? e.message : String(e));
+        }
+      };
+
+      try {
+        await body();
+      } catch (e) {
+        setupError = setupError ?? (e instanceof Error ? e.message : String(e));
+      } finally {
+        if (weStarted && input.stopAfter) {
+          const t0 = Date.now();
+          try {
+            const stopRes = await stopPlaytest({ action: "stop", mode: input.mode });
+            stopped = !(stopRes as { isError?: boolean }).isError;
+          } catch {
+            stopped = false;
+          }
+          mark("stop_playtest", stopped === true, t0);
+        }
+        if (input.gate && gatePrevious && (!weStarted || !input.stopAfter || stopped !== null)) {
+          const t0 = Date.now();
+          try {
+            const prev = gatePrevious as { existed: boolean; value: unknown };
+            const r = prev.existed
+              ? await enqueueAndAwait("set_attribute", "edit", { path: input.gate.path, name: input.gate.name, value: prev.value }, 10_000)
+              : await enqueueAndAwait("delete_attribute", "edit", { path: input.gate.path, name: input.gate.name }, 10_000);
+            gateRestored = r.ok;
+          } catch {
+            gateRestored = false;
+          }
+          mark("restore_gate_attribute", gateRestored === true, t0);
+        }
+      }
+
+      const passed = done && !setupError && output.errors.length === 0;
+      const summary = passed
+        ? `HARNESS PASS: ${doneAttr} reached after ${polls} poll(s); ${Object.keys(results).length} ${input.resultPrefix}* attribute(s)`
+        : `HARNESS ${done ? "DONE-WITH-ERRORS" : "INCOMPLETE"}: ${setupError ?? (done ? `${output.errors.length} server error(s)` : `${doneAttr} never became truthy within ${input.timeoutSec}s${lastAttrError ? ` (last error: ${lastAttrError})` : ""}`)}`;
+      return {
+        isError: !done && !!setupError,
+        content: [
+          { type: "text" as const, text: summary },
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                passed,
+                done,
+                doneAttribute: doneAttr,
+                resultPath: input.resultPath,
+                results,
+                setupError,
+                serverErrors: output.errors,
+                output: output.lines,
+                pinned: output.pinned,
+                unfilteredOutputLines: output.unfiltered,
+                polls,
+                durationSec: Math.round((Date.now() - startedAt) / 10) / 100,
+                stopped,
+                gateRestored,
+                phases,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  server.registerTool(
+    "server_query",
+    {
+      title: "Server Query (read-only F5 server introspection, no loadstring)",
+      description:
+        "Fixed read-only queries against the LIVE playtest server DataModel that work even when " +
+        "LoadStringEnabled is off (run_luau context='server' needs loadstring; this does not). " +
+        "name: attributes {path} | attribute {path,attribute} | attributes_prefix {path,prefix} | " +
+        "properties {path,propertyNames?} | tree {path,maxDepth?} | children {path} | descendants " +
+        "{path,maxDepth?} | tagged {tag} | tags {path} | players | place | runtime_status | search " +
+        "{query?,className?,tag?,path=root,limit?}. Requires a running playtest with the runtime agent.",
+      inputSchema: {
+        name: z.enum([
+          "attributes",
+          "attribute",
+          "attributes_prefix",
+          "properties",
+          "tree",
+          "children",
+          "descendants",
+          "tagged",
+          "tags",
+          "players",
+          "place",
+          "runtime_status",
+          "search",
+        ]),
+        path: z.string().optional(),
+        attribute: z.string().optional(),
+        prefix: z.string().optional(),
+        propertyNames: z.array(z.string()).optional(),
+        maxDepth: z.number().int().min(1).max(20).optional(),
+        tag: z.string().optional(),
+        query: z.string().optional(),
+        className: z.string().optional(),
+        limit: z.number().int().min(1).max(1000).default(100),
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (q) => {
+      const reason = gateToolCall("server_query");
+      if (reason) return blocked(reason);
+      if (!isAlive("server")) {
+        return blocked("server_query requires a running playtest with the runtime agent connected (see get_playtest_status.phase)");
+      }
+      const need = (v: unknown, label: string) => (v === undefined || v === "" ? blocked(`server_query '${q.name}' requires ${label}`) : null);
+      const run = (type: string, payload: unknown) => callWithTimeout(type, "server", payload, cfg.commandTimeoutMs);
+      switch (q.name) {
+        case "attributes":
+          return need(q.path, "path") ?? run("get_attributes", { path: q.path });
+        case "attribute":
+          return need(q.path, "path") ?? need(q.attribute, "attribute") ?? run("get_attribute", { path: q.path, name: q.attribute });
+        case "attributes_prefix": {
+          const missing = need(q.path, "path") ?? need(q.prefix, "prefix");
+          if (missing) return missing;
+          const r = await enqueueAndAwait("get_attributes", "server", { path: q.path }, cfg.commandTimeoutMs);
+          if (!r.ok) return renderResult(r);
+          const attrs = ((r.result as { attributes?: Record<string, unknown> } | undefined)?.attributes ??
+            (r.result as Record<string, unknown> | undefined) ??
+            {}) as Record<string, unknown>;
+          const prefix = q.prefix as string;
+          return jsonResult({
+            path: q.path,
+            prefix,
+            attributes: Object.fromEntries(Object.entries(attrs).filter(([k]) => k.startsWith(prefix))),
+          });
+        }
+        case "properties":
+          return need(q.path, "path") ?? run("get_properties", { path: q.path, propertyNames: q.propertyNames });
+        case "tree":
+          return run("get_instance_tree", { path: q.path ?? "game", maxDepth: q.maxDepth ?? 3 });
+        case "children":
+          return need(q.path, "path") ?? run("get_instance_tree", { path: q.path, maxDepth: 1 });
+        case "descendants":
+          return run("get_descendants", { path: q.path ?? "game", maxDepth: q.maxDepth });
+        case "tagged":
+          return need(q.tag, "tag") ?? run("get_tagged", { tag: q.tag });
+        case "tags":
+          return need(q.path, "path") ?? run("get_tags", { path: q.path });
+        case "players":
+          return run("get_instance_tree", { path: "Players", maxDepth: 2 });
+        case "place":
+          return run("get_place_info", {});
+        case "runtime_status":
+          return run("get_runtime_status", {});
+        case "search":
+          return run("search_instances", {
+            query: q.query,
+            className: q.className,
+            tag: q.tag,
+            root: q.path ?? "game",
+            limit: q.limit,
+          });
+      }
+      return blocked("unknown server_query name");
+    },
+  );
+
+  server.registerTool(
+    "client_activate",
+    {
+      title: "Client Activate (fire a GuiButton by path)",
+      description:
+        "Activate a named GuiButton in the live F5 client by PlayerGui path -- no screen " +
+        "coordinates. method 'click' presses the official VirtualInput mouse at the button's live " +
+        "center; 'gamepad' selects it (GuiService.SelectedObject) and taps ButtonA; 'auto' tries " +
+        "click then gamepad if Activated did not fire. Returns whether GuiButton.Activated actually " +
+        "fired (observed on the client), the button's state before/after, and an optional " +
+        "assertion. Requires a running play-mode playtest with the client agent.",
+      inputSchema: {
+        path: z.string().min(1).describe("PlayerGui-relative or full path, e.g. 'ReadyGui.Frame.ReadyButton'"),
+        method: z.enum(["auto", "click", "gamepad"]).default("auto"),
+        holdSeconds: z.number().min(0).max(2).default(0.05),
+        waitForActivatedSec: z.number().min(0.05).max(5).default(0.75),
+        expect: objectArg()
+          .pipe(
+            z.object({
+              path: z.string().min(1),
+              property: z.enum(["visible", "effectiveVisible", "enabled", "active", "selectable", "selected", "text", "className"]),
+              equals: objectArg(),
+              afterSec: z.number().min(0).max(5).default(0.25),
+            }),
+          )
+          .optional(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (input) => {
+      const reason = gateToolCall("client_activate");
+      if (reason) return blocked(reason);
+      if (!isAlive("server")) {
+        return blocked("client_activate requires a running F5 play-mode playtest with the runtime agent");
+      }
+      return callWithTimeout("client_activate", "server", input, 20_000);
+    },
+  );
+
+  server.registerTool(
+    "reconcile_manifest",
+    {
+      title: "Reconcile Sync Manifest",
+      description:
+        "Rebase the export_scripts manifest baseline WITHOUT touching any script or file content. " +
+        "accept:'equal' (default) only rebases entries whose disk and Studio content already agree " +
+        "(byte- or whitespace-equal) so stale-manifest CONFLICTs read clean. accept:'studio' sets the " +
+        "baseline to the live Studio hash (disk edits then show as diskAhead, importable); " +
+        "accept:'disk' sets it to the disk hash (Studio edits then show as studioAhead). Optional " +
+        "paths allowlist; dryRun previews. Never runs export_scripts, never rewrites files.",
+      inputSchema: {
+        dir: z.string().optional(),
+        accept: z.enum(["equal", "studio", "disk"]).default("equal"),
+        paths: z.array(z.string().min(1)).max(500).optional(),
+        dryRun: z.boolean().default(false),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ dir, accept, paths, dryRun }) => {
+      const reason = gateToolCall("reconcile_manifest");
+      if (reason) return blocked(reason);
+      const guard = syncPlaytestGuard();
+      if (guard) return guard;
+      const target = dir || cfg.syncDir;
+      if (!target) return blocked("dir required (or set syncDir in config.json)");
+      const s = await computeSyncStatus(target);
+      if ("error" in s) return blocked(s.error);
+      const rows: RebaseRow[] = s.rows.map((row) => ({
+        relPath: row.relPath,
+        dataModelPath: row.dataModelPath,
+        state: row.state,
+        diskHash: row.diskHash,
+        studioHash: row.studioHash,
+        whitespaceEqual: row.whitespaceEqual,
+      }));
+      const outcome = rebaseManifest(s.manifest, rows, accept, paths ? new Set(paths) : undefined);
+      if (!dryRun && outcome.rebased.length) writeManifestAtomic(target, s.manifest);
+      return jsonResult({
+        dir: target,
+        accept,
+        dryRun,
+        rebased: outcome.rebased,
+        skipped: outcome.skipped,
+        counts: { rebased: outcome.rebased.length, skipped: outcome.skipped.length },
+        written: !dryRun && outcome.rebased.length > 0,
+      });
+    },
+  );
+
+
   server.registerTool(
     "get_status",
     {
       title: "Get Status",
       description:
-        "Report which Studio contexts are connected, plus the runtime agent's " +
-        "recent self-diagnostics (diag: connect/poll/error/shutdown events).",
+        "Report bridge port, edit/runtime/client connection state, current playtest " +
+        "status, active place, and recent runtime self-diagnostics.",
       inputSchema: {},
     },
     async () => ({
-      content: [
-        {
-          type: "text" as const,
-          text: JSON.stringify(
-            { edit: isAlive("edit"), server: isAlive("server"), diag: getDiag() },
-            null,
-            2
-          ),
-        },
-      ],
+      content: [{ type: "text" as const, text: JSON.stringify(await canonicalPlaytestStatus(), null, 2) }],
     })
+  );
+
+  server.registerTool(
+    "get_studio_targets",
+    {
+      title: "Get Studio Targets",
+      description:
+        "List every reachable Roblox Studio window across the configured bridge-port range. " +
+        "Returns identity-pinned target ids, exact ports, PID/window title when Windows can resolve them, " +
+        "place/universe/file metadata, edit/runtime state, health, and the currently selected target.",
+      inputSchema: {},
+    },
+    async () => {
+      const targets = await discoverStudioTargets();
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            selectedTarget: getSelectedStudioTarget(),
+            localBridgePort: getBoundPort(),
+            count: targets.length,
+            targets,
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  server.registerTool(
+    "select_studio_target",
+    {
+      title: "Select Studio Target",
+      description:
+        "Pin all subsequent Studio calls to one exact Studio session by target id or bridge port. " +
+        "The pin fails closed if that port later belongs to a different Studio window.",
+      inputSchema: {
+        targetId: z.string().min(1).optional(),
+        bridgePort: z.number().int().min(1).max(65535).optional(),
+      },
+    },
+    async ({ targetId, bridgePort }) => {
+      try {
+        const target = await selectStudioTarget({ targetId, bridgePort });
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify({ selected: true, target }, null, 2) }],
+        };
+      } catch (e) {
+        return blocked(e instanceof Error ? e.message : String(e));
+      }
+    }
   );
 
   const transport = new StdioServerTransport();

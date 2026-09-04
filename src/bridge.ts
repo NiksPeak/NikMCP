@@ -4,13 +4,31 @@ import type { Server } from "node:http";
 import type { AppConfig } from "./config.js";
 import { HOST, setRoCreateApiKey } from "./config.js";
 import type { Context, CommandResult } from "./types.js";
-import { dequeue, resolveResult, markSeen, isAlive } from "./queue.js";
-import { setSettings, checkAuth } from "./settings.js";
+import {
+  dequeue,
+  resolveResult,
+  markSeen,
+  isLocalAlive,
+  localContextAgeMs,
+  enqueueLocalAndAwait,
+} from "./queue.js";
+import { setSettings, checkAuth, gateToolCall } from "./settings.js";
+import {
+  claimLocalTargetId,
+  getLocalTargetIdentity,
+  resolveWindowsStudioProcess,
+  setLocalTargetIdentity,
+  wouldAcceptTargetId,
+} from "./studio-targets.js";
 import {
   unlock as rocreateUnlock,
   lock as rocreateLock,
   setCookieSecret,
 } from "./rocreate-secrets.js";
+import {
+  INTERNAL_ROUTE_HEADER,
+  verifyInternalRouteToken,
+} from "./internal-auth.js";
 
 const log = (...args: unknown[]) => console.error("[bridge]", ...args); // stderr only
 
@@ -115,6 +133,19 @@ function authed(req: Request, res: Response): boolean {
   return false;
 }
 
+function targetClaimed(req: Request, res: Response): boolean {
+  const targetId = req.header("x-mcp-target-id") ?? "";
+  if (!targetId) {
+    res.status(400).json({ ok: false, error: "x-mcp-target-id header required" });
+    return false;
+  }
+  if (!claimLocalTargetId(targetId, isLocalAlive("edit") || isLocalAlive("server"))) {
+    res.status(409).json({ ok: false, error: "bridge is leased to a different live Studio target" });
+    return false;
+  }
+  return true;
+}
+
 export function startBridge(cfg: AppConfig): void {
   const app = express();
   app.use(express.json({ limit: "16mb" }));
@@ -132,13 +163,157 @@ export function startBridge(cfg: AppConfig): void {
   app.get("/poll", (req, res) => {
     if (!authed(req, res)) return;
     const ctx = asContext(req.query.context);
+    const targetId = typeof req.query.targetId === "string" ? req.query.targetId : "";
+    if (!targetId) {
+      res.status(400).json({ ok: false, error: "targetId query parameter required" });
+      return;
+    }
+    if (!claimLocalTargetId(targetId, isLocalAlive("edit") || isLocalAlive("server"))) {
+      res.status(409).json({
+        ok: false,
+        error: "bridge is leased to a different live Studio target",
+      });
+      return;
+    }
     markSeen(ctx);
-    res.json({ command: dequeue(ctx) ?? null, edit: isAlive("edit"), server: isAlive("server") });
+    // v0.2.0: a context that is still executing a long-running command keeps
+    // polling with busy=1 so liveness never lapses mid-yield; it must not be
+    // handed a second command until the first result has been posted.
+    if (req.query.busy === "1") {
+      res.json({ command: null, edit: isLocalAlive("edit"), server: isLocalAlive("server"), busy: true });
+      return;
+    }
+    res.json({
+      command: dequeue(ctx) ?? null,
+      edit: isLocalAlive("edit"),
+      server: isLocalAlive("server"),
+    });
+  });
+
+  // A Studio window identifies itself after claiming the bridge with targetId.
+  // The OS process lookup runs while this outbound Studio HTTP socket is still
+  // established, letting Windows map the ephemeral peer port back to the exact
+  // RobloxStudioBeta PID, title, and optional -file path.
+  app.post("/target/identity", async (req, res) => {
+    if (!authed(req, res)) return;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const targetId = typeof body.targetId === "string" ? body.targetId : "";
+    const studioSessionId = typeof body.studioSessionId === "string" ? body.studioSessionId : "";
+    if (!targetId || !studioSessionId) {
+      res.status(400).json({ ok: false, error: "targetId and studioSessionId required" });
+      return;
+    }
+    if (!claimLocalTargetId(targetId, isLocalAlive("edit") || isLocalAlive("server"))) {
+      res.status(409).json({ ok: false, error: "bridge is leased to a different live Studio target" });
+      return;
+    }
+    const processInfo = await resolveWindowsStudioProcess(req.socket.remotePort, boundPort);
+    setLocalTargetIdentity(
+      {
+        targetId,
+        studioSessionId,
+        placeId: typeof body.placeId === "number" ? body.placeId : 0,
+        universeId: typeof body.universeId === "number" ? body.universeId : 0,
+        placeName: typeof body.placeName === "string" ? body.placeName : "",
+      },
+      processInfo
+    );
+    res.json({ ok: true, targetId });
+  });
+
+  // Read-only target descriptor used by get_studio_targets and by the
+  // identity pin before every selected call.
+  app.get("/target", (req, res) => {
+    if (!authed(req, res)) return;
+    const identity = getLocalTargetIdentity();
+    if (!identity) {
+      res.status(503).json({ ok: false, error: "no Studio target has identified itself" });
+      return;
+    }
+    const editAlive = isLocalAlive("edit");
+    const serverAlive = isLocalAlive("server");
+    res.json({
+      kind: "nikmcp-studio-target",
+      targetId: identity.targetId,
+      studioSessionId: identity.studioSessionId,
+      bridgePort: boundPort,
+      windowTitle: identity.windowTitle,
+      studioPid: identity.pid,
+      placeId: identity.placeId,
+      universeId: identity.universeId,
+      placeName: identity.placeName,
+      placeFilePath: identity.filePath,
+      state: serverAlive ? "runtime" : editAlive ? "edit" : "disconnected",
+      health: {
+        bridge: boundPort !== null,
+        plugin: editAlive,
+        runtimeAgent: serverAlive,
+        editAgeMs: localContextAgeMs("edit"),
+        serverAgeMs: localContextAgeMs("server"),
+      },
+      connectedToThisMcp: true,
+      selected: false,
+    });
+  });
+
+  // Authenticated loopback proxy for explicit cross-port selection. The peer
+  // bridge re-applies its own Studio settings gate and refuses identity drift.
+  app.post("/invoke", async (req, res) => {
+    if (!authed(req, res)) return;
+    if (!verifyInternalRouteToken(req.header(INTERNAL_ROUTE_HEADER))) {
+      res.status(403).json({ ok: false, error: "internal Studio routing capability required" });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const identity = getLocalTargetIdentity();
+    if (!identity || body.expectedTargetId !== identity.targetId) {
+      res.status(409).json({ ok: false, error: "selected Studio target identity changed" });
+      return;
+    }
+    const type = typeof body.type === "string" ? body.type : "";
+    const context = body.context === "server" ? "server" : body.context === "edit" ? "edit" : null;
+    if (!type || !context) {
+      res.status(400).json({ ok: false, error: "type and valid context required" });
+      return;
+    }
+    const payload = body.payload as Record<string, unknown> | undefined;
+    const gateAs = typeof payload?.gateAs === "string" ? payload.gateAs : null;
+    const gateName =
+      gateAs && (gateAs === "edit_script" || gateAs === "restore_script_backup" || gateAs === "run_harness")
+        ? gateAs
+        : type === "client_query" && payload?.name === "input_sequence"
+          ? "client_input_sequence"
+          : type === "client_query" && payload?.name === "activate_gui"
+            ? "client_activate"
+            : type === "client_activate"
+              ? "client_activate"
+              : type === "sync_set_sources"
+                ? "import_scripts"
+                : type;
+    const gateReason = gateToolCall(gateName);
+    if (gateReason) {
+      res.status(403).json({ ok: false, error: gateReason });
+      return;
+    }
+    const timeoutMs = Math.max(250, Math.min(120_000, Number(body.timeoutMs) || 30_000));
+    try {
+      const result = await enqueueLocalAndAwait(
+        type,
+        context,
+        body.payload,
+        timeoutMs,
+        identity.targetId,
+      );
+      res.json(result);
+    } catch (e) {
+      res.status(504).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
   });
 
   // Studio returns a completed command result here.
   app.post("/response", (req, res) => {
     if (!authed(req, res)) return;
+    if (!targetClaimed(req, res)) return;
     resolveResult(req.body as CommandResult);
     res.sendStatus(200);
   });
@@ -147,6 +322,7 @@ export function startBridge(cfg: AppConfig): void {
   // Authed exactly like /response. Reassemble by id; resolve once complete.
   app.post("/response-chunk", (req, res) => {
     if (!authed(req, res)) return;
+    if (!targetClaimed(req, res)) return;
     const { id, seq, total, part } = (req.body ?? {}) as {
       id?: string;
       seq?: number;
@@ -170,6 +346,7 @@ export function startBridge(cfg: AppConfig): void {
   // Plugin pushes the tool-gating settings here (on connect + on every change).
   app.post("/settings", (req, res) => {
     if (!authed(req, res)) return; // allowed until a token is adopted (TOFU)
+    if (!targetClaimed(req, res)) return;
     setSettings(req.body ?? {});
     res.json({ ok: true });
   });
@@ -234,10 +411,27 @@ export function startBridge(cfg: AppConfig): void {
 
   // Lightweight liveness + which contexts are connected (drives status UI).
   // Not authed: harmless, and the plugin probes it before settings are pushed.
+  // v0.2.0: with ?targetId= the answer also says whether THIS bridge would
+  // accept that Studio window (lease-aware) and whether the caller's token is
+  // valid, so a runtime agent can pick the right bridge up front instead of
+  // discovering the wrong one through a 401/409 busy-loop. Read-only: never
+  // claims, never markSeen.
   app.get("/heartbeat", (req, res) => {
-    const ctx = asContext(req.query.context);
-    markSeen(ctx);
-    res.json({ ok: true, edit: isAlive("edit"), server: isAlive("server") });
+    const targetId = typeof req.query.targetId === "string" ? req.query.targetId : "";
+    const base: Record<string, unknown> = {
+      ok: true,
+      edit: isLocalAlive("edit"),
+      server: isLocalAlive("server"),
+      port: boundPort,
+    };
+    if (targetId) {
+      const lease = wouldAcceptTargetId(targetId, isLocalAlive("edit") || isLocalAlive("server"));
+      base.accepts = lease.accepts;
+      base.exact = lease.exact;
+      base.leasedTargetId = lease.leasedTargetId;
+      base.tokenOk = checkAuth(req.header("x-mcp-token"));
+    }
+    res.json(base);
   });
 
   // Agent self-diagnostics sink. Not authed (harmless on 127.0.0.1) and does NOT

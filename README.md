@@ -1,6 +1,6 @@
 # Roblox Studio MCP (dual-context)
 
-**Version 0.1.7** — July 6, 2026.
+**Version 0.2.0** - September 3, 2026.
 
 A local AI-to-Studio bridge. An MCP client (Claude Desktop / Claude Code / Cursor) calls tools
 like `run_luau` or `get_instance_tree`; the call travels **MCP client → (stdio) → Node MCP
@@ -36,10 +36,15 @@ MCP client ──stdio──▶ Node process ─┬─ MCP server (stdio)
 | `src/config.ts` | Port precedence: `--port` > `ROBLOX_STUDIO_PORT`/`PORT` env > `config.json` > `58741` |
 | `src/types.ts` | Shared `Command` / `CommandResult` / `Context` types |
 | `src/queue.ts` | Per-context queues, correlation IDs, timeouts, `chooseContext` routing |
-| `src/bridge.ts` | Express `/poll` `/response` `/heartbeat` `/settings`, context-aware, optional auth |
+| `src/bridge.ts` | Express `/poll` `/response` `/heartbeat` `/settings` plus identity-pinned `/target` and `/invoke`, context-aware, optional auth |
+| `src/studio-targets.ts` | Multi-window Studio discovery, explicit selection, PID/title enrichment, and fail-closed cross-port routing |
+| `src/environment-manifest.ts` | Safe local JSON manifest loader for Blender chunk assembly |
+| `src/creator-store.ts` | Official Creator Store search/details client, guarded target allowlist, and one-time scan grants |
+| `src/agent-analysis.ts` | Deterministic task-context, change-impact, and code-health analysis with hard caps |
+| `src/script-patchset.ts` | Exact patch transforms plus target-bound, expiring, one-use transaction plans |
 | `src/settings.ts` | In-memory tool gating + flags (plugin is source of truth; server enforces) |
 | `src/mcp-server.ts` | MCP server + tools (every `tools/call` gated by settings) |
-| `plugin/src/*.luau` | Edit plugin: `init.server`, `Config`, `Settings`, `Serializer`, `Executor`, `StatusWidget`, `RuntimeAgentSource`, `ClientAgentSource` |
+| `plugin/src/*.luau` | Edit plugin: core executor/runtime/client modules plus isolated `AnalysisTools`, `EnvironmentTools`, `AssetGuardTools`, `QATools`, and `AgentTools` modules |
 | `plugin/plugin.project.json` | Rojo project (build target) |
 | `scripts/install-plugin.{sh,ps1}` | Build the `.rbxmx` into the local Plugins folder |
 
@@ -52,6 +57,8 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | Tool | Kind | Context | Notes |
 |------|------|---------|-------|
 | `run_luau` | write | auto / edit / server | print output + returned value (serialized) |
+| `get_studio_targets` | meta | Node + edit/runtime health | list every reachable Studio target with stable target id, bridge port(s), PID/title/file path when Windows can resolve them, place/universe, state, and health |
+| `select_studio_target` | meta | Node routing | pin subsequent calls to one target id or bridge port; refuses port identity drift instead of silently switching windows |
 | `get_instance_tree` | read | auto / edit / server | depth-limited tree from a dot path |
 | `read_console` | read | auto / edit / server / **client** | recent Output via `LogService` history + live ring buffer; `count`, `levelFilter`; `context="client"` drains the F5 **play-mode** client's ring, relayed to the server agent over `NikMCP_ClientRelay` |
 | `get_selection` | read | edit | current `Selection:Get()` as paths |
@@ -62,8 +69,18 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `get_tagged` | read | auto / edit / server | `CollectionService:GetTagged(tag)` |
 | `get_properties` | read | auto / edit / server | **curated** common-property dump (not exhaustive); optional `propertyNames` |
 | `set_property` | write | auto / edit / server | edit context wraps in undo history |
-| `write_script` | write | edit only | `ScriptEditorService:UpdateSourceAsync` |
+| `write_script` | write | edit only | `ScriptEditorService:UpdateSourceAsync`; `source` inline or `sourceFile` from disk; previous source auto-backed up |
+| `edit_script` | write | edit only | **v0.2.0** exact `oldString`->`newString` (must match once unless `replaceAll`/`expectedMatches`) or unified-diff `patch`; luau-lsp gated; hash-checked write; returns diff + hashes; `dryRun` |
+| `list_script_backups` / `restore_script_backup` | read / write | edit only | **v0.2.0** in-memory pre-write backups taken by every source-writing tool; restore is `confirm:true` + hash-checked |
+| `run_harness` | write | edit + server | **v0.2.0** set gate attribute -> arm -> play -> wait `<prefix>_Done` -> return `<prefix>*` attributes + filtered/pinned output -> stop -> restore gate |
+| `server_query` | read | server | **v0.2.0** loadstring-free live-server reads: attributes, attributes_prefix, properties, tree, children, descendants, tagged, tags, players, place, runtime_status, search |
+| `client_activate` | write | client (via server) | **v0.2.0** fire a named GuiButton (click / gamepad / auto) and report whether `Activated` really fired |
+| `reconcile_manifest` | write (disk only) | edit | **v0.2.0** rebase the sync manifest baseline (`equal` / `studio` / `disk`, `paths`, `dryRun`) without touching any file or script |
+| `get_luau_job` | read | Node | **v0.2.0** poll a `run_luau async:true` job |
 | `set_selection` | write | edit | `Selection:Set(paths)` |
+| `prompt_save_selection` | write | edit | opens Studio's native Save Selection dialog for the current selection, or first selects `paths`; use for RBXM/RBXMX backups such as `StarterGui.MainMenu` / `StarterGui.GameHUD` (Studio still requires confirming the file dialog) |
+| `backup_selection` | write | edit | clone explicit paths or the current selection into `ServerStorage.NikMCPBackups.<name>`; preserves descendants, attributes, transforms, material children, and non-Archivable descendants; collisions require `replace:true` |
+| `restore_backup` | write | edit | restore only one named backup to recorded parent paths; requires `confirm:true`, retains the backup, and refuses existing-name collisions unless `replaceExisting:true` |
 | `create_instance` | write | auto / edit / server | `{ className, parentPath, name?, properties? }` |
 | `delete_instance` | write | auto / edit / server | destroy at path |
 | `clone_instance` | write | auto / edit / server | `{ path, parentPath? }` |
@@ -72,7 +89,7 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `move_instance` | write | auto / edit / server | `{ path, cframe \| position }` (Model uses `PivotTo`) |
 | `bulk_set_property` | write | auto / edit / server | one undoable batch over `paths[]` |
 | `tag_instance` / `untag_instance` | write | auto / edit / server | CollectionService add/remove |
-| `insert_asset` | write | auto / edit / server | `InsertService:LoadAsset(assetId)` then parent (owned/public only) |
+| `insert_asset` | write | auto / edit / server | legacy direct insertion with no risk scan; preserved for compatibility, but new workflows should use `inspect_creator_store_asset` then `guarded_insert_asset` |
 | `enable_playtest_agent` | write | edit only | arm the runtime agent before F5 |
 | `get_attribute` / `get_attributes` | read | auto / edit / server | `Instance:GetAttribute(s)` |
 | `set_attribute` / `set_attributes` | write | auto / edit / server | set one / many attributes (one undo) |
@@ -83,9 +100,11 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `find_and_replace_in_scripts` | write | edit only | find/replace across scripts under a root (`regex?`) |
 | `grep_scripts` | read | auto / edit / server | matches `{ path, line, text }` under a root (`regex?`) |
 | `get_script_analysis` | read | auto / edit / server | compile-check (loadstring) syntax diagnostics |
+| `plan_script_patchset` | read | edit only, Node preflight | exact literal/line/full-source multi-script plan; compile-gates every result and returns diffs plus a 10-minute one-use token bound to the selected Studio target |
+| `apply_script_patchset` | write | edit only | confirmed transactional apply with before-hash checks repeated inside `UpdateSourceAsync`, post-write verification, and guarded hash-verified rollback of every touched script on failure; source writes are not Studio-undoable |
 | `export_scripts` | read | edit only | dump all scripts under `root` (default: the 8 script-bearing services) to a disk tree with Rojo-style names + a `nikmcp-sync.json` manifest — see **Script sync** |
 | `sync_status` | read | edit only | three-way drift report per exported file: clean / diskAhead / studioAhead / CONFLICT / missing — see **Script sync** |
-| `import_scripts` | write | edit only | apply diskAhead files back to Studio in ONE undo step; any conflict aborts everything with a diff; sources Luau-analyzed first — see **Script sync** |
+| `import_scripts` | write | edit only | apply diskAhead files as one hash-guarded, rollback-verified transaction; any conflict aborts everything with a diff; sources Luau-analyzed first; source writes are not Studio-undoable - see **Script sync** |
 | `undo` / `redo` | write | edit only | `ChangeHistoryService:Undo()/Redo()` |
 | `mass_create_objects` | write | auto / edit / server | create many in one undo (`items[]`) |
 | `mass_duplicate` | write | auto / edit / server | clone `count` times, cumulative `offset?` |
@@ -102,6 +121,9 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `remote_inventory` | read | auto / edit / server | every Remote/Bindable Event/Function under `root` + a name-matched usage scan across all scripts (`FireServer`/`InvokeServer`/`OnServerEvent`/.../`WaitForChild`/`FindFirstChild`); shared names marked `ambiguous` |
 | `datastore_inventory` | read | auto / edit / server | scans scripts for `GetDataStore`/`GetOrderedDataStore`/`GetGlobalDataStore`/MemoryStore declarations + `GetAsync`/`SetAsync`/.../`GetSortedAsync` calls, grouped by store name (non-literal names `dynamic:true`) |
 | `require_graph` | read | auto / edit / server | every `require()` call site, best-effort resolved against the live DataModel (`game.X.Y`, `game:GetService`, `script.Parent.X`, `WaitForChild`/`FindFirstChild`); numeric asset ids and unresolved expressions reported separately; `topRequired` + simple cycle detection |
+| `task_context_bundle` | read | edit only, Node composite | ranked live task context with bounded excerpts, source hashes, require neighbors, remote/DataStore peers, and explicit relevance reasons |
+| `change_impact_report` | read | edit only, Node composite | direct/transitive dependency and dependent fan-out, contract peers, literal references, cycles, risk score, and focused regression recommendations |
+| `code_health_report` | read | edit only, Node analysis | capped deterministic scan for deprecated globals, numeric requires, risky persistence/remotes, TODOs, oversized scripts, and exact duplicate source groups |
 | `monetization_map` | read | Node composite | code scan (`PromptProductPurchase`/`PromptGamePassPurchase`/`UserOwnsGamePassAsync`/`GetProductInfo`/`ProcessReceipt`/id-like bindings) merged with live developer products + game passes (`universeId`, needs a RoCreate key) -- marks each live item `wired` and each code id `orphanCode`; degrades to code-only with a `note` when `universeId`/key is missing |
 | `place_digest` | read | Node composite | one-call project overview: `get_project_structure` + script/tag/workspace/StarterGui/sound/animation counts + `remote_inventory` + `datastore_inventory` + a monetization code scan, as a short human-readable summary followed by the full merged JSON; `include` skips heavy parts |
 | `ui_style_fingerprint` | read | auto / edit / server | fingerprints StarterGui's (or `root`'s) art style: fonts, UICorner sharp/rounded/pill buckets, UIStroke thickness/color, UIGradient color pairs, a quantized background/text/image color histogram, a shadow-name heuristic, layout hygiene (Scale vs Offset usage, padding/list/grid/aspect-ratio counts), and distinct image ids; Node classifies a `styleClass` (flat/rounded-soft/bubbly/pill-heavy/mixed/skeuo-textured) + a reusable token set |
@@ -116,7 +138,9 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `get_asset_thumbnail` | read | auto / edit / server | `rbxthumb://` content id for an asset |
 | `preview_asset` | read | auto / edit / server | product info + thumbnail content id |
 | `search_materials` | read | auto / edit / server | `Enum.Material` names (`query?`) |
-| `search_assets` | read | — | **unsupported from a plugin** (needs Open Cloud / web catalog API); clear error |
+| `search_assets` | read | Node-side Creator Store API | search-only discovery with model/audio/decal/plugin/mesh/video/font types, verified/creator filters, ratings/relevance sorts, pagination, and a 1-100 result cap; never inserts |
+| `inspect_creator_store_asset` | read | Node metadata + edit quarantine scan | requires `assetId` and intended `targetPath`; fetches official metadata, loads the model unparented, scans hierarchy/source/remotes/obfuscation/network/loader signatures, destroys it, and returns a 10-minute one-time `scanToken` bound to the asset, target, and content fingerprint |
+| `guarded_insert_asset` | write | edit only | requires explicit `assetId`, allowlisted `targetPath`, matching `scanToken`, and `confirm:true`; reloads/rescans, refuses fingerprint drift, quarantines all scripts and remotes under `ServerStorage.NikMCPQuarantine`, and post-scans inserted roots; critical findings require a separate `allowCriticalRisk:true` acknowledgement |
 | `list_library` | read | — | **unsupported from a plugin** (needs Open Cloud); clear error |
 | `upload_decal` | write | — | still unsupported directly (no decal-specific Open Cloud endpoint) — **use `upload_asset`** (`assetType:"Image"`/`"Decal"`) instead, now supported via Open Cloud; see below |
 | `upload_asset` | write | — (Node-side, Open Cloud) | uploads bytes (`filePath` or base64 `content`) via the Open Cloud Assets API: `{ assetType: Image\|Decal\|Audio\|Model, filePath?, content?, contentType?, displayName, description?, applyTo?: {path, property} }` -> `{ assetId, assetUri: "rbxassetid://<id>", moderationState, applied? }`; 20 MB/file cap; `applyTo` calls the existing `set_property` after upload; honest `"not configured"` without a key (see **Open Cloud setup** below) |
@@ -125,15 +149,21 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `orbit_capture` | experimental | edit (pinned), Node composite | frame `path` from up to 6 fixed angles (`front`/`back`/`left`/`right`/`top`/`iso`, default `[front,right,top,iso]`) via `get_bounding_box` + `set_camera` + `capture_viewport`, one PNG per angle; saves the camera first and always restores it after, even on error. Zero new plugin code |
 | `selection_capture` | experimental | edit (pinned) | screenshot with each target instance temporarily wrapped in a `Highlight` (distinct color per target, 8-color palette) and optionally auto-framed on their combined bounding box; defaults to the current Studio selection when `paths` is omitted. Highlights + camera are always torn down/restored, even on error. Returns the PNG plus a `legend` (`path` -> `colorHex`) |
 | `visual_diff` | experimental | edit (pinned), Node composite | in-memory visual regression check (baselines live only for this server process, LRU-capped at 8 labels — not persisted to disk). `mode:"baseline"` optionally frames `path` (same `iso` angle as `orbit_capture`) and stores a capture + the camera used under `label`; `mode:"compare"` replays that exact camera, recaptures, and reports percent-of-pixels-changed (>12 max-channel-delta threshold), mean delta, and the changed-region bounding box — a dimension mismatch is reported as text instead of bogus stats |
-| `ui_capture` | experimental | — | **unsupported**: pixel-level GUI capture needs the F5 play-mode client, but the client agent is a fixed, intentionally-closed introspection whitelist (`fps`/`camera`/`gui_tree`/`local_player`/`ping`), not a general command executor — adding pixel capture there would mean opening up arbitrary client-side logic. Use `client_query name:"gui_tree"` for GUI structure meanwhile |
+| `ui_capture` | experimental | — | **unsupported**: the fixed F5 client protocol has no pixel-capture path. Use `runtime_ui_regression` for truthful live state/layout evidence or `client_query` for focused structure/layout reads |
 | `playtest_gif` | experimental | — | **unsupported** for the same reason as `ui_capture` (same client-side pixel-capture dependency); would otherwise loop client captures and encode an animated GIF Node-side |
-| `playtest_control` | experimental | edit | start/stop the in-Studio sim (`mode='run'` → `RunService:Run()/Stop()`); `mode='play'` (Play Solo / players) unsupported |
+| `playtest_control` | experimental | edit / server stop | start StudioTestService `run`, `play`, or true `multiplayer` mode (1-8 clients plus one server). Stop uses the settled handshake: edit restored, RunService stopped, runtime agents disconnected, and runtime session id cleared |
+| `stop_playtest` | experimental | edit / server stop | dedicated alias for the settled stop handshake. Prefer this over raw `playtest_control action:"stop"` when ending runtime verification |
+| `get_settled_runtime_status` | meta | selected edit/runtime target | engine-truth `RunService:IsRunning()`, DataModel state, server/client agent attachment, exact target/place/universe/port, stale runtime state, and settlement-complete proof |
+| `stop_playtest_settled` | write | selected edit/runtime target | explicit stop states (`stop_requested`, `runservice_stopped`, `edit_mode_confirmed`, server/client disconnected, stale state cleared) plus actionable timeout diagnostics |
 | `get_playtest_output` | experimental | edit / server | drain/peek the playtest log buffer; **during an active F5 playtest, reads the live server agent's ring** (plus a `client` array when the client relay has entries) instead of the stale edit-time buffer; Run mode's `client` is always `[]` with a `"run mode has no client"` note |
-| `simulate_keyboard_input` / `simulate_mouse_input` | experimental | — | `VirtualInputManager` is **RobloxScriptSecurity-restricted**; returns a clear reason when blocked |
+| `simulate_keyboard_input` / `simulate_mouse_input` | experimental | F5 client | compatibility wrappers over official `VirtualInput`; keyboard tap/down/up and mouse move work, while unsafe isolated mouse down/up is refused in favor of bounded click cleanup |
 | `character_navigation` | experimental | server | `Humanoid:MoveTo(position)`; needs a running playtest (use `context:"server"`) |
 | `create_keyframe_sequence` | write | edit only | build a `KeyframeSequence` (Keyframe/Pose tree) from JSON for **manual upload** — collected in a shared folder (default `ServerStorage/GeneratedAnimations`, or under `parentPath`/`folderName`) so you can right-click → **Save to Roblox** or open it in the **Animation Editor**. One undo. Poses matched to a rig by part name at **playback** time. `registerPreview` returns a **temporary, session-only** `tempAnimationId` for in-Studio preview only (not a permanent `AnimationId`) |
 | `play_animation` | write | **server only** | play an `AnimationId` on a live rig's `Animator` during an F5 playtest (`target` = rig path or `"player"`). Returns `AnimationTrack.Length`. Under `context:"edit"` returns a specific "requires a running playtest" error. Surfaces the real engine error (nil character, no Animator, asset not loaded) |
-| `client_query` | read | **client (F5 play only)** | fixed read-only queries relayed from the live playtest client over `NikMCP_ClientRelay`: `fps` (RenderStepped avg), `camera` (CFrame + FOV), `gui_tree` (`maxDepth?`), `local_player` (character/HRP/Humanoid state), `ping`; unknown `name` lists the valid set; 5s timeout returns `"client agent not connected"` (Run mode, or no client yet) |
+| `client_query` | read | **client (F5 play only)** | fixed read-only queries relayed from the live client: `fps`, `camera`, `gui_tree`, `gui_object`, `ui_regression`, `local_player`, and `ping`. `ui_regression` inspects live PlayerGui screen-space state; arbitrary client eval remains unavailable |
+| `client_input_sequence` | write | F5 client | bounded official VirtualInput flow: key, move, click, text, wheel/pan/pinch, wait, and PlayerGui assertion steps; PlayerGui-only path targets, per-step evidence, timeout, and stuck-key/button cleanup |
+| `scene_analysis_snapshot` | read | F5 server / client / both | engine-native instance composition, script memory, unparented instances, triangle/draw-call composition, animation memory, and audio memory with depth/node/byte/timeout caps |
+| `capture_script_profile` | read | edit plugin driving active F5 | bounded server or first-client ScriptProfilerService capture; returns deserialized capped evidence and always stops/disconnects profiling resources; do not overlap Studio's global manual profiler |
 | `verify_playtest` | write | edit (drives a playtest) | composite self-correcting loop: start playtest -> optional `setupScript` -> `assertScript` (**must** return `{ passed, failures }`) -> optional `clientChecks` (`client_query` calls, play mode only; `skipped:"no client"` in run mode) -> drain server + client errors -> **always stops the playtest it started** (unless `keepRunning`), even on timeout/throw. `{ mode, setupScript?, assertScript, clientChecks?, timeoutSec?, keepRunning? }` -> `{ passed, failures, checks, serverErrors, clientErrors, durationSec, stopped }` |
 | `create_sound` | write | edit | convenience wrapper over `create_instance`: a `Sound` under `parentPath` with validated props (coerced `soundId`, volume clamped 0-10, rollOff enum). One undo. `playOnCreate` previews via `:Play()` |
 | `set_lighting` | write | edit | convenience over `set_properties` on `Lighting` + optional child effects (Atmosphere/Sky/Bloom/ColorCorrection/DepthOfField/SunRays, one per class). Tagged Color3/Vector3 via serializer; rejects unknown property/effect names. One undo |
@@ -142,10 +172,34 @@ reaches Studio. "Write" tools also respect **read-only mode**.
 | `playtest_smoke` | write | edit (drives a playtest) | composite: generalizes `verify_playtest` into an ordered smoke-test script — starts Run mode, optional `setupLuau` once, then each `steps[].luau` IN ORDER via `run_luau` context=`server` (falsy Luau return fails a step unless `expectTruthy:false`); the FIRST failed step aborts the rest, but the playtest is still stopped (`stopAfter`) and output still drained (`collectOutput`). `{ steps: [{ luau, description?, expectTruthy?, timeoutMs? }], setupLuau?, numPlayers?, stopAfter?, collectOutput? }` -> `{ passed, stepsPassed, stepsTotal, results, serverErrors, outputTail, durationSec, stopped }` |
 | `snapshot_revert` | write | edit (`export_build`/`import_build` under the hood) | in-memory (this process only, LRU-capped at 6 labels) subtree snapshot/diff/revert. `mode:"snapshot"` (`path`+`label`) stores an `export_build`; `mode:"diff"` (`label`) re-exports and reports `addedInstances`/`removedInstances`/`changedInstances` (cap 200 entries, 20 changed props/instance); `mode:"revert"` (`label`) **DESTRUCTIVE** — deletes the current instance then reimports the stored build under its recorded parent (refuses bare top-level paths like `"Workspace"`/`"game"`; if import fails post-delete the snapshot is kept for a retry); `mode:"list"` returns stored labels + metadata |
 | `multiplayer_eval` | write | server (`serverLuau`) / client (`clientQuery`) | hybrid multiplayer introspection: `serverLuau` runs arbitrary code in the F5 server context (same mechanism as `run_luau`, sees every connected peer via `Players:GetPlayers()`); `clientQuery` routes one existing `client_query` name to the F5 client, but the client relay hard-binds to a single player as an anti-forgery measure, so `allPeers:true` / `clientQuery.playerName` are honestly **rejected**, not silently ignored — no arbitrary client eval or true multi-client targeting is added |
+| `run_multi_client_qa` | write | edit orchestrator + multiplayer server/clients | true `ExecuteMultiplayerTestAsync` runner for 1-8 clients. Supports serializable `testArgs`, waits/checkpoints, `AddPlayers`, targeted client `LeaveTest`, server Luau assertions, per-step timeouts/results, output drain, teardown Luau, and an always-settled stop. Refuses an active or stale previous test |
+| `runtime_ui_regression` | write | edit device simulator + F5 client | sweeps phone portrait, phone landscape, tablet portrait, and desktop by default. For each profile it inspects live PlayerGui clipping, offscreen layout, interactive overlap, touch targets, safe area, heavy Offset sizing, and constraints, then settles before the next device. Returns state/layout evidence only; screenshots are explicitly unsupported |
+| `assemble_imported_chunks` | write | edit only | dry-run-first Blender FBX chunk reassembly: preserves X/Z, reconstructs Y from inline/disk manifest or a reference chunk, groups requested roots, records original pivots/deltas, optionally backs up, and anchors parts |
+| `audit_environment` | read | edit only | structured severity audit for likely Z-fighting, floating pieces, deep intersections, duplicates, unanchored parts, scale distortion, scene-bounds escapes, texture dependencies, and opt-in capped `EditableMesh:GetFaces()` triangle counts |
+| `inspect_texture_health` | read | edit only | per-mesh MeshId/TextureID/SurfaceAppearance/MaterialVariant dependency report with usage counts and fallback-material findings; explicitly does not claim to repair Blender UVs |
+| `world_health_report` | read | edit only, Node composite | normalized read-only report combining environment and texture scans: exact paths, issue type, severity, detail, recommendation, current engine asset-fetch failures, anchoring/support/overlap/scale/bounds/material state, and invisible collision. It never auto-anchors or rewrites gameplay geometry |
 | `rocreate_*` (9 tools) | read/write | Node + edit | password-gated reupload of YOUR OWN assets/dev-products/game-passes/animations under a per-run creator — see **RoCreate** |
-| `get_status` | meta | — | `{ edit, server }` connectivity (ungated) |
+| `get_status` | meta | — | canonical selected-target bridge/runtime status: target id/title/PID, bridge port, edit plugin, F5 server/client agents, player count, active place, and recent runtime diag (ungated) |
+| `wait_for_state` | read | edit / server / client GUI/console | bounded declarative polling for instance existence, property/attribute equality, player count, runtime state, console text, and PlayerGui fields; requires consecutive stable samples and returns observations |
 
 `context: "auto"` (the default) targets the **running F5 server** when it's alive, else the editor.
+
+### Guarded Creator Store workflow
+
+1. Call `search_assets` only to discover candidates.
+2. Call `inspect_creator_store_asset` with the exact `assetId` and intended `targetPath`.
+3. Review metadata, hierarchy, every script/remote path, signature findings, and the honest risk limitation.
+4. Call `guarded_insert_asset` with the returned one-time `scanToken`, the same asset and target, and `confirm:true`.
+5. Inspect `postInsertScan`. Review anything moved to `ServerStorage.NikMCPQuarantine` manually before enabling or relocating it.
+
+Allowed targets are `Workspace`, `ServerStorage`, `Lighting`, `SoundService`, and explicit `ReplicatedStorage.Assets`, `.Content`, `.Models`, or `.Packages` descendants. Executable/network surfaces such as `ServerScriptService`, `StarterPlayer`, `StarterGui`, `ReplicatedFirst`, and remote/network folders are blocked in both Node and Studio. A clean static scan is risk reduction, not proof of safety.
+
+### Scripted QA workflow
+
+- `run_multi_client_qa` owns one bounded true multiplayer session. The spec contains `startup`, ordered `steps`, and `teardown`. Step types are `wait`, `wait_for_players`, `checkpoint`, `add_players`, `disconnect_player`, and `server_assertion`.
+- `runtime_ui_regression` owns a sequence of single-client F5 sessions under device simulation. It restores the original device simulator state in `finally`.
+- Both tools require a fully settled edit target before starting and always use engine/runtime settlement before returning.
+- Screenshots are not claimed. UI regression evidence comes from the live client `PlayerGui`, `AbsolutePosition`, `AbsoluteSize`, viewport, constraints, safe-area configuration, and overlap calculations.
 
 **Context note:** every tool is implemented in the **edit** `Executor`. During a live F5 playtest,
 `auto` routes to the **server** agent, which mirrors `run_luau` + the **read** tools (instance tree,
@@ -217,8 +271,9 @@ manifest entry three ways — disk vs manifest vs live Studio: `clean`, `diskAhe
 `studioAhead` (report only; re-export to accept), `CONFLICT` (both moved), plus
 `missingInStudio` / `missingOnDisk` / `newOnDisk`. `import_scripts` refuses the ENTIRE import
 on any conflict and returns a whitespace-normalized unified diff per conflict; `studioAhead`
-and missing entries are skipped, reported, and never block. Applied files land in ONE
-ChangeHistory recording — a single Ctrl+Z reverts the whole import. Every applied source runs
+and missing entries are skipped, reported, and never block. Applied files use callback-time
+hash checks and guarded verified rollback if any write fails. Roblox does not capture script
+source changes in Studio undo history, so Ctrl+Z cannot revert an import. Every applied source runs
 through the task-24 Luau analyze gate first (errors abort the import; `skipAnalysis:true`
 bypasses; analyzer unavailable = fail-open with `analyzed: 0`). `dryRun:true` returns the
 would-apply plan.
@@ -257,7 +312,7 @@ with "locked — unlock via the RoCreate tab" until then.
 **Tools** — `rocreate_status` (booleans only; values never leave Node), `rocreate_set_credentials`,
 `rocreate_scan_assets` (walk the place for asset refs + script `rbxassetid://` hits), `rocreate_reupload_assets`
 (download → upload → grant restricted → record map; `dryRun` for the plan), `rocreate_apply_asset_map`
-(rewire instance props in one undo + script IDs via `find_and_replace_in_scripts`), `rocreate_list_monetization`,
+(rewire instance props with normal undo + non-undoable script IDs via `find_and_replace_in_scripts`), `rocreate_list_monetization`,
 `rocreate_reupload_devproducts` / `rocreate_reupload_gamepasses` (bulk create in a target universe),
 `rocreate_create_devproducts` (create brand-new dev products from an explicit name+price list),
 `rocreate_upload_image` / `rocreate_upload_audio` / `rocreate_upload_model` (upload a **local** image / audio /
@@ -393,12 +448,14 @@ bridge wire, or a log line.
 ## F5 playtest flow
 
 1. In **edit mode**, click **Enable Playtest** (or call `enable_playtest_agent` once). The
-   plugin writes `MCP_RuntimeAgent` into `ServerScriptService` and stamps the chosen port on it
-   as the `McpPort` attribute.
+   plugin writes `MCP_RuntimeAgent` into `ServerScriptService`, stamps the live owning bridge
+   as `McpPort`, and stamps the full candidate range as `McpPortCandidates` so auto-walked
+   ports like 58747 are reachable by the cloned runtime agent.
 2. Press **F5**. Studio copies that Script into the new server DataModel, where it sees
    `RunService:IsRunning()` true, resolves its port (attribute first, then probe), and opens its
    own `context=server` poll + heartbeat loops.
-3. `get_status` now shows `{ edit: true, server: true }`.
+3. `get_status` / `get_playtest_status` now show `edit.connected`, `serverAgent.connected`,
+   `clientAgent.connected`, `players`, `activePlaceName`, and recent runtime `diag` events.
 4. `run_luau` with `context:"auto"` hits the **running game**; `context:"edit"` still targets the
    editor.
 5. Stop the playtest → the agent's loops end → the `server` context goes stale within ~2s →
@@ -412,12 +469,27 @@ Solo (F5)** needs the runtime agent.
 mode — a `NikMCP_ClientAgent` LocalScript (injected at `playtest_control` start, play mode only,
 removed on stop) hooks `LogService` and relays lines to the server agent over a
 `NikMCP_ClientRelay` RemoteEvent; read them with `read_console context="client"` or
-`get_playtest_output`. Fixed client introspection (`fps`, `camera`, `gui_tree`, `local_player`,
-`ping`) is exposed via `client_query`, also relayed the same way. Arbitrary client-side
+`get_playtest_output`. Fixed client introspection (`fps`, `camera`, `gui_tree`, `gui_object`,
+`ui_regression`, `local_player`, `ping`) is exposed via `client_query`, also relayed the same way.
+`ui_regression` returns live layout/state evidence but not pixels or screenshots. Arbitrary client-side
 `run_luau context="client"` **remains impossible** — `loadstring` is server-only, and no amount of
 relaying changes that; calling it returns `"not supported: loadstring is server-only; use
 client_query"`. **Run mode has no client** (it never injects the LocalScript), so client reads in
 Run mode return an honest empty result with a `"run mode has no client"` note, not an error.
+
+Runtime attach regression guard: `npm run selftest:runtime` starts Run mode, waits for the
+runtime server agent, executes a trivial server Luau assertion, and verifies settled stop.
+It requires live Studio with the rebuilt plugin connected to the spawned bridge.
+
+### Live acceptance checklist for the QA/safe-asset expansion
+
+1. Save every open place, fully restart Studio so it loads the installed `RobloxStudioMCP.rbxmx`, restart only the matching `D:/GameProjects/NikMCP/dist/index.js` process, and reconnect MCP.
+2. Run `get_studio_targets`, select the intended test place, and confirm `get_settled_runtime_status` reports edit mode with no server/client agent or stale runtime id.
+3. Run `search_assets` for a small public Model. Create/select a disposable `game.Workspace.NikMCPAssetStaging` folder, run `inspect_creator_store_asset`, and confirm the place hierarchy did not change. Review every finding. Insert only a clean test asset with `guarded_insert_asset`; confirm the fingerprint matches, scripts/remotes are absent from inserted roots, anything executable is under `ServerStorage.NikMCPQuarantine`, then undo/delete the disposable staging content.
+4. Run `world_health_report` on a bounded test root. Confirm every finding has path(s), `issueType`, severity, detail, and recommendation, and confirm no Anchored/CanCollide/transform/property value changed.
+5. Run `run_multi_client_qa` with two initial players, a 2-player wait/checkpoint, `add_players count:1`, a 3-player wait, `disconnect_player playerIndex:3`, a 2-player wait, and server assertion `return #game:GetService("Players"):GetPlayers() == 2`. Confirm test args are visible, all ready counts settle, and the final status is fully stopped.
+6. Run `runtime_ui_regression` with the default four profiles. In each visible client, manually inspect the same UI paths reported for phone portrait, phone landscape, tablet portrait, and desktop. Confirm the original Device Simulator state is restored and the final runtime state is settled.
+7. Run `npm run selftest:runtime` once against the restarted plugin. Screenshots are not an acceptance gate because the fixed client protocol has no client pixel-capture support.
 
 ## Ports
 Default base is **58741** — boshyxd `robloxstudio-mcp`'s port — so NikMCP is a drop-in
@@ -431,14 +503,23 @@ pick a port outside that set, add it to `CANDIDATE_PORTS` in `plugin/src/Config.
 - Short-poll ~250ms (≈240 req/min per loop; localhost ceiling ~2000/min). Long-poll only if measured.
 - Bind `127.0.0.1` only, never `0.0.0.0`.
 - All logs to **stderr** — stdout is reserved for MCP JSON-RPC.
-- Every edit-context mutation is wrapped in `ChangeHistoryService`; not during playtest.
+- Edit-context instance/property mutations use `ChangeHistoryService`; Roblox does not capture `LuaSourceContainer.Source` changes in Studio undo history, so script patchsets use expected hashes plus guarded manual rollback instead.
+- Cross-port `/invoke` calls require a private per-user routing capability. Every queued command carries an exact target id and wall-clock expiry; timed-out commands are removed and Studio refuses stale or wrong-window work.
 
 ## Status / scope
-Node side (bridge + MCP server + all six tools + routing) is built and verified end-to-end:
-a real MCP `tools/list` + `tools/call run_luau` round-trips through the bridge, and `auto`
-routing switches to the server context when alive. The Luau plugin is written but **must be
-installed and confirmed inside Studio by a human** — the toolbar/dock, the edit round-trip, and
-the F5 dual-context flow can only be verified there.
+v0.2.0 (September 3, 2026) is built from a working agent's ranked pain list: token-cheap script
+edits (`edit_script`, `get_script_source` windows, `write_script sourceFile`), automatic pre-write
+backups, the `run_harness` macro, loadstring-free `server_query`, `client_activate`, filtered and
+pinned playtest output, `import_scripts` allowlist/force with protected bridge scripts,
+whitespace-aware sync status plus `reconcile_manifest`, async/long `run_luau`, non-blocking
+command execution in both pollers, a lease-aware runtime agent that stops 409 busy-loops, a
+`starting` playtest phase, and an INFO class for analyzer noise in the lint gate. 164 tools, 81
+write-gated. Node, plugin packaging, MCP contracts, target routing, Creator Store guards, QA
+contracts, environment reporting, sync, script-edit, RoCreate, Open Cloud, and every changed Luau
+source pass the offline regression matrix. Live Studio acceptance of the plugin side needs a
+Studio restart plus MCP reconnect; running NikMCP processes were deliberately left alone.
+
+See `Version_History.md` for the full per-tool changelog.
 
 ## Security note
 The bridge binds `127.0.0.1` only. `run_luau` executes arbitrary Luau in **your** Studio — treat

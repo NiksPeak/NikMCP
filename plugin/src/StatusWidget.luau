@@ -327,7 +327,7 @@ function StatusWidget.new(plugin: Plugin)
 	version.Size = UDim2.fromOffset(120, 9)
 	version.BackgroundTransparency = 1
 	version.Font = Enum.Font.Merriweather -- readable serif at small sizes
-	version.Text = "version 0.1.7"
+	version.Text = "version 0.2.0"
 	version.TextColor3 = Theme.subtext
 	version.TextXAlignment = Enum.TextXAlignment.Left
 	version.TextYAlignment = Enum.TextYAlignment.Top
@@ -472,10 +472,10 @@ function StatusWidget.new(plugin: Plugin)
 	self.address, self.addrDot = address, addrDot
 
 	-- Port lane: horizontally-scrolling chips + a "+" pinned outside the scroll.
-	-- Slim strip: chips vertically centered, just enough room for the scrollbar.
+	-- The scrollbar stays visible and tall enough to grab in Studio's compact dock.
 	local lane = Instance.new("Frame")
 	lane.Name = "PortLane"
-	lane.Size = UDim2.new(1, 0, 0, 26)
+	lane.Size = UDim2.new(1, 0, 0, 30)
 	lane.BackgroundTransparency = 1
 	lane.LayoutOrder = 1
 	lane.Parent = portsCard
@@ -484,25 +484,42 @@ function StatusWidget.new(plugin: Plugin)
 	chipScroll.Size = UDim2.new(1, -38, 1, 0) -- room on the right for "+"; the editor overlays on top
 	chipScroll.BackgroundTransparency = 1
 	chipScroll.BorderSizePixel = 0
+	chipScroll.Active = true
+	chipScroll.ClipsDescendants = true
+	chipScroll.ScrollingEnabled = true
 	chipScroll.ScrollingDirection = Enum.ScrollingDirection.X
 	chipScroll.AutomaticCanvasSize = Enum.AutomaticSize.X
 	chipScroll.CanvasSize = UDim2.new()
-	chipScroll.ScrollBarThickness = 3
+	chipScroll.ScrollBarThickness = 6
 	chipScroll.ScrollBarImageColor3 = Theme.stroke
-	chipScroll.ScrollBarImageTransparency = 0.2
+	chipScroll.ScrollBarImageTransparency = 0
 	chipScroll.Parent = lane
 	local chipLayout = hlist(chipScroll, 6)
 	chipLayout.VerticalAlignment = Enum.VerticalAlignment.Center
 	local chipPad = Instance.new("UIPadding")
-	chipPad.PaddingBottom = UDim.new(0, 4) -- room for the bottom scrollbar
+	chipPad.PaddingBottom = UDim.new(0, 6) -- reserve the scrollbar instead of covering chips
 	chipPad.Parent = chipScroll
 	self.chipScroll = chipScroll
+
+	-- Roblox maps wheel motion to Y by default. This lane only scrolls on X, so
+	-- translate the documented wheel events into a bounded horizontal step.
+	local function scrollPortLane(delta: number)
+		local maxX = math.max(0, chipScroll.AbsoluteCanvasSize.X - chipScroll.AbsoluteWindowSize.X)
+		local nextX = math.clamp(chipScroll.CanvasPosition.X + delta, 0, maxX)
+		chipScroll.CanvasPosition = Vector2.new(nextX, chipScroll.CanvasPosition.Y)
+	end
+	chipScroll.MouseWheelForward:Connect(function()
+		scrollPortLane(-48)
+	end)
+	chipScroll.MouseWheelBackward:Connect(function()
+		scrollPortLane(48)
+	end)
 
 	-- "+" add control, pinned to the right of the lane (outside the scroll).
 	local add = Instance.new("TextButton")
 	add.Name = "AddPort"
 	add.AnchorPoint = Vector2.new(1, 0.5)
-	add.Position = UDim2.new(1, 0, 0.5, 0)
+	add.Position = UDim2.new(1, 0, 0.5, -3)
 	add.Size = UDim2.fromOffset(32, 22)
 	add.BackgroundColor3 = Theme.panel
 	add.AutoButtonColor = false
@@ -525,11 +542,16 @@ function StatusWidget.new(plugin: Plugin)
 	local editor = Instance.new("Frame")
 	editor.Name = "PortEditor"
 	editor.AnchorPoint = Vector2.new(1, 0.5)
-	editor.Position = UDim2.new(1, -38, 0.5, 0)
+	editor.Position = UDim2.new(1, -38, 0.5, -3)
 	editor.Size = UDim2.fromOffset(96, 22)
-	editor.BackgroundTransparency = 1
+	editor.BackgroundColor3 = Theme.panelHi
+	editor.BackgroundTransparency = 0
+	editor.BorderSizePixel = 0
+	editor.Active = true -- sink clicks in the overlay gaps so covered chips cannot fire
 	editor.Visible = false
 	editor.ZIndex = 10
+	corner(editor, 8)
+	stroke(editor, Theme.accent, 0.1)
 	editor.Parent = lane
 	self.editor = editor
 	self.overStepper = nil -- "up" | "down" while the mouse hovers a stepper
@@ -824,7 +846,7 @@ function StatusWidget:_rebuildChips()
 
 		local x = Instance.new("TextButton")
 		x.Name = "Remove"
-		x.Size = UDim2.fromOffset(18, 18)
+		x.Size = UDim2.fromOffset(14, 16)
 		x.Position = UDim2.new(1, -4, 0.5, 0)
 		x.AnchorPoint = Vector2.new(1, 0.5)
 		x.ZIndex = 2 -- above the chip body so "x" removes instead of selecting
@@ -833,10 +855,34 @@ function StatusWidget:_rebuildChips()
 		x.Font = Enum.Font.GothamBold
 		x.TextColor3 = colored and fg or Theme.subtext
 		x.TextScaled = true
-		textConstraint(x, 14, 9)
+		textConstraint(x, 11, 8)
+		corner(x, 5)
 		x.Parent = chip
+
+		-- Port removal stops a live polling lane, so require a deliberate second
+		-- click. The first click arms briefly and gives an unmistakable "?" state.
+		local removeArmed = false
+		local removeArmToken = 0
 		x.MouseButton1Click:Connect(function()
 			self:_click()
+			if not removeArmed then
+				removeArmed = true
+				removeArmToken += 1
+				local token = removeArmToken
+				x.Text = "?"
+				x.TextColor3 = Theme.red
+				x.BackgroundColor3 = Theme.bg2
+				x.BackgroundTransparency = 0
+				task.delay(1.4, function()
+					if x.Parent and removeArmed and removeArmToken == token then
+						removeArmed = false
+						x.Text = "x"
+						x.TextColor3 = colored and fg or Theme.subtext
+						x.BackgroundTransparency = 1
+					end
+				end)
+				return
+			end
 			if self.onRemovePort then
 				self.onRemovePort(port)
 			end

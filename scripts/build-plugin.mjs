@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SRC = join(ROOT, "plugin", "src");
 const ROOT_NAME = "RobloxStudioMCP";
-const CHILDREN = ["Config", "Settings", "Serializer", "AnalysisTools", "Executor", "StatusWidget", "RuntimeAgentSource", "ClientAgentSource"];
+const CHILDREN = ["Config", "Settings", "Serializer", "AnalysisTools", "EnvironmentTools", "AssetGuardTools", "QATools", "AgentTools", "Executor", "StatusWidget", "RuntimeAgentSource", "ClientAgentSource"];
 
 // Luau's bytecode compiler caps a single lexical scope at 200 local-variable
 // registers ("Out of local registers... exceeded limit 200" at compile time --

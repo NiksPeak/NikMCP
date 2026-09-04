@@ -13,11 +13,14 @@ import { initLuauGate, analyzeLuau, _internal } from "../dist/luau-gate.js";
     "x.luau(3,5): TypeError: Unknown global 'gme'",
     "x.luau(1,7): LocalUnused: Variable 'a' is never used; prefix with '_' to silence",
   ].join("\n");
-  const { errors, warnings } = _internal.parseDiagnostics(sample);
+  const { errors, warnings, infos } = _internal.parseDiagnostics(sample);
   assert.strictEqual(errors.length, 2, "SyntaxError + TypeError must classify as errors");
   assert.strictEqual(warnings.length, 1, "lint kinds classify as warnings");
-  // Dynamic-DataModel TypeErrors must be DEMOTED to warnings (dot-child access
-  // like game.Workspace.MyPart is statically unknowable without a sourcemap).
+  assert.strictEqual(infos.length, 0, "no analyzer-noise infos in this sample");
+  // Dynamic-DataModel TypeErrors must be DEMOTED (dot-child access like
+  // game.Workspace.MyPart and WaitForChild-chain requires are statically
+  // unknowable without a sourcemap). v0.2.0: they are INFO, not warnings, so
+  // luau_lint_gate failOn:'warning' no longer fails on pure analyzer noise.
   const demoted = _internal.parseDiagnostics(
     [
       "x.luau(1,11): TypeError: Key 'Baseplate' not found in external type 'Workspace'",
@@ -25,7 +28,8 @@ import { initLuauGate, analyzeLuau, _internal } from "../dist/luau-gate.js";
     ].join("\n")
   );
   assert.strictEqual(demoted.errors.length, 0, "DataModel-content TypeErrors must not block");
-  assert.strictEqual(demoted.warnings.length, 2, "they ride along as warnings");
+  assert.strictEqual(demoted.warnings.length, 0, "analyzer noise is not a lint warning");
+  assert.strictEqual(demoted.infos.length, 2, "they ride along as infos");
   assert.deepStrictEqual(
     { line: errors[1].line, col: errors[1].col, kind: errors[1].kind },
     { line: 3, col: 5, kind: "TypeError" }

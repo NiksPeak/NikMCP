@@ -140,8 +140,13 @@ check("no unlock session -> isUnlocked false, useCookie null (tools must refuse)
 // --- config.json RoCreate key writer ----------------------------------------
 check("setRoCreateApiKey creates config.json, trims key, and merges existing fields", () => {
   const cwd = process.cwd();
+  const prevOverride = process.env.NIKMCP_CONFIG_PATH;
   const dir = mkdtempSync(join(tmpdir(), "nikmcp-rocreate-config-"));
   try {
+    // Redirect the writer EXPLICITLY. chdir alone is not enough: with no
+    // config.json in the temp cwd the writer falls back to the package copy,
+    // and this test's dummy key lands on the user's real Open Cloud key.
+    process.env.NIKMCP_CONFIG_PATH = join(dir, "config.json");
     process.chdir(dir);
     setRoCreateApiKey("  rc-key-1 \n");
     assert.deepStrictEqual(JSON.parse(readFileSync("config.json", "utf8")), {
@@ -158,6 +163,8 @@ check("setRoCreateApiKey creates config.json, trims key, and merges existing fie
     assert.throws(() => setRoCreateApiKey("rc-key-3"), /JSON/);
   } finally {
     process.chdir(cwd);
+    if (prevOverride === undefined) delete process.env.NIKMCP_CONFIG_PATH;
+    else process.env.NIKMCP_CONFIG_PATH = prevOverride;
     rmSync(dir, { recursive: true, force: true });
   }
 });

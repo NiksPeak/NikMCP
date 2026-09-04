@@ -39,6 +39,10 @@ export interface AnalyzeResult {
   ok: boolean; // no blocking errors (always true when unavailable)
   errors: Diagnostic[];
   warnings: Diagnostic[];
+  // v0.2.0: analyzer noise that is statically unknowable without a sourcemap
+  // (Unknown require from WaitForChild chains, dot-child DataModel access).
+  // Never blocks, never counts as a lint warning; reported for information.
+  infos: Diagnostic[];
 }
 
 interface GateState {
@@ -239,9 +243,14 @@ const DEMOTED_TYPEERRORS = [
   /^Unknown require:/,
 ];
 
-function parseDiagnostics(text: string): { errors: Diagnostic[]; warnings: Diagnostic[] } {
+function parseDiagnostics(text: string): {
+  errors: Diagnostic[];
+  warnings: Diagnostic[];
+  infos: Diagnostic[];
+} {
   const errors: Diagnostic[] = [];
   const warnings: Diagnostic[] = [];
+  const infos: Diagnostic[] = [];
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || line.startsWith("[INFO]")) continue;
@@ -256,14 +265,15 @@ function parseDiagnostics(text: string): { errors: Diagnostic[]; warnings: Diagn
     const demoted =
       d.kind === "TypeError" && DEMOTED_TYPEERRORS.some((re) => re.test(d.message));
     if (ERROR_KINDS.has(d.kind) && !demoted) errors.push(d);
+    else if (demoted) infos.push(d);
     else warnings.push(d);
   }
-  return { errors, warnings };
+  return { errors, warnings, infos };
 }
 
 export async function analyzeLuau(source: string): Promise<AnalyzeResult> {
   const s = state;
-  if (!s) return { available: false, ok: true, errors: [], warnings: [] };
+  if (!s) return { available: false, ok: true, errors: [], warnings: [], infos: [] };
 
   const tmp = join(
     tmpdir(),
@@ -273,7 +283,7 @@ export async function analyzeLuau(source: string): Promise<AnalyzeResult> {
     writeFileSync(tmp, source);
   } catch (e) {
     warnOnce(`temp file write failed (${e instanceof Error ? e.message : String(e)})`);
-    return { available: false, ok: true, errors: [], warnings: [] };
+    return { available: false, ok: true, errors: [], warnings: [], infos: [] };
   }
 
   try {
@@ -313,10 +323,10 @@ export async function analyzeLuau(source: string): Promise<AnalyzeResult> {
 
     if (output === null) {
       console.error("[luau-gate] analyze timed out/failed for one call -- passing through");
-      return { available: false, ok: true, errors: [], warnings: [] };
+      return { available: false, ok: true, errors: [], warnings: [], infos: [] };
     }
-    const { errors, warnings } = parseDiagnostics(output);
-    return { available: true, ok: errors.length === 0, errors, warnings };
+    const { errors, warnings, infos } = parseDiagnostics(output);
+    return { available: true, ok: errors.length === 0, errors, warnings, infos };
   } finally {
     try {
       unlinkSync(tmp);

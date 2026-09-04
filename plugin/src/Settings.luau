@@ -8,6 +8,8 @@ local Settings = {}
 -- headers; names MUST match the server's registerTool names + WRITE_TOOLS set.
 Settings.TOOLS = {
 	-- read / inspect
+	{ name = "get_studio_targets", group = "read", label = "Studio targets" },
+	{ name = "select_studio_target", group = "read", label = "Select Studio target" },
 	{ name = "get_instance_tree", group = "read", label = "Instance tree" },
 	{ name = "read_console", group = "read", label = "Read console" },
 	{ name = "get_selection", group = "read", label = "Get selection" },
@@ -40,6 +42,18 @@ Settings.TOOLS = {
 	{ name = "require_graph", group = "read", label = "Require graph" },
 	{ name = "monetization_map", group = "read", label = "Monetization map" },
 	{ name = "place_digest", group = "read", label = "Place digest" },
+	{ name = "audit_environment", group = "read", label = "Audit environment" },
+	{ name = "inspect_texture_health", group = "read", label = "Inspect texture health" },
+	{ name = "world_health_report", group = "read", label = "World health report" },
+	{ name = "task_context_bundle", group = "read", label = "Task context bundle" },
+	{ name = "change_impact_report", group = "read", label = "Change impact report" },
+	{ name = "code_health_report", group = "read", label = "Code health report" },
+	{ name = "wait_for_state", group = "read", label = "Wait for state" },
+	{ name = "plan_script_patchset", group = "read", label = "Plan script patchset" },
+	-- v0.2.0 reads
+	{ name = "list_script_backups", group = "read", label = "List script backups" },
+	{ name = "get_luau_job", group = "read", label = "Get Luau job (async run_luau)" },
+	{ name = "server_query", group = "read", label = "Server query (F5 read-only)" },
 	-- Bucket 3: style / art direction (UI/world/lighting fingerprinting + layout
 	-- solver) -- all read-only
 	{ name = "ui_style_fingerprint", group = "read", label = "UI style fingerprint" },
@@ -58,7 +72,10 @@ Settings.TOOLS = {
 	{ name = "run_luau", group = "write", label = "Run Luau" },
 	{ name = "set_property", group = "write", label = "Set property" },
 	{ name = "write_script", group = "write", label = "Write script" },
+	{ name = "edit_script", group = "write", label = "Edit script (exact string / patch)" },
+	{ name = "restore_script_backup", group = "write", label = "Restore script backup" },
 	{ name = "import_scripts", group = "write", label = "Import scripts from disk" },
+	{ name = "reconcile_manifest", group = "write", label = "Reconcile sync manifest" },
 	-- task 26: RoCreate mutating tools
 	{ name = "rocreate_set_credentials", group = "write", label = "RoCreate set credentials" },
 	{ name = "rocreate_reupload_assets", group = "write", label = "RoCreate reupload assets" },
@@ -83,6 +100,7 @@ Settings.TOOLS = {
 	{ name = "tag_instance", group = "write", label = "Tag instance" },
 	{ name = "untag_instance", group = "write", label = "Untag instance" },
 	{ name = "insert_asset", group = "write", label = "Insert asset" },
+	{ name = "guarded_insert_asset", group = "write", label = "Guarded insert asset" },
 	{ name = "set_attribute", group = "write", label = "Set attribute" },
 	{ name = "set_attributes", group = "write", label = "Set attributes" },
 	{ name = "delete_attribute", group = "write", label = "Delete attribute" },
@@ -98,6 +116,10 @@ Settings.TOOLS = {
 	{ name = "mass_set_property", group = "write", label = "Mass set property" },
 	{ name = "set_properties", group = "write", label = "Set properties (multi)" },
 	{ name = "enable_playtest_agent", group = "write", label = "Enable playtest agent" },
+	{ name = "prompt_save_selection", group = "write", label = "Prompt save selection" },
+	{ name = "backup_selection", group = "write", label = "Backup selection" },
+	{ name = "restore_backup", group = "write", label = "Restore backup" },
+	{ name = "apply_script_patchset", group = "write", label = "Apply script patchset" },
 	-- Bucket 4 QoL: snapshot/diff/revert (revert mode is destructive)
 	{ name = "snapshot_revert", group = "write", label = "Snapshot / diff / revert" },
 	-- assets / marketplace
@@ -106,6 +128,7 @@ Settings.TOOLS = {
 	{ name = "preview_asset", group = "assets", label = "Preview asset" },
 	{ name = "search_materials", group = "assets", label = "Search materials" },
 	{ name = "search_assets", group = "assets", label = "Search assets (Open Cloud)" },
+	{ name = "inspect_creator_store_asset", group = "assets", label = "Inspect Creator Store asset" },
 	{ name = "list_library", group = "assets", label = "List library (Open Cloud)" },
 	{ name = "upload_decal", group = "assets", label = "Upload decal (Open Cloud)" },
 	{ name = "upload_asset", group = "assets", label = "Upload asset (Open Cloud)" },
@@ -113,6 +136,9 @@ Settings.TOOLS = {
 	-- experimental (may be unsupported from a plugin; see Phase D)
 	{ name = "capture_viewport", group = "experimental", label = "Capture viewport" },
 	{ name = "playtest_control", group = "experimental", label = "Playtest control" },
+	{ name = "stop_playtest", group = "experimental", label = "Stop playtest (settled)" },
+	{ name = "get_settled_runtime_status", group = "experimental", label = "Settled runtime status" },
+	{ name = "stop_playtest_settled", group = "experimental", label = "Stop playtest (engine settled)" },
 	{ name = "get_playtest_output", group = "experimental", label = "Get playtest output" },
 	{ name = "simulate_keyboard_input", group = "experimental", label = "Simulate keyboard" },
 	{ name = "simulate_mouse_input", group = "experimental", label = "Simulate mouse" },
@@ -122,7 +148,14 @@ Settings.TOOLS = {
 	{ name = "verify_playtest", group = "experimental", label = "Verify playtest (composite)" },
 	-- Bucket 4 QoL: playtest smoke test + hybrid multiplayer introspection
 	{ name = "playtest_smoke", group = "experimental", label = "Playtest smoke (composite)" },
+	{ name = "run_harness", group = "experimental", label = "Run harness (arm/play/wait/collect/stop)" },
+	{ name = "client_activate", group = "experimental", label = "Client activate GuiButton" },
 	{ name = "multiplayer_eval", group = "experimental", label = "Multiplayer eval (hybrid)" },
+	{ name = "run_multi_client_qa", group = "experimental", label = "Multi-client QA runner" },
+	{ name = "runtime_ui_regression", group = "experimental", label = "Runtime UI regression" },
+	{ name = "client_input_sequence", group = "experimental", label = "Client input sequence" },
+	{ name = "scene_analysis_snapshot", group = "experimental", label = "Scene analysis snapshot" },
+	{ name = "capture_script_profile", group = "experimental", label = "Capture script profile" },
 	-- Bucket 1 "Eyes in Studio": capture/diff tools, grouped with capture_viewport
 	{ name = "orbit_capture", group = "experimental", label = "Orbit capture (multi-angle)" },
 	{ name = "selection_capture", group = "experimental", label = "Selection capture (highlighted)" },
@@ -151,6 +184,7 @@ Settings.TOOLS = {
 	{ name = "ungroup_instance", group = "scene", label = "Ungroup instance" },
 	{ name = "align_instances", group = "scene", label = "Align instances" },
 	{ name = "measure_distance", group = "scene", label = "Measure distance" },
+	{ name = "assemble_imported_chunks", group = "scene", label = "Assemble imported chunks" },
 }
 
 -- ordered group headers for the Settings UI

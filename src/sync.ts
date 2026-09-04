@@ -234,6 +234,97 @@ export function decideImport(status: StatusEntry[]): ImportDecision {
   };
 }
 
+// ---------- v0.2.0: protected paths + manifest rebase --------------------------------
+
+// Bridge-critical scripts the plugin injects itself. Sync must never export
+// them as user code or overwrite them from disk: a stale on-disk copy of
+// MCP_RuntimeAgent would strand the F5 agent on a dead port/token.
+const PROTECTED_LEAF_RE = /^(MCP_RuntimeAgent|NikMCP_ClientAgent|NikMCP_ClientRelay|__MCP_CommandListener|__MCP_[A-Za-z0-9_]+)$/;
+
+export function isProtectedSyncPath(dataModelPath: string): boolean {
+  const leaf = dataModelPath.split(".").pop() ?? "";
+  return PROTECTED_LEAF_RE.test(leaf);
+}
+
+export interface RebaseRow {
+  relPath: string;
+  dataModelPath: string;
+  state: DriftState;
+  diskHash: string | null;
+  studioHash: string | null;
+  whitespaceEqual?: boolean;
+}
+
+export type RebaseAccept = "equal" | "studio" | "disk";
+
+export interface RebaseOutcome {
+  rebased: { relPath: string; dataModelPath: string; from: string; to: string; reason: string }[];
+  skipped: { relPath: string; dataModelPath: string; state: DriftState; reason: string }[];
+}
+
+// Rewrites manifest baseline hashes WITHOUT touching any file content.
+//   equal : only rows whose disk and Studio content already agree (byte or
+//           whitespace-equal) -> they become clean. Safe default.
+//   studio: baseline := Studio hash. Disk edits then read as diskAhead.
+//   disk  : baseline := disk hash. Studio edits then read as studioAhead.
+// Rows outside `paths` (when given) are untouched. Missing sides are skipped.
+export function rebaseManifest(
+  manifest: Manifest,
+  rows: RebaseRow[],
+  accept: RebaseAccept,
+  paths?: Set<string>,
+): RebaseOutcome {
+  const out: RebaseOutcome = { rebased: [], skipped: [] };
+  for (const row of rows) {
+    const entry = manifest.files[row.relPath];
+    if (!entry) continue;
+    if (paths && !paths.has(row.relPath) && !paths.has(row.dataModelPath)) continue;
+    const skip = (reason: string) =>
+      out.skipped.push({ relPath: row.relPath, dataModelPath: row.dataModelPath, state: row.state, reason });
+    if (row.studioHash === null && accept !== "disk") {
+      skip("script missing in Studio");
+      continue;
+    }
+    if (row.diskHash === null && accept !== "studio") {
+      skip("file missing on disk");
+      continue;
+    }
+    let to: string | null = null;
+    let reason = "";
+    if (accept === "equal") {
+      if (row.diskHash !== null && row.diskHash === row.studioHash) {
+        to = row.diskHash;
+        reason = "disk and Studio hashes already agree";
+      } else if (row.whitespaceEqual) {
+        // Both sides are the same code modulo whitespace; take Studio's hash so
+        // the next status reads clean against the live place.
+        to = row.studioHash;
+        reason = "disk and Studio are whitespace-equal";
+      } else {
+        skip(row.state === "clean" ? "already clean" : "disk and Studio differ (use accept:'studio' or 'disk')");
+        continue;
+      }
+    } else if (accept === "studio") {
+      to = row.studioHash;
+      reason = "accepted Studio as baseline";
+    } else {
+      to = row.diskHash;
+      reason = "accepted disk as baseline";
+    }
+    if (to === null) {
+      skip("no hash available on the accepted side");
+      continue;
+    }
+    if (entry.hash === to) {
+      skip("baseline already matches");
+      continue;
+    }
+    out.rebased.push({ relPath: row.relPath, dataModelPath: row.dataModelPath, from: entry.hash, to, reason });
+    entry.hash = to;
+  }
+  return out;
+}
+
 // ---------- diff (conflict reporting) ------------------------------------------------
 // Whitespace-normalized per the drift doctrine: tabs expanded, LF-normalized.
 // Deliberately simple: trim common prefix/suffix, emit one unified-style hunk

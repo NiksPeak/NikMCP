@@ -10,6 +10,7 @@
 local HttpService = game:GetService("HttpService")
 local ServerScriptService = game:GetService("ServerScriptService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
+local Selection = game:GetService("Selection")
 
 local Config = require(script.Config)
 local Settings = require(script.Settings)
@@ -19,6 +20,9 @@ local RuntimeAgentSource = require(script.RuntimeAgentSource)
 
 local CONTEXT = "edit"
 local AGENT_NAME = "MCP_RuntimeAgent"
+local AGENT_SOURCE_VERSION = "2026-09-03-v0.2.0-lease-aware"
+local STUDIO_SESSION_ID = HttpService:GenerateGUID(false)
+local TARGET_ID = "studio-" .. STUDIO_SESSION_ID
 local SETTING_PORTS = "NikMCP_CandidatePorts_v2"
 local SETTING_ARMED = "NikMCP_PlaytestArmed"
 local SETTING_PORT_DIR = "NikMCP_PortDir"
@@ -110,11 +114,13 @@ local function saveSettings()
 end
 
 -- Auth header (only when enabled + token set); nil otherwise.
-local function authHeaders(): { [string]: string }?
+
+local function authHeaders(): { [string]: string }
+	local headers = { ["x-mcp-target-id"] = TARGET_ID }
 	if settings.auth.enabled and settings.auth.token ~= "" then
-		return { ["x-mcp-token"] = settings.auth.token }
+		headers["x-mcp-token"] = settings.auth.token
 	end
-	return nil
+	return headers
 end
 
 -- == Connection state ========================================================
@@ -129,6 +135,7 @@ type Conn = {
 	warned: string?, -- rate-limit: emit each state's diagnostic once
 	serverAlive: boolean, -- this port's `server` flag from the poll/heartbeat (playtest live)
 	commandsProven: boolean,
+	busy: boolean, -- v0.2.0: a command is executing in its own task; keep polling (busy=1) without dequeuing
 }
 local connections: { [number]: Conn } = {}
 local selectedPort: number? = loadSelectedPort()
@@ -194,7 +201,7 @@ local function pushSettingsTo(port: number, tokenOverride: string?)
 	end
 	local headers = authHeaders()
 	if tokenOverride and tokenOverride ~= "" then
-		headers = { ["x-mcp-token"] = tokenOverride }
+		headers["x-mcp-token"] = tokenOverride
 	end
 	pcall(function()
 		HttpService:PostAsync(
@@ -203,6 +210,32 @@ local function pushSettingsTo(port: number, tokenOverride: string?)
 			Enum.HttpContentType.ApplicationJson,
 			false,
 			headers
+		)
+	end)
+end
+
+-- Identify this exact Studio DataModel/window to a bridge. The bridge enriches
+-- this session id with the outbound socket's RobloxStudioBeta PID/window title.
+local function pushTargetIdentityTo(port: number)
+	local ok, json = pcall(function()
+		return HttpService:JSONEncode({
+			targetId = TARGET_ID,
+			studioSessionId = STUDIO_SESSION_ID,
+			placeId = game.PlaceId,
+			universeId = game.GameId,
+			placeName = game.Name,
+		})
+	end)
+	if not ok then
+		return
+	end
+	pcall(function()
+		HttpService:PostAsync(
+			urlFor(port) .. "/target/identity",
+			json,
+			Enum.HttpContentType.ApplicationJson,
+			false,
+			authHeaders()
 		)
 	end)
 end
@@ -226,14 +259,42 @@ end
 -- == Playtest agent ========================================================
 -- Full create-or-rewrite. Archivable so Play Solo (F5) clones it into the play
 -- server DataModel; the agent is inert in edit (`if not RunService:IsRunning()`).
+local function runtimePortCandidates(primaryPort: number): string
+	local seen: { [number]: boolean } = {}
+	local out = {}
+	local function add(port: number?)
+		if type(port) == "number" and not seen[port] then
+			seen[port] = true
+			table.insert(out, tostring(port))
+		end
+	end
+	add(primaryPort)
+	for port in pairs(connections) do
+		add(port)
+	end
+	for _, port in ipairs(candidatePorts) do
+		add(port)
+	end
+	for _, port in ipairs(Config.CANDIDATE_PORTS) do
+		add(port)
+	end
+	return table.concat(out, ",")
+end
+
+local function stampPlaytestAgent(agent: Script, port: number)
+	agent.Archivable = true
+	agent:SetAttribute("McpPort", port)
+	agent:SetAttribute("McpPortCandidates", runtimePortCandidates(port))
+	agent:SetAttribute("McpToken", (settings.auth.enabled and settings.auth.token) or "")
+	agent:SetAttribute("McpTargetId", TARGET_ID)
+end
+
 local function enablePlaytestAgent(port: number): (boolean, string?)
 	local existing = ServerScriptService:FindFirstChild(AGENT_NAME)
 	local agent = existing or Instance.new("Script")
 	agent.Name = AGENT_NAME
-	agent.Archivable = true
 	agent.Parent = ServerScriptService -- parent before writing source (UpdateSourceAsync needs DataModel)
-	agent:SetAttribute("McpPort", port)
-	agent:SetAttribute("McpToken", (settings.auth.enabled and settings.auth.token) or "")
+	stampPlaytestAgent(agent, port)
 
 	local source = (RuntimeAgentSource:gsub("{{PORT}}", tostring(port)))
 	local ok = pcall(function()
@@ -242,6 +303,7 @@ local function enablePlaytestAgent(port: number): (boolean, string?)
 		end)
 	end)
 	if ok then
+		agent:SetAttribute("McpSourceVersion", AGENT_SOURCE_VERSION)
 		return true
 	end
 	-- fallback to .Source (edit context only); bind a local first (never lead with `(`)
@@ -252,15 +314,24 @@ local function enablePlaytestAgent(port: number): (boolean, string?)
 	if not fbOk then
 		return false, tostring(fbErr)
 	end
+	agent:SetAttribute("McpSourceVersion", AGENT_SOURCE_VERSION)
 	return true
 end
 
--- Idempotent: inject only when missing, so the poll loop never re-writes source
--- every tick. Present already => no-op (just keep Archivable true).
+-- Idempotent enough for the maintenance loop: existing agents get fresh port
+-- attributes every tick, but source is rewritten only when absent/stale.
 local function ensureAgent(port: number): boolean
 	local existing = ServerScriptService:FindFirstChild(AGENT_NAME)
 	if existing then
-		existing.Archivable = true
+		stampPlaytestAgent(existing :: Script, port)
+		if existing:GetAttribute("McpSourceVersion") ~= AGENT_SOURCE_VERSION then
+			local ok, err = enablePlaytestAgent(port)
+			lastEnsureOk = ok
+			if not ok then
+				warn(("[NikMCP] playtest agent refresh failed: %s"):format(tostring(err)))
+			end
+			return ok
+		end
 		lastEnsureOk = true
 		return true
 	end
@@ -369,6 +440,16 @@ local function firstConnectedPort(): number?
 	return (next(connections))
 end
 
+local function activeAgentPort(preferredPort: number?): number
+	if preferredPort and connections[preferredPort] then
+		return preferredPort
+	end
+	if selectedPort and connections[selectedPort] then
+		return selectedPort
+	end
+	return firstConnectedPort() or selectedPort or Config.DEFAULT_PORT
+end
+
 local function countConnections(): number
 	local n = 0
 	for _ in pairs(connections) do
@@ -377,13 +458,81 @@ local function countConnections(): number
 	return n
 end
 
-local function setArmed(value: boolean)
+local function resolvePathForSelection(path: string): Instance?
+	if path == "game" then
+		return game
+	end
+	local stripped = string.gsub(path, "^game%.", "")
+	local current: Instance = game
+	for segment in string.gmatch(stripped, "[^%.]+") do
+		local nextInst: Instance? = nil
+		if current == game then
+			local ok, svc = pcall(function()
+				return game:GetService(segment)
+			end)
+			if ok then
+				nextInst = svc
+			end
+		end
+		if not nextInst then
+			nextInst = current:FindFirstChild(segment)
+		end
+		if not nextInst then
+			return nil
+		end
+		current = nextInst
+	end
+	return current
+end
+
+local function promptSaveSelection(p: any): any
+	if type(p.paths) == "table" then
+		local insts = {}
+		for _, path in ipairs(p.paths) do
+			if type(path) ~= "string" then
+				return { ok = false, err = "paths must contain strings" }
+			end
+			local inst = resolvePathForSelection(path)
+			if not inst then
+				return { ok = false, err = "path not found: " .. path }
+			end
+			table.insert(insts, inst)
+		end
+		Selection:Set(insts)
+	end
+	local selected = Selection:Get()
+	if #selected == 0 then
+		return { ok = false, err = "nothing selected; pass paths or select instances in Studio first" }
+	end
+	local suggestedFileName = tostring(p.suggestedFileName or "nikmcp_selection.rbxmx")
+	local pluginAny = plugin :: any
+	local ok, saved = pcall(function()
+		if pluginAny.PromptSaveSelectionAsync then
+			return pluginAny:PromptSaveSelectionAsync(suggestedFileName)
+		end
+		return pluginAny:PromptSaveSelection(suggestedFileName)
+	end)
+	if not ok then
+		return { ok = false, err = tostring(saved) }
+	end
+	return {
+		ok = true,
+		output = saved and "selection saved" or "save selection canceled",
+		result = {
+			saved = saved == true,
+			selectionCount = #selected,
+			suggestedFileName = suggestedFileName,
+		},
+	}
+end
+
+local function setArmed(value: boolean, preferredPort: number?)
 	armed = value
 	plugin:SetSetting(SETTING_ARMED, armed)
 	agentButton:SetActive(armed)
 	status:setArmed(armed)
 	if armed then
-		local port = selectedPort or firstConnectedPort() or Config.DEFAULT_PORT
+		local port = activeAgentPort(preferredPort)
 		lastEnsureOk = enablePlaytestAgent(port)
 		if not lastEnsureOk then
 			warn("[NikMCP] could not arm playtest agent (source write failed)")
@@ -406,7 +555,7 @@ local function markConnected(conn: Conn)
 	if armed then
 		local agent = ServerScriptService:FindFirstChild(AGENT_NAME)
 		if agent then
-			agent:SetAttribute("McpPort", conn.port) -- point the agent at a live port
+			stampPlaytestAgent(agent :: Script, conn.port) -- point the agent at a live port
 		end
 	end
 	if conn.warned ~= "connected" then
@@ -414,6 +563,7 @@ local function markConnected(conn: Conn)
 		print(("[NikMCP] connected on :%d"):format(conn.port))
 	end
 	pushSettingsTo(conn.port) -- this bridge enforces tool gating; refresh it on (re)connect
+	pushTargetIdentityTo(conn.port)
 	render()
 end
 
@@ -444,9 +594,14 @@ local function startConnection(port: number)
 		warned = nil,
 		serverAlive = false,
 		commandsProven = false,
+		busy = false,
 	}
 	connections[port] = conn
 	render()
+	-- Claim the bridge before the first command-bearing poll. Repeated on the
+	-- connected transition so a bridge that came up during backoff is enriched.
+	pushSettingsTo(port)
+	pushTargetIdentityTo(port)
 
 	-- Apply the merged liveness from a /poll response (server flag drives the
 	-- Playtest-agent row); no separate per-tick heartbeat is needed.
@@ -465,7 +620,12 @@ local function startConnection(port: number)
 			-- Merged short-poll: one immediate GET carrying status + any command.
 			local base = urlFor(port)
 			local ok, body = pcall(function()
-				return HttpService:GetAsync(base .. "/poll?context=" .. CONTEXT, true, authHeaders())
+				return HttpService:GetAsync(
+					base .. "/poll?context=" .. CONTEXT .. "&targetId=" .. HttpService:UrlEncode(TARGET_ID)
+						.. (if conn.busy then "&busy=1" else ""),
+					true,
+					authHeaders()
+				)
 			end)
 			if not conn.running then
 				break
@@ -491,42 +651,71 @@ local function startConnection(port: number)
 			applyServerFlag(decoded ~= nil and decoded.server == true)
 
 			local cmd = decoded and decoded.command or nil
-			if cmd and cmd.id then
+			if cmd and cmd.id and not conn.busy then
 				activeUntil = os.clock() + Config.ACTIVE_WINDOW -- snappier right after activity
-				local result
-				local startClock = os.clock()
-				if cmd.type == "enable_playtest_agent" then
-					setArmed(true) -- arming makes the agent persistent + F5-covered
-					result = { ok = lastEnsureOk, output = lastEnsureOk and "playtest agent armed" or "arm failed" }
-				else
-					result = Executor.execute(cmd)
-				end
-				if result and result.ok == false then
-					warn(("[NikMCP] command %q failed: %s")
-						:format(tostring(cmd.type), tostring(result.err)))
-				end
-				if settings.activityLog then
-					local ms = math.floor((os.clock() - startClock) * 1000 + 0.5)
-					status:addActivity({
-						tool = (":%d %s"):format(port, tostring(cmd.type)),
-						target = activityTarget(cmd),
-						ok = result.ok ~= false,
-						ms = ms,
-						time = os.time(),
-					})
-				end
-				result.id = cmd.id
-				postResult(base, result) -- chunks the POST if the result exceeds the 1024 KB PostAsync cap
-				conn.commandsProven = true
-				if port == selectedPort then
-					status:setCommands(true)
-				end
+				-- v0.2.0: execute in its own task so a long-yielding command (run_luau
+				-- with task.wait / *Async calls, big builds) never starves this poll
+				-- loop. While busy the loop keeps polling with busy=1 (liveness only,
+				-- no second command is dequeued), so the bridge never sees a drop.
+				conn.busy = true
+				task.spawn(function()
+					local result
+					local startClock = os.clock()
+					local okRun, runErr = pcall(function()
+						local nowMs = DateTime.now().UnixTimestampMillis
+						if type(cmd.expectedTargetId) == "string" and cmd.expectedTargetId ~= TARGET_ID then
+							result = {
+								ok = false,
+								err = ("command target mismatch: expected %s, current %s")
+									:format(cmd.expectedTargetId, TARGET_ID),
+							}
+						elseif type(cmd.expiresAtMs) == "number" and cmd.expiresAtMs <= nowMs then
+							result = {
+								ok = false,
+								err = ("command expired before execution at %d (now %d)")
+									:format(cmd.expiresAtMs, nowMs),
+							}
+						elseif cmd.type == "enable_playtest_agent" then
+							setArmed(true, port) -- arming makes the agent persistent + F5-covered
+							result = { ok = lastEnsureOk, output = lastEnsureOk and "playtest agent armed" or "arm failed" }
+						elseif cmd.type == "prompt_save_selection" then
+							result = promptSaveSelection(cmd.payload or {})
+						else
+							result = Executor.execute(cmd)
+						end
+					end)
+					if not okRun or type(result) ~= "table" then
+						result = { ok = false, err = "handler error: " .. tostring(if okRun then "no result table" else runErr) }
+					end
+					if result.ok == false then
+						warn(("[NikMCP] command %q failed: %s")
+							:format(tostring(cmd.type), tostring(result.err)))
+					end
+					if settings.activityLog then
+						local ms = math.floor((os.clock() - startClock) * 1000 + 0.5)
+						status:addActivity({
+							tool = (":%d %s"):format(port, tostring(cmd.type)),
+							target = activityTarget(cmd),
+							ok = result.ok ~= false,
+							ms = ms,
+							time = os.time(),
+						})
+					end
+					result.id = cmd.id
+					postResult(base, result) -- chunks the POST if the result exceeds the 1024 KB PostAsync cap
+					conn.busy = false
+					conn.commandsProven = true
+					if port == selectedPort then
+						status:setCommands(true)
+					end
+				end)
 			end
 
-			-- adaptive cadence: fast for ~2s after a command, else idle scaled by
-			-- the number of connected ports (keeps total req-rate under the limit)
+			-- adaptive cadence: fast for ~2s after a command (and for the whole time a
+			-- command is executing), else idle scaled by the number of connected
+			-- ports (keeps total req-rate under the limit)
 			local interval
-			if os.clock() < activeUntil then
+			if conn.busy or os.clock() < activeUntil then
 				interval = Config.POLL_ACTIVE
 			else
 				interval = math.max(Config.POLL_IDLE, 0.15 * countConnections())
@@ -649,7 +838,34 @@ local function rocreateTargetPort(): number?
 	if selectedPort and connections[selectedPort] then
 		return selectedPort
 	end
-	return firstConnectedPort()
+	local live = firstConnectedPort()
+	if live then
+		return live
+	end
+	-- No live poll connection (dock never pressed Connect, or it dropped).
+	-- The bridge answers /heartbeat regardless, so probe candidates directly
+	-- instead of failing with "no connected bridge".
+	local seen: { [number]: boolean } = {}
+	local probeOrder: { number } = {}
+	local function addProbe(port: number?)
+		if type(port) == "number" and not seen[port] then
+			seen[port] = true
+			table.insert(probeOrder, port)
+		end
+	end
+	addProbe(selectedPort)
+	for _, p in ipairs(candidatePorts) do
+		addProbe(p)
+	end
+	for _, port in ipairs(probeOrder) do
+		local ok = pcall(function()
+			return HttpService:GetAsync(urlFor(port) .. "/heartbeat", true)
+		end)
+		if ok then
+			return port
+		end
+	end
+	return nil
 end
 
 local function rocreatePost(path: string, body: any): (boolean, any)
@@ -689,6 +905,9 @@ status.onRocreateUnlock = function(password: string): string
 	if typeof(data) == "table" and data.error then
 		return tostring(data.error)
 	end
+	if typeof(data) == "string" and data ~= "" then
+		return "unlock failed: " .. data
+	end
 	return "unlock failed"
 end
 
@@ -707,6 +926,9 @@ status.onRocreateSetCreds = function(cookie: string, password: string): string
 	if typeof(data) == "table" and data.error then
 		return tostring(data.error)
 	end
+	if typeof(data) == "string" and data ~= "" then
+		return "save failed: " .. data
+	end
 	return "save failed"
 end
 
@@ -721,6 +943,9 @@ status.onRocreateSetApiKey = function(apiKey: string): string
 	end
 	if typeof(data) == "table" and data.error then
 		return tostring(data.error)
+	end
+	if typeof(data) == "string" and data ~= "" then
+		return "save failed: " .. data
 	end
 	return "save failed"
 end
@@ -755,7 +980,7 @@ render() -- shows the restored selected port, all Disconnected (no auto-connect)
 task.spawn(function()
 	while pluginRunning do
 		if armed then
-			ensureAgent(selectedPort or firstConnectedPort() or Config.DEFAULT_PORT)
+			ensureAgent(activeAgentPort(nil))
 		end
 		-- A live server context (F5 agent polling) counts as playtest activity,
 		-- so a watched run isn't auto-stopped for idleness.
@@ -837,6 +1062,8 @@ local Settings = {}
 -- headers; names MUST match the server's registerTool names + WRITE_TOOLS set.
 Settings.TOOLS = {
 	-- read / inspect
+	{ name = "get_studio_targets", group = "read", label = "Studio targets" },
+	{ name = "select_studio_target", group = "read", label = "Select Studio target" },
 	{ name = "get_instance_tree", group = "read", label = "Instance tree" },
 	{ name = "read_console", group = "read", label = "Read console" },
 	{ name = "get_selection", group = "read", label = "Get selection" },
@@ -869,6 +1096,18 @@ Settings.TOOLS = {
 	{ name = "require_graph", group = "read", label = "Require graph" },
 	{ name = "monetization_map", group = "read", label = "Monetization map" },
 	{ name = "place_digest", group = "read", label = "Place digest" },
+	{ name = "audit_environment", group = "read", label = "Audit environment" },
+	{ name = "inspect_texture_health", group = "read", label = "Inspect texture health" },
+	{ name = "world_health_report", group = "read", label = "World health report" },
+	{ name = "task_context_bundle", group = "read", label = "Task context bundle" },
+	{ name = "change_impact_report", group = "read", label = "Change impact report" },
+	{ name = "code_health_report", group = "read", label = "Code health report" },
+	{ name = "wait_for_state", group = "read", label = "Wait for state" },
+	{ name = "plan_script_patchset", group = "read", label = "Plan script patchset" },
+	-- v0.2.0 reads
+	{ name = "list_script_backups", group = "read", label = "List script backups" },
+	{ name = "get_luau_job", group = "read", label = "Get Luau job (async run_luau)" },
+	{ name = "server_query", group = "read", label = "Server query (F5 read-only)" },
 	-- Bucket 3: style / art direction (UI/world/lighting fingerprinting + layout
 	-- solver) -- all read-only
 	{ name = "ui_style_fingerprint", group = "read", label = "UI style fingerprint" },
@@ -887,7 +1126,10 @@ Settings.TOOLS = {
 	{ name = "run_luau", group = "write", label = "Run Luau" },
 	{ name = "set_property", group = "write", label = "Set property" },
 	{ name = "write_script", group = "write", label = "Write script" },
+	{ name = "edit_script", group = "write", label = "Edit script (exact string / patch)" },
+	{ name = "restore_script_backup", group = "write", label = "Restore script backup" },
 	{ name = "import_scripts", group = "write", label = "Import scripts from disk" },
+	{ name = "reconcile_manifest", group = "write", label = "Reconcile sync manifest" },
 	-- task 26: RoCreate mutating tools
 	{ name = "rocreate_set_credentials", group = "write", label = "RoCreate set credentials" },
 	{ name = "rocreate_reupload_assets", group = "write", label = "RoCreate reupload assets" },
@@ -912,6 +1154,7 @@ Settings.TOOLS = {
 	{ name = "tag_instance", group = "write", label = "Tag instance" },
 	{ name = "untag_instance", group = "write", label = "Untag instance" },
 	{ name = "insert_asset", group = "write", label = "Insert asset" },
+	{ name = "guarded_insert_asset", group = "write", label = "Guarded insert asset" },
 	{ name = "set_attribute", group = "write", label = "Set attribute" },
 	{ name = "set_attributes", group = "write", label = "Set attributes" },
 	{ name = "delete_attribute", group = "write", label = "Delete attribute" },
@@ -927,6 +1170,10 @@ Settings.TOOLS = {
 	{ name = "mass_set_property", group = "write", label = "Mass set property" },
 	{ name = "set_properties", group = "write", label = "Set properties (multi)" },
 	{ name = "enable_playtest_agent", group = "write", label = "Enable playtest agent" },
+	{ name = "prompt_save_selection", group = "write", label = "Prompt save selection" },
+	{ name = "backup_selection", group = "write", label = "Backup selection" },
+	{ name = "restore_backup", group = "write", label = "Restore backup" },
+	{ name = "apply_script_patchset", group = "write", label = "Apply script patchset" },
 	-- Bucket 4 QoL: snapshot/diff/revert (revert mode is destructive)
 	{ name = "snapshot_revert", group = "write", label = "Snapshot / diff / revert" },
 	-- assets / marketplace
@@ -935,6 +1182,7 @@ Settings.TOOLS = {
 	{ name = "preview_asset", group = "assets", label = "Preview asset" },
 	{ name = "search_materials", group = "assets", label = "Search materials" },
 	{ name = "search_assets", group = "assets", label = "Search assets (Open Cloud)" },
+	{ name = "inspect_creator_store_asset", group = "assets", label = "Inspect Creator Store asset" },
 	{ name = "list_library", group = "assets", label = "List library (Open Cloud)" },
 	{ name = "upload_decal", group = "assets", label = "Upload decal (Open Cloud)" },
 	{ name = "upload_asset", group = "assets", label = "Upload asset (Open Cloud)" },
@@ -942,6 +1190,9 @@ Settings.TOOLS = {
 	-- experimental (may be unsupported from a plugin; see Phase D)
 	{ name = "capture_viewport", group = "experimental", label = "Capture viewport" },
 	{ name = "playtest_control", group = "experimental", label = "Playtest control" },
+	{ name = "stop_playtest", group = "experimental", label = "Stop playtest (settled)" },
+	{ name = "get_settled_runtime_status", group = "experimental", label = "Settled runtime status" },
+	{ name = "stop_playtest_settled", group = "experimental", label = "Stop playtest (engine settled)" },
 	{ name = "get_playtest_output", group = "experimental", label = "Get playtest output" },
 	{ name = "simulate_keyboard_input", group = "experimental", label = "Simulate keyboard" },
 	{ name = "simulate_mouse_input", group = "experimental", label = "Simulate mouse" },
@@ -951,7 +1202,14 @@ Settings.TOOLS = {
 	{ name = "verify_playtest", group = "experimental", label = "Verify playtest (composite)" },
 	-- Bucket 4 QoL: playtest smoke test + hybrid multiplayer introspection
 	{ name = "playtest_smoke", group = "experimental", label = "Playtest smoke (composite)" },
+	{ name = "run_harness", group = "experimental", label = "Run harness (arm/play/wait/collect/stop)" },
+	{ name = "client_activate", group = "experimental", label = "Client activate GuiButton" },
 	{ name = "multiplayer_eval", group = "experimental", label = "Multiplayer eval (hybrid)" },
+	{ name = "run_multi_client_qa", group = "experimental", label = "Multi-client QA runner" },
+	{ name = "runtime_ui_regression", group = "experimental", label = "Runtime UI regression" },
+	{ name = "client_input_sequence", group = "experimental", label = "Client input sequence" },
+	{ name = "scene_analysis_snapshot", group = "experimental", label = "Scene analysis snapshot" },
+	{ name = "capture_script_profile", group = "experimental", label = "Capture script profile" },
 	-- Bucket 1 "Eyes in Studio": capture/diff tools, grouped with capture_viewport
 	{ name = "orbit_capture", group = "experimental", label = "Orbit capture (multi-angle)" },
 	{ name = "selection_capture", group = "experimental", label = "Selection capture (highlighted)" },
@@ -980,6 +1238,7 @@ Settings.TOOLS = {
 	{ name = "ungroup_instance", group = "scene", label = "Ungroup instance" },
 	{ name = "align_instances", group = "scene", label = "Align instances" },
 	{ name = "measure_distance", group = "scene", label = "Measure distance" },
+	{ name = "assemble_imported_chunks", group = "scene", label = "Assemble imported chunks" },
 }
 
 -- ordered group headers for the Settings UI
@@ -3283,6 +3542,2190 @@ return AnalysisTools
   </Item>
   <Item class="ModuleScript" referent="RBX5">
    <Properties>
+    <string name="Name">EnvironmentTools</string>
+    <ProtectedString name="Source"><![CDATA[--!nonstrict
+-- Blender environment import assembly, spatial/material audits, and recoverable
+-- model-tree backups. Kept out of Executor to preserve its Luau register budget.
+local EnvironmentTools = {}
+
+local Workspace = game:GetService("Workspace")
+local ServerStorage = game:GetService("ServerStorage")
+local Selection = game:GetService("Selection")
+local MaterialService = game:GetService("MaterialService")
+local HttpService = game:GetService("HttpService")
+local AssetService = game:GetService("AssetService")
+local ContentProvider = game:GetService("ContentProvider")
+
+local resolvePath
+local recorded
+
+function EnvironmentTools.init(deps)
+	resolvePath = deps.resolvePath
+	recorded = deps.recorded
+end
+
+local function pathOf(inst)
+	return inst:GetFullName()
+end
+
+local function countTree(inst)
+	return 1 + #inst:GetDescendants()
+end
+
+local function v3(value)
+	return { x = value.X, y = value.Y, z = value.Z }
+end
+
+local function cfComponents(value)
+	return { value:GetComponents() }
+end
+
+local function vectorFrom(value)
+	if typeof(value) == "Vector3" then
+		return value
+	end
+	if type(value) ~= "table" then
+		return nil
+	end
+	if type(value[1]) == "number" and type(value[2]) == "number" and type(value[3]) == "number" then
+		return Vector3.new(value[1], value[2], value[3])
+	end
+	local x = value.x or value.X
+	local y = value.y or value.Y
+	local z = value.z or value.Z
+	if type(x) == "number" and type(y) == "number" and type(z) == "number" then
+		return Vector3.new(x, y, z)
+	end
+	return nil
+end
+
+local function collectParts(root, cap)
+	local out = {}
+	if root:IsA("BasePart") then
+		table.insert(out, root)
+	end
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") then
+			table.insert(out, d)
+			if cap and #out >= cap then
+				break
+			end
+		end
+	end
+	return out
+end
+
+local function aabbForPart(part)
+	local half = part.Size / 2
+	local minV = Vector3.new(math.huge, math.huge, math.huge)
+	local maxV = Vector3.new(-math.huge, -math.huge, -math.huge)
+	for sx = -1, 1, 2 do
+		for sy = -1, 1, 2 do
+			for sz = -1, 1, 2 do
+				local p = part.CFrame * Vector3.new(half.X * sx, half.Y * sy, half.Z * sz)
+				minV = Vector3.new(math.min(minV.X, p.X), math.min(minV.Y, p.Y), math.min(minV.Z, p.Z))
+				maxV = Vector3.new(math.max(maxV.X, p.X), math.max(maxV.Y, p.Y), math.max(maxV.Z, p.Z))
+			end
+		end
+	end
+	return minV, maxV
+end
+
+local function boundsForPlans(plans)
+	local minV = Vector3.new(math.huge, math.huge, math.huge)
+	local maxV = Vector3.new(-math.huge, -math.huge, -math.huge)
+	local found = false
+	for _, plan in ipairs(plans) do
+		for _, part in ipairs(collectParts(plan.instance)) do
+			local pmin, pmax = aabbForPart(part)
+			local delta = Vector3.new(0, plan.deltaY, 0)
+			pmin += delta
+			pmax += delta
+			minV = Vector3.new(math.min(minV.X, pmin.X), math.min(minV.Y, pmin.Y), math.min(minV.Z, pmin.Z))
+			maxV = Vector3.new(math.max(maxV.X, pmax.X), math.max(maxV.Y, pmax.Y), math.max(maxV.Z, pmax.Z))
+			found = true
+		end
+	end
+	if not found then
+		return nil
+	end
+	return { min = minV, max = maxV, center = (minV + maxV) / 2, size = maxV - minV }
+end
+
+local function resolveRequestedRoots(p)
+	local roots = {}
+	local missing = {}
+	local seen = {}
+	local requested = p.paths or p.importedRoots or p.rootNames
+	if type(requested) ~= "table" or #requested == 0 then
+		return nil, { "no imported roots or paths supplied" }
+	end
+	for _, raw in ipairs(requested) do
+		local key = tostring(raw)
+		local inst = resolvePath(key)
+		if not inst and not string.find(key, "%.", 1, false) then
+			inst = Workspace:FindFirstChild(key)
+		end
+		if not inst then
+			table.insert(missing, key)
+		elseif not inst:IsA("PVInstance") then
+			table.insert(missing, key .. " (not a Model/BasePart)")
+		elseif not seen[inst] then
+			seen[inst] = true
+			table.insert(roots, inst)
+		end
+	end
+	for i, a in ipairs(roots) do
+		for j, b in ipairs(roots) do
+			if i ~= j and b:IsDescendantOf(a) then
+				return nil, { pathOf(b) .. " is already inside requested root " .. pathOf(a) }
+			end
+		end
+	end
+	return roots, missing
+end
+
+local function manifestRows(manifest)
+	if type(manifest) ~= "table" then
+		return {}, {}
+	end
+	local source = manifest.chunks or manifest.objects or manifest
+	local byKey = {}
+	local keys = {}
+	if type(source) ~= "table" then
+		return byKey, keys
+	end
+	for k, entry in pairs(source) do
+		if type(entry) == "table" then
+			local key = tostring(entry.path or entry.name or entry.chunk or k)
+			byKey[key] = entry
+			table.insert(keys, key)
+		end
+	end
+	return byKey, keys
+end
+
+local function entryPosition(entry)
+	if type(entry) ~= "table" then
+		return nil
+	end
+	local candidates = {
+		entry.intendedOrigin,
+		entry.origin,
+		entry.position,
+		entry.pivotPosition,
+		entry.worldPosition,
+		entry.transform and entry.transform.position,
+	}
+	for _, candidate in ipairs(candidates) do
+		local value = vectorFrom(candidate)
+		if value then
+			return value
+		end
+	end
+	if type(entry.y) == "number" then
+		return Vector3.new(0, entry.y, 0), true
+	end
+	return nil
+end
+
+local function findManifestEntry(byKey, inst)
+	local full = pathOf(inst)
+	return byKey[full] or byKey[inst.Name], byKey[full] and full or (byKey[inst.Name] and inst.Name or nil)
+end
+
+local function ensureBackupsFolder()
+	local root = ServerStorage:FindFirstChild("NikMCPBackups")
+	if root and not root:IsA("Folder") then
+		return nil, "ServerStorage.NikMCPBackups exists but is not a Folder"
+	end
+	if not root then
+		root = Instance.new("Folder")
+		root.Name = "NikMCPBackups"
+		root.Parent = ServerStorage
+	end
+	return root
+end
+
+local function cloneComplete(root)
+	local states = {}
+	local all = { root }
+	for _, descendant in ipairs(root:GetDescendants()) do
+		table.insert(all, descendant)
+	end
+	for _, inst in ipairs(all) do
+		states[inst] = inst.Archivable
+		inst.Archivable = true
+	end
+	local ok, cloned = pcall(function()
+		return root:Clone()
+	end)
+	for inst, value in pairs(states) do
+		if inst.Parent or inst == root then
+			inst.Archivable = value
+		end
+	end
+	if not ok then
+		return nil, tostring(cloned)
+	end
+	return cloned
+end
+
+local function createBackup(name, roots, replace)
+	if type(name) ~= "string" or name == "" then
+		return nil, "backup name required"
+	end
+	local backups, rootErr = ensureBackupsFolder()
+	if not backups then
+		return nil, rootErr
+	end
+	local existing = backups:FindFirstChild(name)
+	if existing and replace ~= true then
+		return nil, "backup already exists: ServerStorage.NikMCPBackups." .. name .. " (pass replace=true to overwrite)"
+	end
+	local made
+	local ok, err = recorded("NikMCP backup " .. name, function()
+		if existing then
+			existing:Destroy()
+		end
+		local folder = Instance.new("Folder")
+		folder.Name = name
+		folder:SetAttribute("NikMCPBackupCreatedAt", os.time())
+		folder:SetAttribute("NikMCPBackupRootCount", #roots)
+		for index, source in ipairs(roots) do
+			local item = Instance.new("Folder")
+			item.Name = ("Item_%04d"):format(index)
+			item:SetAttribute("OriginalName", source.Name)
+			item:SetAttribute("OriginalPath", pathOf(source))
+			item:SetAttribute("OriginalParentPath", source.Parent and pathOf(source.Parent) or "")
+			local clone, cloneErr = cloneComplete(source)
+			if not clone then
+				error("could not clone " .. pathOf(source) .. ": " .. tostring(cloneErr))
+			end
+			clone.Parent = item
+			item.Parent = folder
+		end
+		folder.Parent = backups
+		made = folder
+	end)
+	if not ok then
+		return nil, tostring(err)
+	end
+	local objects = 0
+	for _, item in ipairs(made:GetChildren()) do
+		local clone = item:GetChildren()[1]
+		if clone then
+			objects += countTree(clone)
+		end
+	end
+	return {
+		name = name,
+		location = pathOf(made),
+		rootCount = #roots,
+		objectCount = objects,
+	}
+end
+
+function EnvironmentTools.backupSelection(p)
+	local roots = {}
+	local missing = {}
+	if type(p.paths) == "table" and #p.paths > 0 then
+		local seen = {}
+		for _, path in ipairs(p.paths) do
+			local inst = resolvePath(path)
+			if inst and not seen[inst] then
+				seen[inst] = true
+				table.insert(roots, inst)
+			else
+				table.insert(missing, tostring(path))
+			end
+		end
+	else
+		roots = Selection:Get()
+	end
+	if #missing > 0 then
+		return { ok = false, err = "backup paths not found: " .. table.concat(missing, ", ") }
+	end
+	if #roots == 0 then
+		return { ok = false, err = "backup_selection needs paths or a non-empty Studio selection" }
+	end
+	for _, root in ipairs(roots) do
+		if root == game or root.Parent == game then
+			return { ok = false, err = "backup_selection is scoped to model trees, not DataModel services: " .. pathOf(root) }
+		end
+	end
+	local result, err = createBackup(p.name, roots, p.replace == true)
+	if not result then
+		return { ok = false, err = err }
+	end
+	return { ok = true, result = result }
+end
+
+function EnvironmentTools.restoreBackup(p)
+	if p.confirm ~= true then
+		return { ok = false, err = "restore_backup mutates the place; pass confirm=true" }
+	end
+	local backups = ServerStorage:FindFirstChild("NikMCPBackups")
+	local backup = backups and backups:FindFirstChild(tostring(p.name))
+	if not backup then
+		return { ok = false, err = "backup not found: ServerStorage.NikMCPBackups." .. tostring(p.name) }
+	end
+	local plans = {}
+	for _, item in ipairs(backup:GetChildren()) do
+		local source = item:GetChildren()[1]
+		local parentPath = item:GetAttribute("OriginalParentPath")
+		local originalName = item:GetAttribute("OriginalName")
+		local parent = type(parentPath) == "string" and resolvePath(parentPath) or nil
+		if not source or not parent or type(originalName) ~= "string" then
+			return { ok = false, err = "backup item is incomplete: " .. pathOf(item) }
+		end
+		local collisions = {}
+		for _, child in ipairs(parent:GetChildren()) do
+			if child.Name == originalName then
+				table.insert(collisions, child)
+			end
+		end
+		if #collisions > 0 and p.replaceExisting ~= true then
+			return {
+				ok = false,
+				err = "restore collision at " .. pathOf(parent) .. "." .. originalName
+					.. " (pass replaceExisting=true to replace only that recorded path)",
+			}
+		end
+		table.insert(plans, { source = source, parent = parent, name = originalName, collisions = collisions })
+	end
+	local restored = {}
+	local objectCount = 0
+	local ok, err = recorded("NikMCP restore " .. tostring(p.name), function()
+		for _, plan in ipairs(plans) do
+			for _, collision in ipairs(plan.collisions) do
+				collision:Destroy()
+			end
+			local clone, cloneErr = cloneComplete(plan.source)
+			if not clone then
+				error(cloneErr)
+			end
+			clone.Name = plan.name
+			clone.Parent = plan.parent
+			table.insert(restored, pathOf(clone))
+			objectCount += countTree(clone)
+		end
+	end)
+	if not ok then
+		return { ok = false, err = tostring(err) }
+	end
+	return {
+		ok = true,
+		result = {
+			name = p.name,
+			backupLocation = pathOf(backup),
+			restoredPaths = restored,
+			rootCount = #restored,
+			objectCount = objectCount,
+			backupRetained = true,
+		},
+	}
+end
+
+function EnvironmentTools.assembleImportedChunks(p)
+	local roots, missing = resolveRequestedRoots(p)
+	if not roots then
+		return { ok = false, err = table.concat(missing, "; ") }
+	end
+	local byKey, manifestKeys = manifestRows(p.manifest)
+	local usedManifest = {}
+	local warnings = {}
+	local reference = nil
+	if p.referenceChunk then
+		for _, root in ipairs(roots) do
+			if root.Name == p.referenceChunk or pathOf(root) == p.referenceChunk then
+				reference = root
+				break
+			end
+		end
+		reference = reference or resolvePath(p.referenceChunk)
+		if not reference then
+			table.insert(warnings, "reference chunk not found: " .. tostring(p.referenceChunk))
+		end
+	end
+	local sharedOffsetY = 0
+	local referenceEntry = reference and select(1, findManifestEntry(byKey, reference)) or nil
+	local referenceExpected = entryPosition(referenceEntry)
+	if reference and referenceExpected then
+		sharedOffsetY = reference:GetPivot().Position.Y - referenceExpected.Y
+	end
+	local plans = {}
+	local partCount = 0
+	local unanchored = 0
+	local maxOriginError = 0
+	local placementMissing = false
+	local requestedMissing = #missing > 0
+	for _, root in ipairs(roots) do
+		local pivot = root:GetPivot()
+		local entry, key = findManifestEntry(byKey, root)
+		local expected, yOnly = entryPosition(entry)
+		if key then
+			usedManifest[key] = true
+		end
+		local targetY = nil
+		if expected then
+			targetY = expected.Y + sharedOffsetY
+		elseif reference then
+			targetY = reference:GetPivot().Position.Y
+			table.insert(warnings, "no manifest origin for " .. root.Name .. "; aligned to reference Y")
+		else
+			table.insert(missing, root.Name .. " (no manifest origin and no reference chunk)")
+			placementMissing = true
+		end
+		local deltaY = targetY and (targetY - pivot.Position.Y) or 0
+		local projected = pivot.Position + Vector3.new(0, deltaY, 0)
+		if expected and not yOnly then
+			local intended = expected + Vector3.new(0, sharedOffsetY, 0)
+			maxOriginError = math.max(maxOriginError, (projected - intended).Magnitude)
+		end
+		local parts = collectParts(root)
+		partCount += #parts
+		for _, part in ipairs(parts) do
+			if not part.Anchored then
+				unanchored += 1
+			end
+		end
+		table.insert(plans, {
+			instance = root,
+			originalPivot = pivot,
+			targetPivot = pivot + Vector3.new(0, deltaY, 0),
+			deltaY = deltaY,
+		})
+	end
+	for _, key in ipairs(manifestKeys) do
+		if not usedManifest[key] then
+			table.insert(missing, key .. " (manifest chunk not imported/requested)")
+		end
+	end
+	local bounds = boundsForPlans(plans)
+	local reportedPlans = {}
+	for _, plan in ipairs(plans) do
+		table.insert(reportedPlans, {
+			path = pathOf(plan.instance),
+			originalPivot = cfComponents(plan.originalPivot),
+			targetPivot = cfComponents(plan.targetPivot),
+			deltaY = plan.deltaY,
+		})
+	end
+	local reportedBounds = bounds and {
+		min = v3(bounds.min),
+		max = v3(bounds.max),
+		center = v3(bounds.center),
+		size = v3(bounds.size),
+	} or nil
+	local dryRun = p.dryRun ~= false
+	local backupResult = nil
+	if not dryRun then
+		if requestedMissing or placementMissing then
+			return {
+				ok = false,
+				err = "assembly preflight has missing requested chunks or unresolved Y origins; run dryRun and fix missingChunks before applying",
+			}
+		end
+		local parentRootName = p.parentRootName or "LobbyEnvironment"
+		local parentPath = p.parentPath or "Workspace"
+		local parent = resolvePath(parentPath)
+		if not parent then
+			return { ok = false, err = "parent path not found: " .. tostring(parentPath) }
+		end
+		local existingRoot = parent:FindFirstChild(parentRootName)
+		if existingRoot and not existingRoot:IsA("Model") then
+			return { ok = false, err = pathOf(existingRoot) .. " exists but is not a Model" }
+		end
+		if existingRoot then
+			for _, root in ipairs(roots) do
+				if root == existingRoot then
+					return { ok = false, err = "an imported chunk cannot also be the assembly root: " .. pathOf(root) }
+				end
+			end
+		end
+		if p.backupName then
+			local backupErr
+			backupResult, backupErr = createBackup(p.backupName, roots, p.replaceBackup == true)
+			if not backupResult then
+				return { ok = false, err = backupErr }
+			end
+		end
+		local ok, err = recorded("Assemble imported chunks", function()
+			local assemblyRoot = existingRoot
+			if not assemblyRoot then
+				assemblyRoot = Instance.new("Model")
+				assemblyRoot.Name = parentRootName
+				assemblyRoot.Parent = parent
+			end
+			local assemblyId = HttpService:GenerateGUID(false)
+			for _, plan in ipairs(plans) do
+				local root = plan.instance
+				root:SetAttribute("NikMCP_AssemblyId", assemblyId)
+				root:SetAttribute("NikMCP_OriginalPivot", plan.originalPivot)
+				root:SetAttribute("NikMCP_AppliedDeltaY", plan.deltaY)
+				root:PivotTo(plan.targetPivot)
+				root.Parent = assemblyRoot
+				if p.anchorParts ~= false then
+					for _, part in ipairs(collectParts(root)) do
+						part.Anchored = true
+					end
+				end
+			end
+			assemblyRoot:SetAttribute("NikMCP_AssemblyId", assemblyId)
+			assemblyRoot:SetAttribute("NikMCP_ChunkCount", #plans)
+		end)
+		if not ok then
+			return { ok = false, err = tostring(err) }
+		end
+	end
+	return {
+		ok = true,
+		result = {
+			dryRun = dryRun,
+			parentRootName = p.parentRootName or "LobbyEnvironment",
+			chunkCount = #plans,
+			basePartCount = partCount,
+			unanchoredCount = (p.anchorParts ~= false) and 0 or unanchored,
+			unanchoredBefore = unanchored,
+			assembledBounds = reportedBounds,
+			maximumHorizontalDrift = 0,
+			maximumOriginReconstructionError = maxOriginError,
+			missingChunks = missing,
+			warnings = warnings,
+			backup = backupResult,
+			plans = reportedPlans,
+		},
+	}
+end
+
+local function validAssetRef(value)
+	if type(value) ~= "string" or value == "" then
+		return false
+	end
+	return string.match(value, "^rbxassetid://%d+$") ~= nil
+		or string.match(value, "^https?://") ~= nil
+		or string.match(value, "^rbxasset://") ~= nil
+		or string.match(value, "^rbxthumb://") ~= nil
+end
+
+local function readProperty(inst, property)
+	local ok, value = pcall(function()
+		return inst[property]
+	end)
+	if ok then
+		return value, true
+	end
+	return nil, false
+end
+
+local SURFACE_MAPS = { "ColorMap", "NormalMap", "RoughnessMap", "MetalnessMap" }
+
+local function inspectTextureRoot(root, maxMeshes)
+	local meshes = {}
+	local totalMeshCount = 0
+	local usage = {
+		meshTextureIds = {},
+		surfaceMaps = {},
+		materialVariants = {},
+		materials = {},
+		fetchStatuses = {},
+	}
+	local issues = { critical = {}, warning = {}, info = {} }
+	local fallbackCount = 0
+	local checkedFetch = {}
+	local function checkFetchStatus(path, property, assetRef)
+		if not validAssetRef(assetRef) or checkedFetch[assetRef] then
+			return
+		end
+		checkedFetch[assetRef] = true
+		local okStatus, status = pcall(function()
+			return ContentProvider:GetAssetFetchStatus(assetRef)
+		end)
+		usage.fetchStatuses[assetRef] = okStatus and status.Name or "Unreadable"
+		if okStatus and status.Name == "Failure" then
+			table.insert(issues.critical, {
+				path = path,
+				kind = "asset_fetch_failure",
+				property = property,
+				detail = assetRef,
+				suggestedFix = "Verify ownership/moderation/permissions and replace or reupload the failed dependency.",
+			})
+		end
+	end
+	for _, part in ipairs(collectParts(root)) do
+		usage.materials[part.Material.Name] = (usage.materials[part.Material.Name] or 0) + 1
+		local materialVariant = readProperty(part, "MaterialVariant") or ""
+		if materialVariant ~= "" then
+			usage.materialVariants[materialVariant] = (usage.materialVariants[materialVariant] or 0) + 1
+			if not MaterialService:FindFirstChild(materialVariant) then
+				table.insert(issues.critical, {
+					path = pathOf(part),
+					kind = "missing_material_variant",
+					detail = "MaterialVariant '" .. materialVariant .. "' is not present in MaterialService",
+					suggestedFix = "Import or recreate the named MaterialVariant, or clear the stale reference.",
+				})
+			end
+		end
+		if part:IsA("MeshPart") then
+			totalMeshCount += 1
+			local surface = part:FindFirstChildOfClass("SurfaceAppearance")
+			local meshId, meshIdReadable = readProperty(part, "MeshId")
+			local textureId, textureIdReadable = readProperty(part, "TextureID")
+			local meshState = {
+				path = pathOf(part),
+				meshId = meshIdReadable and meshId or nil,
+				meshIdReadable = meshIdReadable,
+				textureId = textureIdReadable and textureId or nil,
+				textureIdReadable = textureIdReadable,
+				material = part.Material.Name,
+				materialVariant = materialVariant,
+				surfaceAppearance = surface and pathOf(surface) or nil,
+			}
+			if meshIdReadable and (meshId == "" or not validAssetRef(meshId)) then
+				table.insert(issues.critical, {
+					path = pathOf(part), kind = "missing_or_invalid_mesh_id",
+					detail = "MeshPart.MeshId is empty or not a recognizable asset reference.",
+					suggestedFix = "Reimport the mesh or assign a valid Roblox mesh asset.",
+				})
+			elseif not meshIdReadable then
+				table.insert(issues.info, {
+					path = pathOf(part), kind = "mesh_id_not_readable",
+					detail = "Studio security did not expose MeshPart.MeshId in this plugin context.",
+					suggestedFix = "Use the per-mesh import report or enable the permitted deep mesh scan if triangle/dependency proof is required.",
+				})
+			end
+			if meshIdReadable and meshId ~= "" then
+				checkFetchStatus(pathOf(part), "MeshId", meshId)
+			end
+			if textureIdReadable and textureId ~= "" then
+				usage.meshTextureIds[textureId] = (usage.meshTextureIds[textureId] or 0) + 1
+				if not validAssetRef(textureId) then
+					table.insert(issues.critical, {
+						path = pathOf(part), kind = "invalid_texture_id", detail = textureId,
+						suggestedFix = "Assign a valid Roblox texture asset reference or reimport the FBX dependency.",
+					})
+				end
+				checkFetchStatus(pathOf(part), "TextureID", textureId)
+			end
+			if surface then
+				local maps = {}
+				for _, prop in ipairs(SURFACE_MAPS) do
+					local value, readable = readProperty(surface, prop)
+					value = readable and value or ""
+					maps[prop] = value
+					if value ~= "" then
+						usage.surfaceMaps[value] = (usage.surfaceMaps[value] or 0) + 1
+						if not validAssetRef(value) then
+							table.insert(issues.critical, {
+								path = pathOf(surface), kind = "invalid_surface_map", property = prop, detail = value,
+								suggestedFix = "Replace the invalid map reference with an uploaded Roblox image asset.",
+							})
+						end
+						checkFetchStatus(pathOf(surface), prop, value)
+					end
+				end
+				meshState.surfaceMaps = maps
+				if maps.ColorMap == "" and (not textureIdReadable or textureId == "") then
+					table.insert(issues.warning, {
+						path = pathOf(part), kind = "surface_without_color_dependency",
+						detail = "SurfaceAppearance has no ColorMap and MeshPart.TextureID is empty.",
+						suggestedFix = "Confirm this is intentionally material-only; otherwise restore the missing color texture.",
+					})
+				end
+			elseif textureIdReadable and textureId == "" and materialVariant == ""
+				and (part.Material == Enum.Material.Plastic or part.Material == Enum.Material.SmoothPlastic) then
+				fallbackCount += 1
+				table.insert(issues.warning, {
+					path = pathOf(part), kind = "likely_fallback_material",
+					detail = "Mesh has no TextureID, SurfaceAppearance, or MaterialVariant and uses a default plastic material.",
+					suggestedFix = "Check the FBX image dependency and material assignment; leave it only if plain plastic is intentional.",
+				})
+			end
+			if #meshes < maxMeshes then
+				table.insert(meshes, meshState)
+			end
+		end
+	end
+	return {
+		meshCount = totalMeshCount,
+		perMeshTruncated = totalMeshCount > #meshes,
+		perMesh = meshes,
+		usageCounts = usage,
+		issues = issues,
+		fallbackMaterialCount = fallbackCount,
+		uvLimitation = "Roblox cannot repair invalid Blender UVs. This audit only identifies missing or suspicious imported dependencies; UV unwrap/channel defects must be fixed and re-exported from Blender.",
+		fetchStatusLimitation = "GetAssetFetchStatus reports current engine state only. A non-Failure status does not prove that an asset will load for every client or permission context.",
+	}
+end
+
+function EnvironmentTools.inspectTextureHealth(p)
+	local root = resolvePath(p.path or p.root)
+	if not root then
+		return { ok = false, err = "texture-health root not found: " .. tostring(p.path or p.root) }
+	end
+	local result = inspectTextureRoot(root, math.clamp(tonumber(p.maxMeshes) or 2000, 1, 10000))
+	result.root = pathOf(root)
+	return { ok = true, result = result }
+end
+
+local function addFinding(groups, severity, finding, cap)
+	if #groups.critical + #groups.warning + #groups.info >= cap then
+		return false
+	end
+	table.insert(groups[severity], finding)
+	return true
+end
+
+function EnvironmentTools.auditEnvironment(p)
+	local root = resolvePath(p.path or p.root)
+	if not root then
+		return { ok = false, err = "audit root not found: " .. tostring(p.path or p.root) }
+	end
+	local maxParts = math.clamp(tonumber(p.maxParts) or 2000, 1, 10000)
+	local parts = collectParts(root, maxParts)
+	local allPartCount = root:IsA("BasePart") and 1 or 0
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") then allPartCount += 1 end
+	end
+	local findings = { critical = {}, warning = {}, info = {} }
+	local cap = math.clamp(tonumber(p.maxFindings) or 500, 1, 5000)
+	local sceneMin = vectorFrom(p.sceneMin or (p.sceneBounds and p.sceneBounds.min))
+	local sceneMax = vectorFrom(p.sceneMax or (p.sceneBounds and p.sceneBounds.max))
+	local triangleLimit = tonumber(p.triangleLimit) or 20000
+	local floatingDistance = tonumber(p.floatingDistance) or 5
+	local floatingTolerance = tonumber(p.floatingTolerance) or 0.08
+	local nearTolerance = tonumber(p.nearCoplanarTolerance) or 0.02
+	local aabbs = {}
+	local triangleInspectable = 0
+	local triangleScanFailures = 0
+	local deepTriangleScans = 0
+	local meshPartCount = 0
+	local maxTriangleMeshes = math.clamp(tonumber(p.maxTriangleMeshes) or 100, 0, 1000)
+	for _, part in ipairs(parts) do
+		local minV, maxV = aabbForPart(part)
+		table.insert(aabbs, { part = part, min = minV, max = maxV })
+		if not part.Anchored then
+			addFinding(findings, "critical", {
+				path = pathOf(part), kind = "unanchored_part", detail = "Imported environment part is not anchored.",
+				suggestedFix = "Anchor the part unless it is intentionally physics-driven.",
+			}, cap)
+		end
+		if part.CanCollide and part.Transparency >= 0.99 and not part:IsA("SpawnLocation") then
+			addFinding(findings, "warning", {
+				path = pathOf(part),
+				kind = "invisible_collision",
+				detail = "Fully transparent part still has CanCollide enabled.",
+				suggestedFix = "Confirm this is an intentional blocker; otherwise disable collision or make the boundary visible.",
+			}, cap)
+		end
+		if sceneMin and sceneMax and (
+			minV.X < sceneMin.X or minV.Y < sceneMin.Y or minV.Z < sceneMin.Z
+			or maxV.X > sceneMax.X or maxV.Y > sceneMax.Y or maxV.Z > sceneMax.Z
+		) then
+			addFinding(findings, "warning", {
+				path = pathOf(part), kind = "outside_scene_bounds", bounds = { min = v3(minV), max = v3(maxV) },
+				suggestedFix = "Move the object inside the configured scene bounds or expand the bounds intentionally.",
+			}, cap)
+		end
+		if part:IsA("MeshPart") then
+			meshPartCount += 1
+			local okMesh, meshSize = pcall(function() return part.MeshSize end)
+			if okMesh and typeof(meshSize) == "Vector3" and meshSize.X > 0 and meshSize.Y > 0 and meshSize.Z > 0 then
+				local scale = Vector3.new(part.Size.X / meshSize.X, part.Size.Y / meshSize.Y, part.Size.Z / meshSize.Z)
+				local lo = math.min(scale.X, scale.Y, scale.Z)
+				local hi = math.max(scale.X, scale.Y, scale.Z)
+				if lo > 0 and hi / lo > (tonumber(p.nonUniformScaleRatio) or 1.05) then
+					addFinding(findings, "warning", {
+						path = pathOf(part), kind = "non_uniform_mesh_scale", scale = v3(scale),
+						suggestedFix = "Apply scale in Blender and re-export if this distortion is unintended.",
+					}, cap)
+				end
+			end
+			local triangleCount = nil
+			-- MeshPart has no official TriangleCount property. An opt-in deep scan
+			-- uses the documented EditableMesh:GetFaces() path, capped because it
+			-- yields, consumes editable-mesh memory, and can require asset permission.
+			if p.deepTriangleScan == true and deepTriangleScans < maxTriangleMeshes then
+				deepTriangleScans += 1
+				local meshId, readable = readProperty(part, "MeshId")
+				if readable and validAssetRef(meshId) then
+					local okEditable, editable = pcall(function()
+						return AssetService:CreateEditableMeshAsync(Content.fromUri(meshId), { FixedSize = true })
+					end)
+					if okEditable and editable then
+						local okFaces, faces = pcall(function() return editable:GetFaces() end)
+						if okFaces and type(faces) == "table" then
+							triangleCount = #faces
+						end
+						pcall(function() editable:Destroy() end)
+					else
+						triangleScanFailures += 1
+					end
+				else
+					triangleScanFailures += 1
+				end
+			end
+			if type(triangleCount) == "number" then
+				triangleInspectable += 1
+				if triangleCount > triangleLimit then
+					addFinding(findings, "critical", {
+						path = pathOf(part), kind = "triangle_limit", triangleCount = triangleCount, limit = triangleLimit,
+						suggestedFix = "Split or decimate this mesh in Blender and re-export it below the configured limit.",
+					}, cap)
+				end
+			end
+		end
+		local horizontalArea = part.Size.X * part.Size.Z
+		if horizontalArea < (tonumber(p.groundAreaSkip) or 10000) then
+			local params = RaycastParams.new()
+			params.FilterType = Enum.RaycastFilterType.Exclude
+			params.FilterDescendantsInstances = { part }
+			local origin = Vector3.new(part.Position.X, minV.Y + 0.05, part.Position.Z)
+			local hit = Workspace:Raycast(origin, Vector3.new(0, -floatingDistance, 0), params)
+			if not hit then
+				addFinding(findings, "warning", {
+					path = pathOf(part), kind = "no_support_below", checkedDistance = floatingDistance,
+					suggestedFix = "Inspect this object in side view and move it onto terrain/support if it is meant to be grounded.",
+				}, cap)
+			else
+				local gap = math.max(0, minV.Y - hit.Position.Y)
+				if gap > floatingTolerance then
+					addFinding(findings, "warning", {
+						path = pathOf(part), kind = "floating_gap", gap = gap, supportPath = pathOf(hit.Instance),
+						suggestedFix = "Lower the object to its support or confirm the gap is intentional.",
+					}, cap)
+				end
+			end
+		end
+	end
+	local pairCap = math.clamp(tonumber(p.maxPairs) or 250000, 1, 1000000)
+	local pairsChecked = 0
+	local pairTruncated = false
+	for i = 1, #aabbs do
+		for j = i + 1, #aabbs do
+			pairsChecked += 1
+			if pairsChecked > pairCap then
+				pairTruncated = true
+				break
+			end
+			local a, b = aabbs[i], aabbs[j]
+			local ox = math.min(a.max.X, b.max.X) - math.max(a.min.X, b.min.X)
+			local oy = math.min(a.max.Y, b.max.Y) - math.max(a.min.Y, b.min.Y)
+			local oz = math.min(a.max.Z, b.max.Z) - math.max(a.min.Z, b.min.Z)
+			if ox > 0 and oy > 0 and oz > 0 then
+				local overlaps = { ox, oy, oz }
+				table.sort(overlaps)
+				local sameSize = (a.part.Size - b.part.Size).Magnitude < 0.01
+				local samePosition = (a.part.Position - b.part.Position).Magnitude < 0.01
+				if sameSize and samePosition then
+					addFinding(findings, "critical", {
+						paths = { pathOf(a.part), pathOf(b.part) }, kind = "duplicate_geometry",
+						suggestedFix = "Delete the unintended duplicate or offset it deliberately.",
+					}, cap)
+				elseif overlaps[1] <= nearTolerance and overlaps[2] > 0.25 and overlaps[3] > 0.25 then
+					addFinding(findings, "warning", {
+						paths = { pathOf(a.part), pathOf(b.part) }, kind = "near_coplanar_overlap",
+						minimumOverlap = overlaps[1],
+						suggestedFix = "Separate, trim, or slightly desize one surface to remove likely Z-fighting.",
+					}, cap)
+				else
+					local intersection = ox * oy * oz
+					local minVolume = math.min(a.part.Size.X * a.part.Size.Y * a.part.Size.Z, b.part.Size.X * b.part.Size.Y * b.part.Size.Z)
+					if minVolume > 0 and intersection / minVolume > (tonumber(p.deepIntersectionRatio) or 0.5) then
+						addFinding(findings, "warning", {
+							paths = { pathOf(a.part), pathOf(b.part) }, kind = "deep_intersection",
+							intersectionRatio = intersection / minVolume,
+							suggestedFix = "Inspect both pieces; trim or reposition one if this embedding is not structural.",
+						}, cap)
+					end
+				end
+			end
+		end
+		if pairTruncated then break end
+	end
+	local textures = inspectTextureRoot(root, maxParts)
+	for severity, rows in pairs(textures.issues) do
+		for _, row in ipairs(rows) do
+			addFinding(findings, severity, row, cap)
+		end
+	end
+	local total = #findings.critical + #findings.warning + #findings.info
+	return {
+		ok = true,
+		result = {
+			root = pathOf(root),
+			summary = {
+				partsScanned = #parts,
+				totalParts = allPartCount,
+				truncatedParts = allPartCount > #parts,
+				pairsChecked = pairsChecked,
+				pairScanTruncated = pairTruncated,
+				triangleInspectableMeshParts = triangleInspectable,
+				deepTriangleScans = deepTriangleScans,
+				triangleScanFailures = triangleScanFailures,
+				triangleScanTruncated = p.deepTriangleScan == true and deepTriangleScans < meshPartCount,
+				critical = #findings.critical,
+				warning = #findings.warning,
+				info = #findings.info,
+				totalFindings = total,
+				findingsTruncated = total >= cap,
+			},
+			findings = findings,
+			heuristics = {
+				geometry = "AABB overlap checks are conservative and may over-report rotated or intentionally nested geometry.",
+				floating = "Downward center raycasts cannot prove every contact point; inspect reported paths visually.",
+				triangles = triangleInspectable > 0
+					and "Triangle counts came from opt-in EditableMesh:GetFaces() reads."
+					or (p.deepTriangleScan == true
+						and "Deep triangle scan produced no readable meshes. Check Allow Mesh/Image APIs, asset permissions, and maxTriangleMeshes."
+						or "Roblox exposes no MeshPart.TriangleCount property. Pass deepTriangleScan=true for a capped EditableMesh:GetFaces() audit."),
+				uv = textures.uvLimitation,
+			},
+		},
+	}
+end
+
+return EnvironmentTools
+]]></ProtectedString>
+   </Properties>
+  </Item>
+  <Item class="ModuleScript" referent="RBX6">
+   <Properties>
+    <string name="Name">AssetGuardTools</string>
+    <ProtectedString name="Source"><![CDATA[--!nonstrict
+-- Creator Store model inspection and guarded insertion. Assets are loaded into
+-- an unparented quarantine container first. No inspected asset enters the place.
+local AssetGuardTools = {}
+
+local RunService = game:GetService("RunService")
+local AssetService = game:GetService("AssetService")
+local ServerStorage = game:GetService("ServerStorage")
+
+local resolvePath
+local recorded
+local readEditorSource
+
+function AssetGuardTools.init(deps)
+	resolvePath = deps.resolvePath
+	recorded = deps.recorded
+	readEditorSource = deps.readEditorSource
+end
+
+local BLOCKED_SEGMENTS = {
+	serverscriptservice = true,
+	starterplayer = true,
+	starterplayerscripts = true,
+	startercharacterscripts = true,
+	startergui = true,
+	starterpack = true,
+	replicatedfirst = true,
+	remotes = true,
+	remoteevents = true,
+	remotefunctions = true,
+	networking = true,
+}
+
+local SAFE_DIRECT_ROOTS = {
+	["game.Workspace"] = true,
+	["game.ServerStorage"] = true,
+	["game.Lighting"] = true,
+	["game.SoundService"] = true,
+}
+
+local SAFE_REPLICATED_FOLDERS = {
+	assets = true,
+	content = true,
+	models = true,
+	packages = true,
+}
+
+local function validateTarget(path)
+	path = tostring(path or "")
+	if string.sub(path, 1, 5) ~= "game." then
+		return false, "targetPath must be an explicit game.<Service> path"
+	end
+	local segments = {}
+	for segment in string.gmatch(path, "[^%.]+") do
+		table.insert(segments, segment)
+	end
+	for i = 2, #segments do
+		if BLOCKED_SEGMENTS[string.lower(segments[i])] then
+			return false, "targetPath enters blocked executable/network surface '" .. segments[i] .. "'"
+		end
+	end
+	for root in pairs(SAFE_DIRECT_ROOTS) do
+		if path == root or string.sub(path, 1, #root + 1) == root .. "." then
+			return true
+		end
+	end
+	if segments[2] == "ReplicatedStorage" and SAFE_REPLICATED_FOLDERS[string.lower(segments[3] or "")] then
+		return true
+	end
+	return false, "targetPath is outside the guarded asset allowlist"
+end
+
+local function sourceHash(text)
+	local normalized = string.gsub(text, "\r\n", "\n")
+	local buf = buffer.fromstring(normalized)
+	local hash = 2166136261
+	for i = 0, buffer.len(buf) - 1 do
+		hash = bit32.bxor(hash, buffer.readu8(buf, i))
+		hash = (bit32.lshift(hash, 24) + bit32.lshift(hash, 8) + hash * 0x93) % 4294967296
+	end
+	return string.format("%08x", hash)
+end
+
+local function relativePath(inst, root)
+	local names = {}
+	local node = inst
+	while node and node ~= root do
+		table.insert(names, 1, node.Name)
+		node = node.Parent
+	end
+	return table.concat(names, ".")
+end
+
+local function isRemote(inst)
+	return inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") or inst:IsA("UnreliableRemoteEvent")
+end
+
+local function addFinding(findings, severity, row)
+	table.insert(findings[severity], row)
+end
+
+local SOURCE_PATTERNS = {
+	{ pattern = "require%s*%(%s*%d+", kind = "numeric_external_require", severity = "critical" },
+	{ pattern = "loadstring%s*%(", kind = "dynamic_code_execution", severity = "critical" },
+	{ pattern = "getfenv%s*%(", kind = "environment_introspection", severity = "critical" },
+	{ pattern = "setfenv%s*%(", kind = "environment_mutation", severity = "critical" },
+	{ pattern = "httpservice", kind = "http_service_access", severity = "critical" },
+	{ pattern = "requestasync%s*%(", kind = "network_request", severity = "critical" },
+	{ pattern = "getasync%s*%(", kind = "network_request", severity = "critical" },
+	{ pattern = "postasync%s*%(", kind = "network_request", severity = "critical" },
+	{ pattern = "insertservice", kind = "nested_asset_loader", severity = "critical" },
+	{ pattern = "loadasset%s*%(", kind = "nested_asset_loader", severity = "critical" },
+	{ pattern = "fireserver%s*%(", kind = "remote_traffic", severity = "warning" },
+	{ pattern = "invokeserver%s*%(", kind = "remote_traffic", severity = "warning" },
+	{ pattern = "fireclient%s*%(", kind = "remote_traffic", severity = "warning" },
+	{ pattern = "fireallclients%s*%(", kind = "remote_traffic", severity = "warning" },
+	{ pattern = "onserverevent", kind = "remote_listener", severity = "warning" },
+	{ pattern = "onclientevent", kind = "remote_listener", severity = "warning" },
+	{ pattern = "string%.char%s*%(", kind = "possible_obfuscation", severity = "warning" },
+	{ pattern = "base64", kind = "possible_encoded_payload", severity = "warning" },
+}
+
+local function scanContainer(container)
+	local findings = { critical = {}, warning = {}, info = {} }
+	local classCounts = {}
+	local scripts = {}
+	local remotes = {}
+	local records = {}
+	local roots = {}
+	for _, child in ipairs(container:GetChildren()) do
+		table.insert(roots, { name = child.Name, className = child.ClassName })
+	end
+	local instances = container:GetDescendants()
+	for _, inst in ipairs(instances) do
+		classCounts[inst.ClassName] = (classCounts[inst.ClassName] or 0) + 1
+		local path = relativePath(inst, container)
+		local record = path .. "|" .. inst.ClassName
+		if inst:IsA("LuaSourceContainer") then
+			local okRead, source = readEditorSource(inst)
+			local scriptRow = {
+				path = path,
+				className = inst.ClassName,
+				readable = okRead,
+				disabled = inst:IsA("BaseScript") and inst.Disabled or nil,
+			}
+			if okRead then
+				scriptRow.sourceHash = sourceHash(source)
+				record ..= "|" .. scriptRow.sourceHash
+				local lower = string.lower(source)
+				for _, check in ipairs(SOURCE_PATTERNS) do
+					if string.find(lower, check.pattern) then
+						addFinding(findings, check.severity, {
+							path = path,
+							issueType = check.kind,
+							detail = "Suspicious source signature matched.",
+							recommendation = "Review the full script source before enabling or moving it out of quarantine.",
+						})
+					end
+				end
+				for line in string.gmatch(source .. "\n", "(.-)\n") do
+					if #line > 500 then
+						addFinding(findings, "warning", {
+							path = path,
+							issueType = "long_minified_line",
+							detail = "A source line exceeds 500 characters.",
+							recommendation = "Treat dense or generated source as untrusted until manually reviewed.",
+						})
+						break
+					end
+				end
+			else
+				addFinding(findings, "critical", {
+					path = path,
+					issueType = "unreadable_executable_source",
+					detail = tostring(source),
+					recommendation = "Do not enable an executable whose source could not be inspected.",
+				})
+			end
+			table.insert(scripts, scriptRow)
+			addFinding(findings, "warning", {
+				path = path,
+				issueType = "executable_descendant",
+				detail = inst.ClassName .. " will be quarantined during guarded insertion.",
+				recommendation = "Keep it quarantined unless a human source review approves it.",
+			})
+		elseif isRemote(inst) then
+			table.insert(remotes, { path = path, className = inst.ClassName })
+			addFinding(findings, "critical", {
+				path = path,
+				issueType = "remote_descendant",
+				detail = "Imported asset contains " .. inst.ClassName .. ".",
+				recommendation = "Keep unexpected networking instances quarantined and recreate only reviewed contracts.",
+			})
+		end
+		table.insert(records, record)
+	end
+	table.sort(records)
+	local fingerprint = sourceHash(table.concat(records, "\n"))
+	return {
+		fingerprint = fingerprint,
+		instanceCount = #instances,
+		rootCount = #roots,
+		roots = roots,
+		classCounts = classCounts,
+		scripts = scripts,
+		remotes = remotes,
+		findings = findings,
+		summary = {
+			critical = #findings.critical,
+			warning = #findings.warning,
+			info = #findings.info,
+			executableCount = #scripts,
+			remoteCount = #remotes,
+		},
+		riskScreen = "Static signatures reduce risk but cannot prove an asset safe. Review quarantined source manually before enabling it.",
+	}
+end
+
+local function loadAsset(assetId)
+	local ok, container = pcall(function()
+		return AssetService:LoadAssetAsync(assetId)
+	end)
+	if not ok or not container then
+		return nil, "LoadAssetAsync failed (asset may be private, moderated, or unavailable): " .. tostring(container)
+	end
+	return container
+end
+
+function AssetGuardTools.scan(p)
+	if RunService:IsRunning() then
+		return { ok = false, err = "guarded asset scan is edit-context only" }
+	end
+	local assetId = tonumber(p.assetId)
+	if not assetId or assetId < 1 then
+		return { ok = false, err = "assetId must be a positive integer" }
+	end
+	local targetOk, targetErr = validateTarget(p.targetPath)
+	if not targetOk then
+		return { ok = false, err = targetErr }
+	end
+	local container, loadErr = loadAsset(assetId)
+	if not container then
+		return { ok = false, err = loadErr }
+	end
+	local okScan, report = pcall(scanContainer, container)
+	container:Destroy()
+	if not okScan then
+		return { ok = false, err = "asset scan failed: " .. tostring(report) }
+	end
+	report.assetId = assetId
+	report.targetPath = p.targetPath
+	report.mutation = "none; asset was loaded into an unparented container and destroyed"
+	return { ok = true, result = report }
+end
+
+local function quarantineExecutables(container, quarantine)
+	local moved = {}
+	for _, inst in ipairs(container:GetDescendants()) do
+		if inst:IsA("LuaSourceContainer") or isRemote(inst) then
+			if inst:IsA("BaseScript") then
+				inst.Disabled = true
+			end
+			table.insert(moved, {
+				originalPath = relativePath(inst, container),
+				className = inst.ClassName,
+				name = inst.Name,
+			})
+			inst.Parent = quarantine
+		end
+	end
+	return moved
+end
+
+function AssetGuardTools.insert(p)
+	if RunService:IsRunning() then
+		return { ok = false, err = "guarded asset insertion is edit-context only" }
+	end
+	if p.confirm ~= true then
+		return { ok = false, err = "guarded insertion requires confirm=true" }
+	end
+	local assetId = tonumber(p.assetId)
+	if not assetId or assetId < 1 then
+		return { ok = false, err = "assetId must be a positive integer" }
+	end
+	local targetOk, targetErr = validateTarget(p.targetPath)
+	if not targetOk then
+		return { ok = false, err = targetErr }
+	end
+	local target = resolvePath(p.targetPath)
+	if not target then
+		return { ok = false, err = "targetPath not found: " .. tostring(p.targetPath) }
+	end
+	local container, loadErr = loadAsset(assetId)
+	if not container then
+		return { ok = false, err = loadErr }
+	end
+	local okScan, preScan = pcall(scanContainer, container)
+	if not okScan then
+		container:Destroy()
+		return { ok = false, err = "pre-insert scan failed: " .. tostring(preScan) }
+	end
+	if tostring(preScan.fingerprint) ~= tostring(p.expectedFingerprint) then
+		container:Destroy()
+		return {
+			ok = false,
+			err = "asset contents changed after inspection; fingerprint mismatch. Inspect again before inserting.",
+		}
+	end
+	if preScan.summary.critical > 0 and p.allowCriticalRisk ~= true then
+		container:Destroy()
+		return {
+			ok = false,
+			err = "scan found critical risk; pass allowCriticalRisk=true only after reviewing the inspection report",
+			result = preScan,
+		}
+	end
+	local inserted = {}
+	local quarantined = {}
+	local quarantinePath = nil
+	local okRecord, recordResult = recorded("guarded_insert_asset", function()
+		local quarantineRoot = ServerStorage:FindFirstChild("NikMCPQuarantine")
+		if not quarantineRoot then
+			quarantineRoot = Instance.new("Folder")
+			quarantineRoot.Name = "NikMCPQuarantine"
+			quarantineRoot.Parent = ServerStorage
+		end
+		local quarantine = Instance.new("Folder")
+		quarantine.Name = "Asset_" .. tostring(assetId) .. "_" .. tostring(os.time())
+		quarantine:SetAttribute("AssetId", assetId)
+		quarantine:SetAttribute("ScanFingerprint", preScan.fingerprint)
+		quarantine.Parent = quarantineRoot
+		quarantinePath = quarantine:GetFullName()
+		quarantined = quarantineExecutables(container, quarantine)
+		for _, child in ipairs(container:GetChildren()) do
+			child.Parent = target
+			table.insert(inserted, {
+				path = child:GetFullName(),
+				className = child.ClassName,
+				name = child.Name,
+			})
+		end
+	end)
+	container:Destroy()
+	if not okRecord then
+		return { ok = false, err = "guarded insertion failed: " .. tostring(recordResult) }
+	end
+	local postScripts = {}
+	local postRemotes = {}
+	for _, root in ipairs(inserted) do
+		local inst = resolvePath(root.path)
+		if inst then
+			for _, descendant in ipairs(inst:GetDescendants()) do
+				if descendant:IsA("LuaSourceContainer") then
+					table.insert(postScripts, descendant:GetFullName())
+				elseif isRemote(descendant) then
+					table.insert(postRemotes, descendant:GetFullName())
+				end
+			end
+		end
+	end
+	return {
+		ok = true,
+		output = ("guarded insert completed: %d roots inserted, %d executable/network instances quarantined")
+			:format(#inserted, #quarantined),
+		result = {
+			assetId = assetId,
+			targetPath = p.targetPath,
+			inserted = inserted,
+			quarantined = quarantined,
+			quarantinePath = quarantinePath,
+			preInsertScan = preScan,
+			postInsertScan = {
+				scriptPaths = postScripts,
+				remotePaths = postRemotes,
+				clean = #postScripts == 0 and #postRemotes == 0,
+			},
+			scriptPolicy = "All Script, LocalScript, ModuleScript, RemoteEvent, RemoteFunction, and UnreliableRemoteEvent descendants were moved to ServerStorage.NikMCPQuarantine. BaseScripts were disabled.",
+		},
+	}
+end
+
+return AssetGuardTools
+]]></ProtectedString>
+   </Properties>
+  </Item>
+  <Item class="ModuleScript" referent="RBX7">
+   <Properties>
+    <string name="Name">QATools</string>
+    <ProtectedString name="Source"><![CDATA[--!nonstrict
+-- Edit-context QA helpers. Multi-client orchestration stays Node-side; this
+-- module owns only privileged Studio device simulator state.
+local QATools = {}
+
+local RunService = game:GetService("RunService")
+local StudioDeviceSimulatorService = game:GetService("StudioDeviceSimulatorService")
+
+local temporaryDevices = {}
+local deviceSequence = 0
+
+local function callGetter(methodName)
+	local ok, value = pcall(function()
+		return StudioDeviceSimulatorService[methodName](StudioDeviceSimulatorService)
+	end)
+	if not ok then
+		return nil, tostring(value)
+	end
+	return value, nil
+end
+
+local function currentState()
+	local deviceId, deviceErr = callGetter("GetDeviceAsync")
+	local resolution, resolutionErr = callGetter("GetResolutionAsync")
+	local orientation, orientationErr = callGetter("GetOrientationAsync")
+	local pixelDensity, densityErr = callGetter("GetPixelDensityAsync")
+	local scalingMode, scalingErr = callGetter("GetScalingModeAsync")
+	return {
+		deviceId = deviceId,
+		resolution = resolution and { x = resolution.X, y = resolution.Y } or nil,
+		orientation = orientation and orientation.Name or nil,
+		pixelDensity = pixelDensity,
+		scalingMode = scalingMode and scalingMode.Name or nil,
+		readErrors = {
+			device = deviceErr,
+			resolution = resolutionErr,
+			orientation = orientationErr,
+			pixelDensity = densityErr,
+			scalingMode = scalingErr,
+		},
+	}
+end
+
+function QATools.deviceSnapshot()
+	if RunService:IsRunning() then
+		return { ok = false, err = "device simulator snapshot is edit-context only" }
+	end
+	return { ok = true, result = currentState() }
+end
+
+local function enumItem(enumType, name)
+	for _, item in ipairs(enumType:GetEnumItems()) do
+		if item.Name == name then
+			return item
+		end
+	end
+	return nil
+end
+
+function QATools.deviceApply(p)
+	if RunService:IsRunning() then
+		return { ok = false, err = "device simulator changes are edit-context only" }
+	end
+	local width = math.floor(tonumber(p.width) or 0)
+	local height = math.floor(tonumber(p.height) or 0)
+	local density = math.floor(tonumber(p.pixelDensity) or 0)
+	if width < 100 or height < 100 or density < 1 then
+		return { ok = false, err = "width, height, and pixelDensity must describe a real device profile" }
+	end
+	local deviceForm = enumItem(Enum.DeviceForm, tostring(p.deviceForm))
+	local orientation = enumItem(Enum.ScreenOrientation, tostring(p.orientation))
+	local scalingMode = enumItem(Enum.DeviceSimulatorScalingMode, tostring(p.scalingMode or "FitToWindow"))
+	if not deviceForm or not orientation or not scalingMode then
+		return { ok = false, err = "invalid deviceForm, orientation, or scalingMode enum name" }
+	end
+	deviceSequence += 1
+	local okCreate, deviceId = pcall(function()
+		return StudioDeviceSimulatorService:CreateDeviceAsync({
+			Name = "NikMCP QA " .. tostring(p.label or "device") .. " " .. tostring(deviceSequence),
+			Width = width,
+			Height = height,
+			PixelDensity = density,
+			DeviceForm = deviceForm,
+		})
+	end)
+	if not okCreate then
+		return { ok = false, err = "CreateDeviceAsync failed: " .. tostring(deviceId) }
+	end
+	table.insert(temporaryDevices, deviceId)
+	local okApply, applyErr = pcall(function()
+		StudioDeviceSimulatorService:SetDeviceAsync(deviceId)
+		StudioDeviceSimulatorService:SetOrientationAsync(orientation)
+		StudioDeviceSimulatorService:SetResolutionAsync(width, height)
+		StudioDeviceSimulatorService:SetPixelDensityAsync(density)
+		StudioDeviceSimulatorService:SetScalingModeAsync(scalingMode)
+	end)
+	if not okApply then
+		return { ok = false, err = "device profile apply failed: " .. tostring(applyErr), result = { deviceId = deviceId } }
+	end
+	return {
+		ok = true,
+		result = {
+			temporaryDeviceId = deviceId,
+			requested = {
+				label = p.label,
+				width = width,
+				height = height,
+				pixelDensity = density,
+				deviceForm = deviceForm.Name,
+				orientation = orientation.Name,
+				scalingMode = scalingMode.Name,
+			},
+			active = currentState(),
+		},
+	}
+end
+
+function QATools.deviceRestore(p)
+	if RunService:IsRunning() then
+		return { ok = false, err = "device simulator restore is edit-context only" }
+	end
+	local snapshot = type(p.snapshot) == "table" and p.snapshot or {}
+	local errors = {}
+	local targetId = tostring(snapshot.deviceId or "default")
+	local okSwitch, switchErr = pcall(function()
+		if targetId == "" or targetId == "default" then
+			StudioDeviceSimulatorService:StopSimulationAsync()
+		else
+			StudioDeviceSimulatorService:SetDeviceAsync(targetId)
+		end
+	end)
+	if not okSwitch then
+		table.insert(errors, "restore device: " .. tostring(switchErr))
+	end
+	if okSwitch and targetId ~= "default" then
+		local okDetails, detailsErr = pcall(function()
+			local orientation = enumItem(Enum.ScreenOrientation, tostring(snapshot.orientation))
+			local scalingMode = enumItem(Enum.DeviceSimulatorScalingMode, tostring(snapshot.scalingMode))
+			if orientation then
+				StudioDeviceSimulatorService:SetOrientationAsync(orientation)
+			end
+			if type(snapshot.resolution) == "table" then
+				StudioDeviceSimulatorService:SetResolutionAsync(
+					tonumber(snapshot.resolution.x) or 0,
+					tonumber(snapshot.resolution.y) or 0
+				)
+			end
+			if tonumber(snapshot.pixelDensity) then
+				StudioDeviceSimulatorService:SetPixelDensityAsync(tonumber(snapshot.pixelDensity))
+			end
+			if scalingMode then
+				StudioDeviceSimulatorService:SetScalingModeAsync(scalingMode)
+			end
+		end)
+		if not okDetails then
+			table.insert(errors, "restore profile: " .. tostring(detailsErr))
+		end
+	end
+	local removed = {}
+	for _, deviceId in ipairs(temporaryDevices) do
+		local okRemove, removeErr = pcall(function()
+			StudioDeviceSimulatorService:RemoveDeviceAsync(deviceId)
+		end)
+		table.insert(removed, {
+			deviceId = deviceId,
+			removed = okRemove,
+			error = if okRemove then nil else tostring(removeErr),
+		})
+	end
+	temporaryDevices = {}
+	return {
+		ok = #errors == 0,
+		err = #errors > 0 and table.concat(errors, "; ") or nil,
+		result = {
+			restored = currentState(),
+			temporaryDevices = removed,
+			errors = errors,
+		},
+	}
+end
+
+return QATools
+]]></ProtectedString>
+   </Properties>
+  </Item>
+  <Item class="ModuleScript" referent="RBX8">
+   <Properties>
+    <string name="Name">AgentTools</string>
+    <ProtectedString name="Source"><![CDATA[--!nonstrict
+-- High-value agent reliability tools kept outside Executor.luau so the main
+-- dispatch module remains safely below Luau's 200-local register limit.
+local AgentTools = {}
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ScriptEditorService = game:GetService("ScriptEditorService")
+local ScriptProfilerService = game:GetService("ScriptProfilerService")
+
+local resolvePath
+local readEditorSource
+
+function AgentTools.init(deps)
+	resolvePath = deps and deps.resolvePath or nil
+	readEditorSource = deps and deps.readEditorSource or nil
+end
+
+local SCRIPT_CLASSES = {
+	Script = true,
+	LocalScript = true,
+	ModuleScript = true,
+}
+local profilerBusy = false
+
+local function normalizeSource(source)
+	return (string.gsub(source, "\r\n", "\n"))
+end
+
+-- FNV-1a over UTF-8 bytes. Keep this bit-identical to src/sync.ts.
+local function sourceHash(source)
+	local bytes = buffer.fromstring(normalizeSource(source))
+	local hash = 2166136261
+	for index = 0, buffer.len(bytes) - 1 do
+		hash = bit32.bxor(hash, buffer.readu8(bytes, index))
+		hash = (bit32.lshift(hash, 24) + bit32.lshift(hash, 8) + hash * 0x93) % 4294967296
+	end
+	return string.format("%08x", hash)
+end
+
+local function readSource(instance)
+	if type(readEditorSource) ~= "function" then
+		return false, "AgentTools.init requires readEditorSource"
+	end
+	local okCall, okRead, source = pcall(readEditorSource, instance)
+	if not okCall then
+		return false, tostring(okRead)
+	end
+	if not okRead or type(source) ~= "string" then
+		return false, tostring(source or "could not read source")
+	end
+	return true, source
+end
+
+local function updateSourceIfHash(instance, expectedHash, source)
+	local observedHash = nil
+	local cancelledReason = nil
+	local ok, err = pcall(function()
+		ScriptEditorService:UpdateSourceAsync(instance, function(oldContent)
+			if type(oldContent) ~= "string" then
+				cancelledReason = "UpdateSourceAsync supplied non-string oldContent"
+				return nil
+			end
+			observedHash = sourceHash(oldContent)
+			if observedHash ~= expectedHash then
+				cancelledReason =
+					("source drifted inside UpdateSourceAsync: observed %s, expected %s")
+						:format(tostring(observedHash), expectedHash)
+				return nil
+			end
+			return source
+		end)
+	end)
+	if not ok then
+		return false, tostring(err), observedHash
+	end
+	if cancelledReason then
+		return false, cancelledReason, observedHash
+	end
+	return true, nil, observedHash
+end
+
+local function rollbackTouched(touched, failure)
+	local rows = {}
+	local failures = {}
+	for index = #touched, 1, -1 do
+		local item = touched[index]
+		local initialReadOk, initialSourceOrErr = readSource(item.instance)
+		local initialHash = if initialReadOk then sourceHash(initialSourceOrErr) else nil
+		local writeOk = initialReadOk
+		local writeErr = if initialReadOk then nil else tostring(initialSourceOrErr)
+		local callbackHash = nil
+		if initialReadOk and initialHash == item.desiredHash then
+			writeOk, writeErr, callbackHash =
+				updateSourceIfHash(item.instance, item.desiredHash, item.originalSource)
+		elseif initialReadOk and initialHash ~= item.beforeHash then
+			writeOk = false
+			writeErr =
+				("rollback refused to overwrite concurrent source hash %s; expected patched %s or original %s")
+					:format(tostring(initialHash), item.desiredHash, item.beforeHash)
+		end
+
+		local readOk, currentOrErr = readSource(item.instance)
+		local restoredHash = if readOk then sourceHash(currentOrErr) else nil
+		local restored = readOk and restoredHash == item.beforeHash
+		local row = {
+			path = item.path,
+			beforeHash = item.beforeHash,
+			initialRollbackHash = initialHash,
+			callbackHash = callbackHash,
+			restoredHash = restoredHash,
+			restored = restored,
+			writeOk = writeOk,
+			writeError = writeErr,
+			readError = if readOk then nil else tostring(currentOrErr),
+		}
+		table.insert(rows, 1, row)
+		if not restored then
+			table.insert(
+				failures,
+				("ROLLBACK FAILURE at %s: write=%s read=%s restoredHash=%s expected=%s")
+					:format(
+						item.path,
+						tostring(writeErr or "ok"),
+						tostring(if readOk then "ok" else currentOrErr),
+						tostring(restoredHash),
+						item.beforeHash
+					)
+			)
+		end
+	end
+
+	local complete = #failures == 0
+	local message = tostring(failure)
+	if not complete then
+		message ..= " | CRITICAL: transactional rollback was incomplete: " .. table.concat(failures, " | ")
+	end
+	return {
+		ok = false,
+		err = message,
+		result = {
+			phase = "rollback",
+			failure = tostring(failure),
+			mutationState = if complete
+				then "all touched scripts restored to their pre-transaction hashes"
+				else "CRITICAL: one or more scripts were not safely restored; concurrent source was preserved",
+			rollback = {
+				attempted = #touched,
+				complete = complete,
+				items = rows,
+				failures = failures,
+				strategy = "conditional source restore with before/desired hash guards",
+			},
+		},
+	}
+end
+
+function AgentTools.applyScriptPatchset(payload)
+	if RunService:IsRunning() then
+		return { ok = false, err = "apply_script_patchset is edit-context only (stop the playtest first)" }
+	end
+	if type(resolvePath) ~= "function" or type(readEditorSource) ~= "function" then
+		return { ok = false, err = "AgentTools.init was not called with resolvePath and readEditorSource" }
+	end
+	if type(payload) ~= "table" or payload.confirm ~= true then
+		return { ok = false, err = "apply_script_patchset requires confirm=true" }
+	end
+	if type(payload.items) ~= "table" or #payload.items < 1 or #payload.items > 50 then
+		return { ok = false, err = "items must contain 1-50 existing script patches" }
+	end
+
+	local validated = {}
+	local seenInstances = {}
+	local totalSourceBytes = 0
+	for index, rawItem in ipairs(payload.items) do
+		if type(rawItem) ~= "table" then
+			return { ok = false, err = ("items[%d] must be an object"):format(index) }
+		end
+		if type(rawItem.path) ~= "string" or rawItem.path == "" then
+			return { ok = false, err = ("items[%d].path must be a non-empty string"):format(index) }
+		end
+		if type(rawItem.expectedHash) ~= "string"
+			or #rawItem.expectedHash ~= 8
+			or not string.match(rawItem.expectedHash, "^[0-9a-fA-F]+$")
+		then
+			return { ok = false, err = ("items[%d].expectedHash must be an 8-character FNV-1a hex hash"):format(index) }
+		end
+		if type(rawItem.source) ~= "string" then
+			return { ok = false, err = ("items[%d].source must be a string"):format(index) }
+		end
+
+		local instance = resolvePath(rawItem.path)
+		if not instance then
+			return { ok = false, err = ("items[%d] path not found: %s"):format(index, rawItem.path) }
+		end
+		if not SCRIPT_CLASSES[instance.ClassName] or not instance:IsA("LuaSourceContainer") then
+			return {
+				ok = false,
+				err = ("items[%d] path is %s, not an editable Script, LocalScript, or ModuleScript: %s")
+					:format(index, instance.ClassName, rawItem.path),
+			}
+		end
+		if seenInstances[instance] then
+			return {
+				ok = false,
+				err = ("items[%d] resolves to a script already present in this patchset: %s"):format(index, instance:GetFullName()),
+			}
+		end
+		seenInstances[instance] = true
+
+		local readOk, originalOrErr = readSource(instance)
+		if not readOk then
+			return {
+				ok = false,
+				err = ("items[%d] could not read %s: %s"):format(index, instance:GetFullName(), tostring(originalOrErr)),
+			}
+		end
+		local beforeHash = sourceHash(originalOrErr)
+		local expectedHash = string.lower(rawItem.expectedHash)
+		if beforeHash ~= expectedHash then
+			return {
+				ok = false,
+				err = ("items[%d] drifted before apply: %s is %s, expected %s")
+					:format(index, instance:GetFullName(), beforeHash, expectedHash),
+				result = {
+					phase = "prevalidate",
+					failedIndex = index,
+					path = instance:GetFullName(),
+					actualHash = beforeHash,
+					expectedHash = expectedHash,
+					mutation = "none",
+				},
+			}
+		end
+
+		local desiredSource = normalizeSource(rawItem.source)
+		if #desiredSource > 1000000 then
+			return {
+				ok = false,
+				err = ("items[%d].source exceeds the 1,000,000-byte cap"):format(index),
+			}
+		end
+		local desiredHash = sourceHash(desiredSource)
+		totalSourceBytes += #desiredSource
+		if totalSourceBytes > 5000000 then
+			return { ok = false, err = "patchset sources exceed the 5,000,000-byte total cap" }
+		end
+		table.insert(validated, {
+			instance = instance,
+			path = instance:GetFullName(),
+			className = instance.ClassName,
+			originalSource = originalOrErr,
+			beforeHash = beforeHash,
+			expectedHash = expectedHash,
+			desiredSource = desiredSource,
+			desiredHash = desiredHash,
+		})
+	end
+
+	local changedCount = 0
+	for _, item in ipairs(validated) do
+		if item.beforeHash ~= item.desiredHash then
+			changedCount += 1
+		end
+	end
+	if changedCount == 0 then
+		local evidence = {}
+		for _, item in ipairs(validated) do
+			table.insert(evidence, {
+				path = item.path,
+				className = item.className,
+				beforeHash = item.beforeHash,
+				afterHash = item.beforeHash,
+				expectedHash = item.expectedHash,
+				desiredHash = item.desiredHash,
+				changed = false,
+			})
+		end
+		return {
+			ok = true,
+			output = "transactional patchset already applied; no script source changed",
+			result = {
+				requestedCount = #validated,
+				appliedCount = 0,
+				totalSourceBytes = totalSourceBytes,
+				undo = "not needed",
+				items = evidence,
+			},
+		}
+	end
+
+	local touched = {}
+	local evidence = {}
+
+	for _, item in ipairs(validated) do
+		local liveReadOk, liveSourceOrErr = readSource(item.instance)
+		if not liveReadOk then
+			return rollbackTouched(
+				touched,
+				("apply stopped before %s: source could not be re-read: %s"):format(item.path, tostring(liveSourceOrErr))
+			)
+		end
+		local liveHash = sourceHash(liveSourceOrErr)
+		if liveHash ~= item.beforeHash then
+			return rollbackTouched(
+				touched,
+				("apply stopped before %s: concurrent drift changed hash from %s to %s")
+					:format(item.path, item.beforeHash, liveHash)
+			)
+		end
+		if item.beforeHash == item.desiredHash then
+			table.insert(evidence, {
+				path = item.path,
+				className = item.className,
+				beforeHash = item.beforeHash,
+				afterHash = liveHash,
+				expectedHash = item.expectedHash,
+				desiredHash = item.desiredHash,
+				changed = false,
+			})
+			continue
+		end
+
+		table.insert(touched, item)
+		local writeOk, writeErr, callbackHash =
+			updateSourceIfHash(item.instance, item.beforeHash, item.desiredSource)
+		if not writeOk then
+			return rollbackTouched(
+				touched,
+				("apply failed at %s: UpdateSourceAsync failed: %s (callback hash %s)")
+					:format(item.path, tostring(writeErr), tostring(callbackHash))
+			)
+		end
+		local readOk, currentOrErr = readSource(item.instance)
+		if not readOk then
+			return rollbackTouched(
+				touched,
+				("apply failed at %s: post-write source could not be read: %s"):format(item.path, tostring(currentOrErr))
+			)
+		end
+		local afterHash = sourceHash(currentOrErr)
+		if afterHash ~= item.desiredHash then
+			return rollbackTouched(
+				touched,
+				("apply failed at %s: post-write hash %s did not match desired hash %s")
+					:format(item.path, afterHash, item.desiredHash)
+			)
+		end
+		table.insert(evidence, {
+			path = item.path,
+			className = item.className,
+			beforeHash = item.beforeHash,
+			afterHash = afterHash,
+			expectedHash = item.expectedHash,
+			desiredHash = item.desiredHash,
+			changed = true,
+		})
+	end
+
+	return {
+		ok = true,
+		output = ("transactional patchset applied: %d scripts changed, %d verified"):format(changedCount, #validated),
+		result = {
+			requestedCount = #validated,
+			appliedCount = changedCount,
+			totalSourceBytes = totalSourceBytes,
+			undo = "LuaSourceContainer source writes are not captured by ChangeHistoryService",
+			rollback = "on failure, every touched source is conditionally restored and hash-verified",
+			verification = "every changed script was re-read and matched its desired FNV-1a hash",
+			items = evidence,
+		},
+	}
+end
+
+local function boundedNumber(value, defaultValue, minimum, maximum)
+	local numberValue = if value == nil then defaultValue else tonumber(value)
+	if not numberValue or numberValue < minimum or numberValue > maximum then
+		return nil
+	end
+	return numberValue
+end
+
+local function sanitizeProfile(root, maxDepth, maxNodes)
+	local stats = {
+		nodesVisited = 0,
+		depthTruncations = 0,
+		nodeTruncations = 0,
+		stringTruncations = 0,
+		cycles = 0,
+	}
+	local seen = {}
+
+	local function sanitize(value, depth)
+		if stats.nodesVisited >= maxNodes then
+			stats.nodeTruncations += 1
+			return "<truncated: node limit>"
+		end
+		stats.nodesVisited += 1
+		if depth > maxDepth then
+			stats.depthTruncations += 1
+			return "<truncated: depth limit>"
+		end
+
+		local valueType = typeof(value)
+		if value == nil or valueType == "boolean" then
+			return value
+		elseif valueType == "number" then
+			if value ~= value or value == math.huge or value == -math.huge then
+				return tostring(value)
+			end
+			return value
+		elseif valueType == "string" then
+			if #value > 4096 then
+				stats.stringTruncations += 1
+				return string.sub(value, 1, 4096) .. "<truncated>"
+			end
+			return value
+		elseif valueType == "Instance" then
+			local ok, path = pcall(function()
+				return value:GetFullName()
+			end)
+			return {
+				type = "Instance",
+				path = if ok then path else tostring(value),
+				className = value.ClassName,
+			}
+		elseif valueType ~= "table" then
+			return tostring(value)
+		end
+
+		if seen[value] then
+			stats.cycles += 1
+			return "<cycle>"
+		end
+		seen[value] = true
+
+		local length = #value
+		local isArray = length > 0
+		if isArray then
+			for key in pairs(value) do
+				if type(key) ~= "number" or key < 1 or key > length or key % 1 ~= 0 then
+					isArray = false
+					break
+				end
+			end
+		end
+		local output = {}
+		if isArray then
+			for index = 1, length do
+				if stats.nodesVisited >= maxNodes then
+					stats.nodeTruncations += 1
+					table.insert(output, "<truncated: node limit>")
+					break
+				end
+				table.insert(output, sanitize(value[index], depth + 1))
+			end
+		else
+			for key, child in pairs(value) do
+				if stats.nodesVisited >= maxNodes then
+					stats.nodeTruncations += 1
+					output["<truncated>"] = "node limit"
+					break
+				end
+				local safeKey = tostring(key)
+				if #safeKey > 256 then
+					safeKey = string.sub(safeKey, 1, 256) .. "<truncated>"
+				end
+				output[safeKey] = sanitize(child, depth + 1)
+			end
+		end
+		seen[value] = nil
+		return output
+	end
+
+	return sanitize(root, 0), stats
+end
+
+function AgentTools.captureScriptProfile(payload)
+	-- This module runs in Studio's edit-plugin DataModel, where the local
+	-- RunService can remain stopped while a separate F5 server DataModel is
+	-- active. The Node orchestrator requires a connected runtime server before
+	-- dispatch; ScriptProfilerService's start call is the final engine check.
+	local p = if type(payload) == "table" then payload else {}
+	local side = tostring(p.side or "server")
+	if side ~= "server" and side ~= "client" then
+		return { ok = false, err = "side must be 'server' or 'client'" }
+	end
+	local duration = boundedNumber(p.durationSec, 2, 0.25, 10)
+	local dataTimeout = boundedNumber(p.dataTimeoutSec, 5, 0.25, 10)
+	local maxDepth = boundedNumber(p.maxDepth, 12, 1, 20)
+	local maxNodes = boundedNumber(p.maxNodes, 5000, 100, 20000)
+	if not duration then
+		return { ok = false, err = "durationSec must be between 0.25 and 10" }
+	elseif not dataTimeout then
+		return { ok = false, err = "dataTimeoutSec must be between 0.25 and 10" }
+	elseif not maxDepth then
+		return { ok = false, err = "maxDepth must be between 1 and 20" }
+	elseif not maxNodes then
+		return { ok = false, err = "maxNodes must be between 100 and 20000" }
+	end
+
+	local targetPlayer = nil
+	if side == "client" then
+		targetPlayer = Players:GetPlayers()[1]
+		if not targetPlayer then
+			return { ok = false, err = "client profiling requires at least one playtest player" }
+		end
+	end
+	if profilerBusy then
+		return { ok = false, err = "another NikMCP script profile capture is already running" }
+	end
+	profilerBusy = true
+
+	local jsonData = nil
+	local dataPlayer = nil
+	local acceptData = false
+	local started = false
+	local stopped = false
+	local connectOk, connectionOrErr = pcall(function()
+		return ScriptProfilerService.OnNewData:Connect(function(player, jsonString)
+			local matches = if side == "server" then player == nil else player == targetPlayer
+			if acceptData and matches and jsonData == nil and type(jsonString) == "string" then
+				jsonData = jsonString
+				dataPlayer = player
+			end
+		end)
+	end)
+	if not connectOk then
+		profilerBusy = false
+		return { ok = false, err = "could not subscribe to ScriptProfilerService.OnNewData: " .. tostring(connectionOrErr) }
+	end
+	local connection = connectionOrErr
+
+	local function stopProfile()
+		if not started or stopped then
+			return true, nil
+		end
+		local ok, err = pcall(function()
+			if side == "server" then
+				ScriptProfilerService:ServerStop()
+			else
+				ScriptProfilerService:ClientStop(targetPlayer)
+			end
+		end)
+		if ok then
+			stopped = true
+		end
+		return ok, if ok then nil else tostring(err)
+	end
+
+	local okRun, resultOrErr = xpcall(function()
+		local startOk, startErr = pcall(function()
+			if side == "server" then
+				ScriptProfilerService:ServerStart()
+			else
+				ScriptProfilerService:ClientStart(targetPlayer)
+			end
+		end)
+		if not startOk then
+			error(
+				"capture_script_profile requires an active Studio playtest; profiler start failed: " .. tostring(startErr),
+				0
+			)
+		end
+		started = true
+
+		local captureStartedAt = os.clock()
+		task.wait(duration)
+		local stopOk, stopErr = stopProfile()
+		if not stopOk then
+			error("profiler stop failed: " .. tostring(stopErr), 0)
+		end
+
+		acceptData = true
+		local requestOk, requestErr = pcall(function()
+			if side == "server" then
+				ScriptProfilerService:ServerRequestData()
+			else
+				ScriptProfilerService:ClientRequestData(targetPlayer)
+			end
+		end)
+		if not requestOk then
+			acceptData = false
+			error("profiler data request failed: " .. tostring(requestErr), 0)
+		end
+
+		local waitStartedAt = os.clock()
+		while jsonData == nil and os.clock() - waitStartedAt < dataTimeout do
+			task.wait(0.05)
+		end
+		if jsonData == nil then
+			acceptData = false
+			error(("profiler produced no %s data within %.2f seconds"):format(side, dataTimeout), 0)
+		end
+		acceptData = false
+		local rawJson = jsonData
+		local parseOk, parsedOrErr = pcall(function()
+			return ScriptProfilerService:DeserializeJSON(rawJson)
+		end)
+		if not parseOk then
+			error("profiler JSON deserialization failed: " .. tostring(parsedOrErr), 0)
+		end
+		local sanitized, truncation = sanitizeProfile(parsedOrErr, math.floor(maxDepth), math.floor(maxNodes))
+		return {
+			side = side,
+			player = dataPlayer and dataPlayer.Name or nil,
+			durationSec = duration,
+			elapsedSec = os.clock() - captureStartedAt,
+			frequency = "engine default",
+			rawJsonBytes = #rawJson,
+			profile = sanitized,
+			truncation = truncation,
+			rawJsonReturned = false,
+		}
+	end, debug.traceback)
+
+	acceptData = false
+	local cleanupStopOk, cleanupStopErr = stopProfile()
+	local disconnectOk, disconnectErr = pcall(function()
+		connection:Disconnect()
+	end)
+	profilerBusy = false
+	if not okRun then
+		local cleanupParts = {}
+		if not cleanupStopOk then
+			table.insert(cleanupParts, "cleanup stop failed: " .. tostring(cleanupStopErr))
+		end
+		if not disconnectOk then
+			table.insert(cleanupParts, "cleanup disconnect failed: " .. tostring(disconnectErr))
+		end
+		local cleanupSuffix = if #cleanupParts > 0 then " | " .. table.concat(cleanupParts, " | ") else ""
+		return { ok = false, err = tostring(resultOrErr) .. cleanupSuffix }
+	end
+	if not cleanupStopOk or not disconnectOk then
+		return {
+			ok = false,
+			err = "profile data was captured, but cleanup was incomplete: "
+				.. table.concat({
+					if cleanupStopOk then "stop ok" else "stop failed: " .. tostring(cleanupStopErr),
+					if disconnectOk then "disconnect ok" else "disconnect failed: " .. tostring(disconnectErr),
+				}, "; "),
+			result = resultOrErr,
+		}
+	end
+	return {
+		ok = true,
+		output = ("captured %.2f seconds of bounded %s script-profiler data"):format(duration, side),
+		result = resultOrErr,
+	}
+end
+
+return AgentTools
+]]></ProtectedString>
+   </Properties>
+  </Item>
+  <Item class="ModuleScript" referent="RBX9">
+   <Properties>
     <string name="Name">Executor</string>
     <ProtectedString name="Source"><![CDATA[-- Executes commands against the DataModel. Used by the edit plugin.
 -- (The runtime agent inlines a minimal version; the tools added in Task 5 are
@@ -3306,6 +5749,10 @@ local Stats = game:GetService("Stats")
 local StarterPlayer = game:GetService("StarterPlayer")
 local Serializer = require(script.Parent.Serializer)
 local ClientAgentSource = require(script.Parent.ClientAgentSource)
+local EnvironmentTools = require(script.Parent.EnvironmentTools)
+local AssetGuardTools = require(script.Parent.AssetGuardTools)
+local QATools = require(script.Parent.QATools)
+local AgentTools = require(script.Parent.AgentTools)
 -- Bucket 2 (project understanding) + Bucket 3 (style/art direction) analysis
 -- helpers live in their own ModuleScript so Executor's top-level scope stays
 -- under Luau's 200-local bytecode-compiler limit. See AnalysisTools.luau's
@@ -3377,7 +5824,7 @@ end
 seedConsole()
 -- Playtest log ring (feeds get_playtest_output). Only fills while capturing
 -- (set by playtest_control start/stop) so it isolates a single playtest run.
-local PLAYTEST_CAP = 1000
+local PLAYTEST_CAP = 3000 -- v0.2.0: larger edit-side ring so soak-test noise evicts less
 local playtestRing: { { text: string, level: string, t: number } } = {}
 local playtestCapturing = false
 -- Lifecycle tracking for get_playtest_status + the auto-stop safety net. Only
@@ -3387,6 +5834,9 @@ local playtestCapturing = false
 local playtestStartedAt: number? = nil
 local playtestLastActivity: number = 0
 local playtestMode: string? = nil
+local playtestSessionSeq = 0
+local playtestSessionId: string? = nil
+local RUNTIME_AGENT_NAME = "MCP_RuntimeAgent"
 local function pushPlaytest(text: string, level: string, t: number)
 	if not playtestCapturing then
 		return
@@ -3812,43 +6262,32 @@ local function syncGetSources(paths: { string }): any
 	return { ok = true, result = out }
 end
 
--- Apply many sources inside ONE ChangeHistory recording (one undo step).
--- Best-effort per item; the recording is still finalized (Commit if anything
--- applied, Cancel if nothing did).
-local function syncSetSources(items: { { path: string, source: string } }): any
-	if RunService:IsRunning() then
-		return { ok = false, err = "sync_set_sources is edit-context only (stop the playtest first)" }
+-- Apply an already conflict-checked disk import through the same conditional,
+-- rollback-verified transaction used by apply_script_patchset. Roblox does not
+-- include LuaSourceContainer source changes in ChangeHistoryService undo.
+local function syncSetSources(items: { { path: string, source: string, expectedHash: string } }): any
+	local response = AgentTools.applyScriptPatchset({
+		confirm = true,
+		items = items,
+	})
+	if not response.ok then
+		return response
 	end
-	if type(items) ~= "table" or #items == 0 then
-		return { ok = false, err = "items array required" }
-	end
+
 	local results = {}
-	local anyApplied = false
-	local recording = ChangeHistoryService:TryBeginRecording("import_scripts")
-	for _, it in ipairs(items) do
-		local inst = it and it.path and resolvePath(it.path)
-		if not inst or not inst:IsA("LuaSourceContainer") then
-			table.insert(results, { path = it and it.path or "?", ok = false, err = "not found or not a script" })
-		elseif type(it.source) ~= "string" then
-			table.insert(results, { path = it.path, ok = false, err = "source missing" })
-		else
-			local newSource = it.source
-			local ok, err = pcall(function()
-				ScriptEditorService:UpdateSourceAsync(inst, function()
-					return newSource
-				end)
-			end)
-			table.insert(results, { path = it.path, ok = ok, err = if ok then nil else tostring(err) })
-			anyApplied = anyApplied or ok
-		end
+	for index, item in ipairs(items) do
+		local evidence = response.result and response.result.items and response.result.items[index]
+		table.insert(results, {
+			path = item.path,
+			ok = evidence ~= nil and evidence.afterHash == evidence.desiredHash,
+			err = if evidence then nil else "transaction result omitted item evidence",
+		})
 	end
-	if recording then
-		ChangeHistoryService:FinishRecording(
-			recording,
-			anyApplied and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel
-		)
-	end
-	return { ok = true, result = results }
+	return {
+		ok = true,
+		result = results,
+		transaction = response.result,
+	}
 end
 
 local function getPlaceInfo(): any
@@ -4394,26 +6833,43 @@ local function playtestControl(p: any): any
 		if RunService:IsRunning() or playtestStartedAt ~= nil then
 			return { ok = false, err = "a playtest/simulation is already running" }
 		end
-		if mode ~= "run" and mode ~= "play" then
-			return { ok = false, err = "playtest_control: mode must be 'run' or 'play'" }
+		if mode ~= "run" and mode ~= "play" and mode ~= "multiplayer" then
+			return { ok = false, err = "playtest_control: mode must be 'run', 'play', or 'multiplayer'" }
 		end
 		playtestRing = {}
 		playtestCapturing = true
 		playtestMode = mode
+		playtestSessionSeq += 1
+		playtestSessionId = tostring(os.time()) .. "-" .. tostring(playtestSessionSeq)
 		if p.numPlayers ~= nil then
 			pcall(function()
 				TestService.NumberOfPlayers = math.clamp(tonumber(p.numPlayers) or 1, 1, 8)
 			end)
 		end
 		injectPlaytestStopListener()
-		if mode == "play" then
-			-- Play mode only -- run mode has no client, period.
+		local runtimeAgent = ServerScriptService:FindFirstChild(RUNTIME_AGENT_NAME)
+		if runtimeAgent then
+			runtimeAgent:SetAttribute("McpRuntimeSessionId", playtestSessionId)
+			-- v0.2.0: plain-substring pin pattern; the runtime agent keeps every
+			-- matching output line in a separate ring that noise cannot evict.
+			runtimeAgent:SetAttribute(
+				"McpPinPattern",
+				if type(p.pinPattern) == "string" and p.pinPattern ~= "" then p.pinPattern else nil
+			)
+		end
+		if mode == "play" or mode == "multiplayer" then
+			-- Play/multiplayer only -- run mode has no client, period.
 			injectClientAgent()
 		end
 		local launchErr: string? = nil
 		task.spawn(function()
 			local ok, err = pcall(function()
-				if mode == "play" then
+				if mode == "multiplayer" then
+					return StudioTestService:ExecuteMultiplayerTestAsync(
+						math.clamp(tonumber(p.numPlayers) or 1, 1, 8),
+						p.testArgs
+					)
+				elseif mode == "play" then
 					return StudioTestService:ExecutePlayModeAsync({})
 				end
 				return StudioTestService:ExecuteRunModeAsync({})
@@ -4425,6 +6881,7 @@ local function playtestControl(p: any): any
 			playtestCapturing = false
 			playtestStartedAt = nil
 			playtestMode = nil
+			playtestSessionId = nil
 			cleanupPlaytestStopListener()
 			pcall(cleanupClientAgent)
 		end)
@@ -4433,9 +6890,14 @@ local function playtestControl(p: any): any
 		if launchErr ~= nil then
 			playtestCapturing = false
 			playtestMode = nil
+			playtestSessionId = nil
 			cleanupPlaytestStopListener()
 			pcall(cleanupClientAgent)
-			local fn = (mode == "play") and "ExecutePlayModeAsync" or "ExecuteRunModeAsync"
+			local fn = if mode == "multiplayer"
+				then "ExecuteMultiplayerTestAsync"
+				elseif mode == "play"
+				then "ExecutePlayModeAsync"
+				else "ExecuteRunModeAsync"
 			return { ok = false, err = "StudioTestService:" .. fn .. " failed: " .. launchErr }
 		end
 		playtestStartedAt = os.time()
@@ -4457,6 +6919,7 @@ local function playtestControl(p: any): any
 		playtestCapturing = false
 		playtestStartedAt = nil
 		playtestMode = nil
+		playtestSessionId = nil
 		cleanupPlaytestStopListener()
 		pcall(cleanupClientAgent)
 		return {
@@ -4475,7 +6938,7 @@ local function getPlaytestOutput(p: any): any
 	if p.drain ~= false then
 		playtestRing = {}
 	end
-	local result: { [string]: any } = { lines = lines, capturing = playtestCapturing, count = #lines, client = {} }
+	local result: { [string]: any } = { lines = lines, capturing = playtestCapturing, count = #lines, client = {}, pinned = {} }
 	if playtestMode ~= "play" then
 		result.note = "run mode has no client"
 	end
@@ -4503,10 +6966,16 @@ local function getPlaytestStatus(): any
 		ok = true,
 		result = {
 			running = simRunning,
+			runServiceIsRunning = simRunning,
+			dataModelState = "edit",
 			mode = playtestMode,
 			startedAtUnix = playtestStartedAt,
 			durationSec = duration,
 			players = players,
+			placeName = game.Name,
+			placeId = game.PlaceId,
+			universeId = game.GameId,
+			runtimeSessionId = playtestSessionId,
 		},
 	}
 end
@@ -6550,6 +9019,19 @@ AnalysisTools.init({
 	readEditorSource = readEditorSource,
 	CollectionService = CollectionService,
 })
+EnvironmentTools.init({
+	resolvePath = resolvePath,
+	recorded = recorded,
+})
+AssetGuardTools.init({
+	resolvePath = resolvePath,
+	recorded = recorded,
+	readEditorSource = readEditorSource,
+})
+AgentTools.init({
+	resolvePath = resolvePath,
+	readEditorSource = readEditorSource,
+})
 
 -- Dispatch one command table -> result table.
 -- (enable_playtest_agent is handled in the plugin entry, not here.)
@@ -6603,6 +9085,10 @@ function Executor.execute(cmd: { type: string, payload: any }): any
 		return tagInstance(p.path, p.tag, false)
 	elseif cmd.type == "insert_asset" then
 		return insertAsset(p.assetId, p.parentPath)
+	elseif cmd.type == "guarded_asset_scan" then
+		return AssetGuardTools.scan(p)
+	elseif cmd.type == "guarded_asset_insert" then
+		return AssetGuardTools.insert(p)
 	-- experimental
 	elseif cmd.type == "capture_viewport" then
 		return captureViewport()
@@ -6646,6 +9132,10 @@ function Executor.execute(cmd: { type: string, payload: any }): any
 		return syncGetSources(p.paths or {})
 	elseif cmd.type == "sync_set_sources" then
 		return syncSetSources(p.items or {})
+	elseif cmd.type == "apply_script_patchset" then
+		return AgentTools.applyScriptPatchset(p)
+	elseif cmd.type == "capture_script_profile" then
+		return AgentTools.captureScriptProfile(p)
 	-- undo/redo + mass ops
 	elseif cmd.type == "undo" then
 		return undo()
@@ -6743,6 +9233,23 @@ function Executor.execute(cmd: { type: string, payload: any }): any
 		return alignInstances(p)
 	elseif cmd.type == "measure_distance" then
 		return measureDistance(p)
+	-- Blender environment import / audit / recoverable backup tools.
+	elseif cmd.type == "assemble_imported_chunks" then
+		return EnvironmentTools.assembleImportedChunks(p)
+	elseif cmd.type == "audit_environment" then
+		return EnvironmentTools.auditEnvironment(p)
+	elseif cmd.type == "inspect_texture_health" then
+		return EnvironmentTools.inspectTextureHealth(p)
+	elseif cmd.type == "qa_device_snapshot" then
+		return QATools.deviceSnapshot()
+	elseif cmd.type == "qa_device_apply" then
+		return QATools.deviceApply(p)
+	elseif cmd.type == "qa_device_restore" then
+		return QATools.deviceRestore(p)
+	elseif cmd.type == "backup_selection" then
+		return EnvironmentTools.backupSelection(p)
+	elseif cmd.type == "restore_backup" then
+		return EnvironmentTools.restoreBackup(p)
 	-- Bucket 2: project understanding (moved to AnalysisTools.luau -- see its header)
 	elseif cmd.type == "remote_inventory" then
 		return AnalysisTools.remoteInventory(p)
@@ -6828,7 +9335,7 @@ return Executor
 ]]></ProtectedString>
    </Properties>
   </Item>
-  <Item class="ModuleScript" referent="RBX6">
+  <Item class="ModuleScript" referent="RBX10">
    <Properties>
     <string name="Name">StatusWidget</string>
     <ProtectedString name="Source"><![CDATA[-- Dock widget: Nik Studio MCP control panel.
@@ -7160,7 +9667,7 @@ function StatusWidget.new(plugin: Plugin)
 	version.Size = UDim2.fromOffset(120, 9)
 	version.BackgroundTransparency = 1
 	version.Font = Enum.Font.Merriweather -- readable serif at small sizes
-	version.Text = "version 0.1.7"
+	version.Text = "version 0.2.0"
 	version.TextColor3 = Theme.subtext
 	version.TextXAlignment = Enum.TextXAlignment.Left
 	version.TextYAlignment = Enum.TextYAlignment.Top
@@ -7305,10 +9812,10 @@ function StatusWidget.new(plugin: Plugin)
 	self.address, self.addrDot = address, addrDot
 
 	-- Port lane: horizontally-scrolling chips + a "+" pinned outside the scroll.
-	-- Slim strip: chips vertically centered, just enough room for the scrollbar.
+	-- The scrollbar stays visible and tall enough to grab in Studio's compact dock.
 	local lane = Instance.new("Frame")
 	lane.Name = "PortLane"
-	lane.Size = UDim2.new(1, 0, 0, 26)
+	lane.Size = UDim2.new(1, 0, 0, 30)
 	lane.BackgroundTransparency = 1
 	lane.LayoutOrder = 1
 	lane.Parent = portsCard
@@ -7317,25 +9824,42 @@ function StatusWidget.new(plugin: Plugin)
 	chipScroll.Size = UDim2.new(1, -38, 1, 0) -- room on the right for "+"; the editor overlays on top
 	chipScroll.BackgroundTransparency = 1
 	chipScroll.BorderSizePixel = 0
+	chipScroll.Active = true
+	chipScroll.ClipsDescendants = true
+	chipScroll.ScrollingEnabled = true
 	chipScroll.ScrollingDirection = Enum.ScrollingDirection.X
 	chipScroll.AutomaticCanvasSize = Enum.AutomaticSize.X
 	chipScroll.CanvasSize = UDim2.new()
-	chipScroll.ScrollBarThickness = 3
+	chipScroll.ScrollBarThickness = 6
 	chipScroll.ScrollBarImageColor3 = Theme.stroke
-	chipScroll.ScrollBarImageTransparency = 0.2
+	chipScroll.ScrollBarImageTransparency = 0
 	chipScroll.Parent = lane
 	local chipLayout = hlist(chipScroll, 6)
 	chipLayout.VerticalAlignment = Enum.VerticalAlignment.Center
 	local chipPad = Instance.new("UIPadding")
-	chipPad.PaddingBottom = UDim.new(0, 4) -- room for the bottom scrollbar
+	chipPad.PaddingBottom = UDim.new(0, 6) -- reserve the scrollbar instead of covering chips
 	chipPad.Parent = chipScroll
 	self.chipScroll = chipScroll
+
+	-- Roblox maps wheel motion to Y by default. This lane only scrolls on X, so
+	-- translate the documented wheel events into a bounded horizontal step.
+	local function scrollPortLane(delta: number)
+		local maxX = math.max(0, chipScroll.AbsoluteCanvasSize.X - chipScroll.AbsoluteWindowSize.X)
+		local nextX = math.clamp(chipScroll.CanvasPosition.X + delta, 0, maxX)
+		chipScroll.CanvasPosition = Vector2.new(nextX, chipScroll.CanvasPosition.Y)
+	end
+	chipScroll.MouseWheelForward:Connect(function()
+		scrollPortLane(-48)
+	end)
+	chipScroll.MouseWheelBackward:Connect(function()
+		scrollPortLane(48)
+	end)
 
 	-- "+" add control, pinned to the right of the lane (outside the scroll).
 	local add = Instance.new("TextButton")
 	add.Name = "AddPort"
 	add.AnchorPoint = Vector2.new(1, 0.5)
-	add.Position = UDim2.new(1, 0, 0.5, 0)
+	add.Position = UDim2.new(1, 0, 0.5, -3)
 	add.Size = UDim2.fromOffset(32, 22)
 	add.BackgroundColor3 = Theme.panel
 	add.AutoButtonColor = false
@@ -7358,11 +9882,16 @@ function StatusWidget.new(plugin: Plugin)
 	local editor = Instance.new("Frame")
 	editor.Name = "PortEditor"
 	editor.AnchorPoint = Vector2.new(1, 0.5)
-	editor.Position = UDim2.new(1, -38, 0.5, 0)
+	editor.Position = UDim2.new(1, -38, 0.5, -3)
 	editor.Size = UDim2.fromOffset(96, 22)
-	editor.BackgroundTransparency = 1
+	editor.BackgroundColor3 = Theme.panelHi
+	editor.BackgroundTransparency = 0
+	editor.BorderSizePixel = 0
+	editor.Active = true -- sink clicks in the overlay gaps so covered chips cannot fire
 	editor.Visible = false
 	editor.ZIndex = 10
+	corner(editor, 8)
+	stroke(editor, Theme.accent, 0.1)
 	editor.Parent = lane
 	self.editor = editor
 	self.overStepper = nil -- "up" | "down" while the mouse hovers a stepper
@@ -7657,7 +10186,7 @@ function StatusWidget:_rebuildChips()
 
 		local x = Instance.new("TextButton")
 		x.Name = "Remove"
-		x.Size = UDim2.fromOffset(18, 18)
+		x.Size = UDim2.fromOffset(14, 16)
 		x.Position = UDim2.new(1, -4, 0.5, 0)
 		x.AnchorPoint = Vector2.new(1, 0.5)
 		x.ZIndex = 2 -- above the chip body so "x" removes instead of selecting
@@ -7666,10 +10195,34 @@ function StatusWidget:_rebuildChips()
 		x.Font = Enum.Font.GothamBold
 		x.TextColor3 = colored and fg or Theme.subtext
 		x.TextScaled = true
-		textConstraint(x, 14, 9)
+		textConstraint(x, 11, 8)
+		corner(x, 5)
 		x.Parent = chip
+
+		-- Port removal stops a live polling lane, so require a deliberate second
+		-- click. The first click arms briefly and gives an unmistakable "?" state.
+		local removeArmed = false
+		local removeArmToken = 0
 		x.MouseButton1Click:Connect(function()
 			self:_click()
+			if not removeArmed then
+				removeArmed = true
+				removeArmToken += 1
+				local token = removeArmToken
+				x.Text = "?"
+				x.TextColor3 = Theme.red
+				x.BackgroundColor3 = Theme.bg2
+				x.BackgroundTransparency = 0
+				task.delay(1.4, function()
+					if x.Parent and removeArmed and removeArmToken == token then
+						removeArmed = false
+						x.Text = "x"
+						x.TextColor3 = colored and fg or Theme.subtext
+						x.BackgroundTransparency = 1
+					end
+				end)
+				return
+			end
 			if self.onRemovePort then
 				self.onRemovePort(port)
 			end
@@ -8423,7 +10976,7 @@ return StatusWidget
 ]]></ProtectedString>
    </Properties>
   </Item>
-  <Item class="ModuleScript" referent="RBX7">
+  <Item class="ModuleScript" referent="RBX11">
    <Properties>
     <string name="Name">RuntimeAgentSource</string>
     <ProtectedString name="Source"><![CDATA[-- Returns the runtime-agent source as a string. The {{PORT}} token is replaced
@@ -8440,13 +10993,45 @@ end
 
 local HttpService = game:GetService("HttpService")
 local PORT = script:GetAttribute("McpPort") or {{PORT}}
+local PORT_CANDIDATES = script:GetAttribute("McpPortCandidates")
 local TOKEN = script:GetAttribute("McpToken") or ""
-local CANDIDATES = { PORT, 58741, 58742, 58743 }
+local TARGET_ID = script:GetAttribute("McpTargetId") or ""
+local RUNTIME_SESSION_ID = script:GetAttribute("McpRuntimeSessionId")
+local PIN_PATTERN = script:GetAttribute("McpPinPattern")
 local POLL_INTERVAL = 0.5
 local BACKOFF_START = 1
-local BACKOFF_MAX = 5
+local BACKOFF_MAX = 8
+local REJECT_COOLDOWN = 30 -- seconds a bridge that answered 401/409/400 is skipped before re-probing
 local CONTEXT = "server"
 local base = nil
+local basePort = nil
+-- v0.2.0: bridges that refused this window (leased to another Studio, bad token)
+-- are parked here so the agent stops busy-looping 409s against them.
+local rejectedUntil = {}
+
+local function buildCandidates()
+	local seen = {}
+	local out = {}
+	local function add(raw)
+		local port = tonumber(raw)
+		if port and port > 0 and port < 65536 and not seen[port] then
+			seen[port] = true
+			table.insert(out, port)
+		end
+	end
+	add(PORT)
+	if type(PORT_CANDIDATES) == "string" then
+		for raw in string.gmatch(PORT_CANDIDATES, "[^,%s]+") do
+			add(raw)
+		end
+	end
+	for port = 58741, 58760 do
+		add(port)
+	end
+	return out
+end
+
+local CANDIDATES = buildCandidates()
 
 local function urlFor(port)
 	return ("http://127.0.0.1:%d"):format(port)
@@ -8454,26 +11039,78 @@ end
 
 -- Optional auth header (matches the edit plugin's TOFU token); nil when off.
 local function authHeaders()
+	local headers = { ["x-mcp-target-id"] = TARGET_ID }
 	if TOKEN ~= "" then
-		return { ["x-mcp-token"] = TOKEN }
+		headers["x-mcp-token"] = TOKEN
 	end
-	return nil
+	return headers
 end
 
-local function tryHeartbeat(port)
-	local ok = pcall(function()
-		HttpService:GetAsync(urlFor(port) .. "/heartbeat?context=" .. CONTEXT)
+-- v0.2.0 lease-aware probe: /heartbeat?targetId= tells us whether THAT bridge
+-- would accept this Studio window (exact = it already holds our lease, i.e. the
+-- edit plugin of this very window is polling it) and whether our token is valid.
+-- Returns nil when unreachable. A pre-0.2.0 bridge (no lease fields) is treated
+-- as accepting so mixed versions still connect.
+local function probeBridge(port)
+	local ok, res = pcall(function()
+		return HttpService:RequestAsync({
+			Url = urlFor(port) .. "/heartbeat?context=" .. CONTEXT .. "&targetId=" .. HttpService:UrlEncode(TARGET_ID),
+			Method = "GET",
+			Headers = authHeaders(),
+		})
 	end)
-	return ok
+	if not ok or type(res) ~= "table" or not res.Success then
+		return nil
+	end
+	local decoded = nil
+	pcall(function()
+		decoded = HttpService:JSONDecode(res.Body)
+	end)
+	if type(decoded) ~= "table" then
+		return { accepts = true, exact = false, tokenOk = true }
+	end
+	return {
+		accepts = decoded.accepts ~= false,
+		exact = decoded.exact == true,
+		tokenOk = decoded.tokenOk ~= false,
+	}
+end
+
+-- Pick the bridge that already owns this window's lease; else the first bridge
+-- that would accept it; never one that is leased to another live Studio window
+-- or rejects our token. Recently-rejecting ports are skipped for REJECT_COOLDOWN.
+local function resolveBridge()
+	local now = os.clock()
+	local fallback = nil
+	for _, port in ipairs(CANDIDATES) do
+		local parkedUntil = rejectedUntil[port]
+		if not parkedUntil or parkedUntil <= now then
+			local info = probeBridge(port)
+			if info and info.tokenOk then
+				if info.exact then
+					return port, "exact"
+				end
+				if info.accepts and not fallback then
+					fallback = port
+				end
+			end
+		end
+	end
+	if fallback then
+		return fallback, "accepting"
+	end
+	return nil, nil
 end
 
 -- Try to resolve a bridge port now (fast path). If the run DM's networking isn't
 -- ready yet at t=0 (heavy boot), that's fine -- do NOT early-exit: the Heartbeat
 -- scheduler below reprobes with backoff until the bridge answers.
-for _, port in ipairs(CANDIDATES) do
-	if tryHeartbeat(port) then
+do
+	local port, how = resolveBridge()
+	if port then
 		base = urlFor(port)
-		break
+		basePort = port
+		print(("[MCP agent] resolved bridge :%d (%s)"):format(port, tostring(how)))
 	end
 end
 
@@ -8568,11 +11205,26 @@ local function buildOf(inst, depth, maxDepth)
 	return node
 end
 
+-- v0.2.0: bigger ring (2000) plus a separate PINNED ring for lines matching the
+-- McpPinPattern attribute (plain substring, stamped by playtest_control/run_harness).
+-- Pinned lines survive any amount of unrelated log noise, so a harness's own
+-- verdict/summary lines are never evicted before they are read.
+local CONSOLE_RING_CAP = 2000
+local PINNED_RING_CAP = 500
 local consoleRing = {}
+local pinnedRing = {}
 LogService.MessageOut:Connect(function(msg, mt)
-	table.insert(consoleRing, { text = tostring(msg), level = mt.Name, t = os.time() })
-	if #consoleRing > 500 then
+	local text = tostring(msg)
+	local entry = { text = text, level = mt.Name, t = os.time() }
+	table.insert(consoleRing, entry)
+	if #consoleRing > CONSOLE_RING_CAP then
 		table.remove(consoleRing, 1)
+	end
+	if type(PIN_PATTERN) == "string" and PIN_PATTERN ~= "" and string.find(text, PIN_PATTERN, 1, true) then
+		table.insert(pinnedRing, entry)
+		if #pinnedRing > PINNED_RING_CAP then
+			table.remove(pinnedRing, 1)
+		end
 	end
 end)
 
@@ -8607,7 +11259,7 @@ end
 
 -- Separate ring for client-side console lines (fed by the client agent's
 -- batched "logs" fires); same cap/shape as consoleRing.
-local CLIENT_RING_CAP = 500
+local CLIENT_RING_CAP = 1500
 local clientRing = {}
 
 -- Flood protection: cap accepted client log entries per second; beyond that
@@ -8617,19 +11269,43 @@ local floodSecond = 0
 local floodCount = 0
 local floodWarned = false
 
--- client_query correlation table: id -> { done, result }, filled by the
+-- Client request correlation table: id -> { done, result, expectedPlayer },
+-- filled by the
 -- "queryResult" branch below and polled (task.wait) by the client_query command.
 local pendingQueries = {}
 local nextQueryId = 0
+local clientReadyAt = nil
+local qaReadyPlayers = {}
+local qaLeaveAcks = {}
+local qaLeaveSequence = 0
+
+Players.PlayerRemoving:Connect(function(player)
+	qaReadyPlayers[player] = nil
+end)
 
 relay.OnServerEvent:Connect(function(_player, kind, a, b)
+	-- These QA messages accept any real Player sender, but cannot satisfy the
+	-- single-client query correlation table or inject client log entries.
+	if kind == "qaReady" then
+		qaReadyPlayers[_player] = os.clock()
+		return
+	elseif kind == "qaLeaveAck" then
+		if type(a) == "number" and type(qaLeaveAcks[a]) == "table" then
+			qaLeaveAcks[a].done = true
+			qaLeaveAcks[a].player = _player
+			qaLeaveAcks[a].result = b
+		end
+		return
+	end
 	if not boundPlayer then
 		boundPlayer = _player
 	end
 	if _player ~= boundPlayer then
 		return -- forged event from a non-bound client -- ignore
 	end
-	if kind == "logs" then
+	if kind == "ready" then
+		clientReadyAt = os.clock()
+	elseif kind == "logs" then
 		if type(a) ~= "table" then
 			return
 		end
@@ -8660,7 +11336,7 @@ relay.OnServerEvent:Connect(function(_player, kind, a, b)
 			return
 		end
 		local slot = pendingQueries[a]
-		if slot then
+		if slot and slot.expectedPlayer == _player then
 			slot.result = b
 			slot.done = true
 		end
@@ -8695,6 +11371,307 @@ local function runLuau(code)
 	return { ok = true, output = output, result = result }
 end
 
+local function qaState()
+	local playerRows = {}
+	local readyCount = 0
+	for index, player in ipairs(Players:GetPlayers()) do
+		local ready = qaReadyPlayers[player] ~= nil
+		if ready then
+			readyCount += 1
+		end
+		table.insert(playerRows, {
+			index = index,
+			name = player.Name,
+			userId = player.UserId,
+			clientAgentReady = ready,
+		})
+	end
+	local okArgs, testArgs = pcall(function()
+		return game:GetService("StudioTestService"):GetTestArgs()
+	end)
+	local serializedArgs = nil
+	local testArgsError = nil
+	if okArgs then
+		serializedArgs = serialize(testArgs)
+	else
+		testArgsError = tostring(testArgs)
+	end
+	return {
+		playerCount = #playerRows,
+		readyClientCount = readyCount,
+		players = playerRows,
+		testArgs = serializedArgs,
+		testArgsError = testArgsError,
+		runServiceIsRunning = RunService:IsRunning(),
+		runtimeSessionId = RUNTIME_SESSION_ID,
+	}
+end
+
+local function relayClientQuery(name, args, timeoutSec)
+	local player = boundPlayer
+	if not player or player.Parent ~= Players or not relay then
+		return false, "client agent not connected"
+	end
+	nextQueryId += 1
+	local id = nextQueryId
+	local slot = {
+		done = false,
+		result = nil,
+		expectedPlayer = player,
+		name = name,
+	}
+	pendingQueries[id] = slot
+	local sent, sendErr = pcall(function()
+		relay:FireClient(player, "query", id, name, args)
+	end)
+	if not sent or not relay.Parent then
+		pendingQueries[id] = nil
+		return false, "client agent not connected: " .. tostring(sendErr)
+	end
+	local boundedTimeout = math.clamp(tonumber(timeoutSec) or 5, 0.1, 60)
+	local waited = 0
+	while not slot.done and waited < boundedTimeout do
+		task.wait(0.05)
+		waited += 0.05
+	end
+	pendingQueries[id] = nil
+	if not slot.done then
+		return false, ("client agent query timed out after %.1fs"):format(boundedTimeout)
+	end
+	return true, slot.result
+end
+
+local SCENE_ANALYSIS_METHODS = {
+	instanceComposition = "GetInstanceCompositionAsync",
+	scriptMemory = "GetScriptMemoryAsync",
+	unparentedInstances = "GetUnparentedInstancesAsync",
+	triangleComposition = "GetTriangleCompositionAsync",
+	animationMemory = "GetAnimationMemoryAsync",
+	audioMemory = "GetAudioMemoryAsync",
+}
+
+local DEFAULT_SCENE_ANALYSIS_MODES = {
+	"instanceComposition",
+	"scriptMemory",
+	"unparentedInstances",
+	"triangleComposition",
+	"animationMemory",
+	"audioMemory",
+}
+
+local function analysisText(value, state, limit)
+	local text = tostring(value)
+	local allowed = math.min(limit or #text, math.max(0, state.maxChars - state.chars))
+	if #text > allowed then
+		text = string.sub(text, 1, allowed)
+		state.truncated = true
+	end
+	state.chars += #text
+	return text
+end
+
+local function sanitizeAnalysisValue(value, state, depth)
+	if state.nodes >= state.maxNodes then
+		state.truncated = true
+		return { __truncated = "node_limit" }
+	end
+	if depth > state.maxDepth then
+		state.truncated = true
+		return { __truncated = "depth_limit" }
+	end
+	if state.chars >= state.maxChars then
+		state.truncated = true
+		return { __truncated = "character_budget" }
+	end
+	state.nodes += 1
+	local valueType = typeof(value)
+	if valueType == "nil" or valueType == "boolean" then
+		return value
+	elseif valueType == "number" then
+		state.chars += 24
+		if value ~= value or value == math.huge or value == -math.huge then
+			return tostring(value)
+		end
+		return value
+	elseif valueType == "string" then
+		return analysisText(value, state, 4096)
+	elseif valueType == "Instance" then
+		local okPath, fullPath = pcall(function()
+			return value:GetFullName()
+		end)
+		return {
+			__t = "Instance",
+			className = analysisText(value.ClassName, state, 128),
+			name = analysisText(value.Name, state, 256),
+			path = analysisText(okPath and fullPath or value.Name, state, 2048),
+			parented = value.Parent ~= nil,
+		}
+	elseif valueType == "EnumItem" then
+		return {
+			__t = "EnumItem",
+			enum = analysisText(tostring(value.EnumType), state, 128),
+			name = analysisText(value.Name, state, 128),
+		}
+	elseif valueType == "table" then
+		if state.seen[value] then
+			state.truncated = true
+			return { __truncated = "cycle_or_shared_table" }
+		end
+		state.seen[value] = true
+		local out = {}
+		for key, child in pairs(value) do
+			if state.nodes >= state.maxNodes or state.chars >= state.maxChars then
+				state.truncated = true
+				out.__truncated = "analysis_budget"
+				break
+			end
+			local safeKey = analysisText(key, state, 256)
+			out[safeKey] = sanitizeAnalysisValue(child, state, depth + 1)
+		end
+		return out
+	end
+	local scalar = serialize(value)
+	if type(scalar) == "table" then
+		return sanitizeAnalysisValue(scalar, state, depth + 1)
+	end
+	return analysisText(scalar, state, 2048)
+end
+
+local function captureSceneAnalysis(args)
+	args = type(args) == "table" and args or {}
+	local okService, serviceOrErr = pcall(function()
+		return game:GetService("SceneAnalysisService")
+	end)
+	if not okService or not serviceOrErr then
+		return {
+			err = "SceneAnalysisService is unavailable in this Studio build: " .. tostring(serviceOrErr),
+		}
+	end
+	local requested = args.include or args.modes or DEFAULT_SCENE_ANALYSIS_MODES
+	if type(requested) ~= "table" or #requested < 1 then
+		return { err = "scene analysis include must contain at least one supported mode" }
+	end
+	local selected = {}
+	local seenModes = {}
+	for _, rawMode in ipairs(requested) do
+		local mode = tostring(rawMode)
+		if not SCENE_ANALYSIS_METHODS[mode] then
+			return { err = "unsupported scene analysis mode: " .. mode }
+		end
+		if not seenModes[mode] then
+			seenModes[mode] = true
+			table.insert(selected, mode)
+		end
+	end
+	local maxOutputBytes = math.clamp(math.floor(tonumber(args.maxOutputBytes) or 250000), 10000, 1000000)
+	local state = {
+		nodes = 0,
+		chars = 0,
+		maxNodes = math.clamp(math.floor(tonumber(args.maxNodes) or 5000), 100, 20000),
+		maxDepth = math.clamp(math.floor(tonumber(args.maxDepth) or 10), 2, 16),
+		maxChars = math.floor(maxOutputBytes * 0.65),
+		truncated = false,
+		seen = {},
+	}
+	local result = {
+		context = "server",
+		requestedModes = selected,
+		results = {},
+	}
+	local modeStatuses = {}
+	for _, mode in ipairs(selected) do
+		local beforeNodes = state.nodes
+		local beforeChars = state.chars
+		local methodName = SCENE_ANALYSIS_METHODS[mode]
+		local okMode, rawOrErr = pcall(function()
+			return serviceOrErr[methodName](serviceOrErr)
+		end)
+		local row
+		if okMode then
+			row = {
+				ok = true,
+				data = sanitizeAnalysisValue(rawOrErr, state, 0),
+			}
+		else
+			row = {
+				ok = false,
+				err = analysisText(rawOrErr, state, 2048),
+			}
+		end
+		row.nodesUsed = state.nodes - beforeNodes
+		row.charactersUsed = state.chars - beforeChars
+		result.results[mode] = row
+		modeStatuses[mode] = {
+			ok = row.ok,
+			nodesUsed = row.nodesUsed,
+			charactersUsed = row.charactersUsed,
+			err = row.err,
+		}
+	end
+	result.summary = {
+		nodesVisited = state.nodes,
+		charactersKept = state.chars,
+		truncated = state.truncated,
+		maxNodes = state.maxNodes,
+		maxDepth = state.maxDepth,
+		maxOutputBytes = maxOutputBytes,
+	}
+	local okEncode, encoded = pcall(function()
+		return HttpService:JSONEncode(result)
+	end)
+	if okEncode and #encoded <= maxOutputBytes then
+		result.summary.encodedBytes = #encoded
+		return result
+	end
+	result.results = modeStatuses
+	result.summary.truncated = true
+	result.summary.dataOmitted = true
+	result.summary.reason = okEncode and "encoded output exceeded maxOutputBytes" or ("JSON encoding failed: " .. tostring(encoded))
+	return result
+end
+
+local sceneAnalysisBusy = false
+
+local function captureSceneAnalysisBounded(args, timeoutSec)
+	if sceneAnalysisBusy then
+		return false, "a previous server scene analysis is still running"
+	end
+	sceneAnalysisBusy = true
+	local slot = { done = false, ok = false, result = nil }
+	local worker = task.spawn(function()
+		local okCapture, resultOrErr = pcall(captureSceneAnalysis, args)
+		slot.ok = okCapture
+		slot.result = resultOrErr
+		slot.done = true
+		sceneAnalysisBusy = false
+	end)
+	local boundedTimeout = math.clamp(tonumber(timeoutSec) or 20, 0.1, 60)
+	local waited = 0
+	while not slot.done and waited < boundedTimeout do
+		task.wait(0.05)
+		waited += 0.05
+	end
+	if not slot.done then
+		local cancelOk, cancelErr = pcall(function()
+			task.cancel(worker)
+		end)
+		if cancelOk then
+			sceneAnalysisBusy = false
+		end
+		return false,
+			("scene analysis timed out after %.1fs; worker cancellation=%s%s")
+				:format(
+					boundedTimeout,
+					tostring(cancelOk),
+					if cancelOk then "" else " (" .. tostring(cancelErr) .. ")"
+				)
+	end
+	if not slot.ok then
+		return false, tostring(slot.result)
+	end
+	return true, slot.result
+end
+
 -- Keep played tracks referenced so they are not GC'd mid-play (play_animation).
 local playingTracks = {}
 
@@ -8703,7 +11680,101 @@ local playingTracks = {}
 -- selection, undo, asset insert) fall through to the unsupported message.
 local function execute(cmd)
 	local p = cmd.payload or {}
-	if cmd.type == "run_luau" then
+	if cmd.type == "get_runtime_status" then
+		local players = Players:GetPlayers()
+		local ageMs = nil
+		if clientReadyAt ~= nil then
+			ageMs = math.floor((os.clock() - clientReadyAt) * 1000 + 0.5)
+		end
+		return {
+			ok = true,
+			result = {
+				placeName = game.Name,
+				placeId = game.PlaceId,
+				universeId = game.GameId,
+				jobId = game.JobId,
+				targetId = TARGET_ID,
+				runServiceIsRunning = RunService:IsRunning(),
+				dataModelState = "runtime",
+					runtimeSessionId = RUNTIME_SESSION_ID,
+					playerCount = #players,
+					qaClientAgentCount = qaState().readyClientCount,
+					clientAgentConnected = clientReadyAt ~= nil and boundPlayer ~= nil,
+					clientAgentAgeMs = ageMs,
+				},
+			}
+		elseif cmd.type == "qa_runtime_control" then
+			local StudioTestService = game:GetService("StudioTestService")
+			local action = tostring(p.action or "state")
+			if action == "state" or action == "checkpoint" then
+				local state = qaState()
+				state.checkpoint = p.name
+				return { ok = true, result = state }
+			elseif action == "add_players" then
+				local count = math.clamp(math.floor(tonumber(p.count) or 0), 1, 8)
+				local before = #Players:GetPlayers()
+				if before + count > 8 then
+					return { ok = false, err = "AddPlayers would exceed Studio's 8-client limit" }
+				end
+				local okAdd, addErr = pcall(function()
+					StudioTestService:AddPlayers(count)
+				end)
+				if not okAdd then
+					return { ok = false, err = "StudioTestService:AddPlayers failed: " .. tostring(addErr) }
+				end
+				return { ok = true, result = { requested = count, before = before, state = qaState() } }
+			elseif action == "disconnect_player" then
+				local target = nil
+				for index, player in ipairs(Players:GetPlayers()) do
+					if (p.playerName and player.Name == p.playerName)
+						or (p.userId and player.UserId == tonumber(p.userId))
+						or (p.playerIndex and index == tonumber(p.playerIndex)) then
+						target = player
+						break
+					end
+				end
+				if not target then
+					return { ok = false, err = "disconnect target player not found" }
+				end
+				qaLeaveSequence += 1
+				local leaveId = qaLeaveSequence
+				local slot = { done = false, player = nil, result = nil }
+				qaLeaveAcks[leaveId] = slot
+				local sent = pcall(function()
+					relay:FireClient(target, "qaLeave", leaveId)
+				end)
+				if not sent then
+					qaLeaveAcks[leaveId] = nil
+					return { ok = false, err = "could not send LeaveTest request to target client" }
+				end
+				local timeoutSec = math.clamp(tonumber(p.timeoutSec) or 8, 1, 30)
+				local waited = 0
+				while target.Parent == Players and waited < timeoutSec do
+					task.wait(0.1)
+					waited += 0.1
+				end
+				qaLeaveAcks[leaveId] = nil
+				if target.Parent == Players then
+					return {
+						ok = false,
+						err = "client did not leave before timeout",
+						result = { acknowledgement = slot.result, state = qaState() },
+					}
+				end
+				return {
+					ok = true,
+					result = {
+						disconnected = { name = target.Name, userId = target.UserId },
+						acknowledgement = slot.result,
+						state = qaState(),
+					},
+				}
+			end
+			return {
+				ok = false,
+				err = "qa_runtime_control action must be state, checkpoint, add_players, or disconnect_player",
+			}
+		elseif cmd.type == "run_luau" then
 		return runLuau(p.code)
 	elseif cmd.type == "get_instance_tree" then
 		local root = resolve(p.path)
@@ -8724,9 +11795,21 @@ local function execute(cmd)
 	elseif cmd.type == "read_console" then
 		local ring = (p.context == "client") and clientRing or consoleRing
 		local count = p.count or 100
+		local levelMatch = {
+			error = "MessageError",
+			warning = "MessageWarning",
+			output = "MessageOutput",
+		}
+		local want = p.levelFilter and levelMatch[p.levelFilter] or nil
 		local picked = {}
-		for i = math.max(1, #ring - count + 1), #ring do
-			table.insert(picked, ring[i])
+		for i = #ring, 1, -1 do
+			local entry = ring[i]
+			if not want or entry.level == want then
+				table.insert(picked, 1, entry)
+				if #picked >= count then
+					break
+				end
+			end
 		end
 		return { ok = true, result = { lines = picked, total = #ring } }
 	elseif cmd.type == "get_playtest_output" then
@@ -8734,43 +11817,115 @@ local function execute(cmd)
 		local drain = p.drain ~= false
 		local lines = consoleRing
 		local clientLines = clientRing
+		local pinnedLines = pinnedRing
 		if drain then
 			consoleRing = {}
 			clientRing = {}
+			pinnedRing = {}
 		end
-		local out = { lines = lines, client = clientLines, count = #lines, capturing = true }
+		local out = {
+			lines = lines,
+			client = clientLines,
+			pinned = pinnedLines,
+			pinPattern = PIN_PATTERN,
+			count = #lines,
+			capturing = true,
+			capacity = { server = CONSOLE_RING_CAP, client = CLIENT_RING_CAP, pinned = PINNED_RING_CAP },
+		}
 		if #game:GetService("Players"):GetPlayers() == 0 then
 			out.note = "run mode has no client"
 		end
 		return { ok = true, result = out }
 	elseif cmd.type == "client_query" then
-		local Players = game:GetService("Players")
-		local player = Players:GetPlayers()[1]
-		if not player or not relay then
-			return { ok = false, err = "client agent not connected" }
+		local okQuery, resultOrErr = relayClientQuery(p.name, p.args, 5)
+		if not okQuery then
+			return { ok = false, err = resultOrErr }
 		end
-		nextQueryId += 1
-		local id = nextQueryId
-		local slot = { done = false, result = nil }
-		pendingQueries[id] = slot
-		local sent = pcall(function()
-			relay:FireClient(player, "query", id, p.name, p.args)
-		end)
-		if not sent or not relay.Parent then
-			pendingQueries[id] = nil
-			return { ok = false, err = "client agent not connected" }
+		return { ok = true, result = resultOrErr }
+	elseif cmd.type == "client_activate" then
+		local okQuery, resultOrErr = relayClientQuery("activate_gui", p, 12)
+		if not okQuery then
+			return { ok = false, err = resultOrErr }
 		end
-		-- Poll (not block) for the queryResult; never hang past 5s.
-		local waited = 0
-		while not slot.done and waited < 5 do
-			task.wait(0.05)
-			waited += 0.05
+		if type(resultOrErr) == "table" and resultOrErr.err ~= nil then
+			return { ok = false, err = tostring(resultOrErr.err), result = resultOrErr }
 		end
-		pendingQueries[id] = nil
-		if not slot.done then
-			return { ok = false, err = "client agent not connected (query timeout)" }
+		return { ok = true, result = resultOrErr }
+	elseif cmd.type == "client_input_sequence" then
+		local clientTimeout = math.clamp(tonumber(p.timeoutSec) or 30, 1, 30)
+		local okQuery, resultOrErr = relayClientQuery("input_sequence", p, clientTimeout + 2)
+		if not okQuery then
+			return { ok = false, err = resultOrErr }
 		end
-		return { ok = true, result = slot.result }
+		if type(resultOrErr) == "table" and resultOrErr.ok == false then
+			return {
+				ok = false,
+				err = tostring(resultOrErr.err or "client input sequence failed"),
+				result = resultOrErr,
+			}
+		end
+		return { ok = true, result = resultOrErr }
+	elseif cmd.type == "scene_analysis_snapshot" then
+		local side = tostring(p.side or "both")
+		if side ~= "server" and side ~= "client" and side ~= "both" then
+			return { ok = false, err = "scene_analysis_snapshot side must be server, client, or both" }
+		end
+		local totalTimeout = math.clamp(tonumber(p.timeoutSec) or 20, 1, 60)
+		local startedAt = os.clock()
+		local deadline = startedAt + totalTimeout
+		local snapshot = {
+			side = side,
+			server = nil,
+			client = nil,
+		}
+		if side == "server" or side == "both" then
+			local remaining = deadline - os.clock()
+			if remaining <= 0 then
+				return { ok = false, err = "scene analysis timed out before server capture" }
+			end
+			local okServer, serverOrErr = captureSceneAnalysisBounded(p, remaining)
+			if not okServer then
+				return { ok = false, err = "server scene analysis failed: " .. tostring(serverOrErr) }
+			end
+			if type(serverOrErr) == "table" and serverOrErr.err then
+				return { ok = false, err = tostring(serverOrErr.err), result = snapshot }
+			end
+			snapshot.server = serverOrErr
+		end
+		if side == "client" or side == "both" then
+			local remaining = deadline - os.clock()
+			if remaining <= 0 then
+				return {
+					ok = false,
+					err = "scene analysis timed out before client capture",
+					result = snapshot,
+				}
+			end
+			local clientArgs = {}
+			for key, value in pairs(p) do
+				clientArgs[key] = value
+			end
+			clientArgs.timeoutSec = math.max(0.1, remaining - 0.5)
+			local okClient, clientOrErr =
+				relayClientQuery("scene_analysis_snapshot", clientArgs, remaining)
+			if not okClient then
+				return {
+					ok = false,
+					err = "client scene analysis failed: " .. tostring(clientOrErr),
+					result = snapshot,
+				}
+			end
+			if type(clientOrErr) == "table" and clientOrErr.err then
+				return {
+					ok = false,
+					err = tostring(clientOrErr.err),
+					result = snapshot,
+				}
+			end
+			snapshot.client = clientOrErr
+		end
+		snapshot.durationMs = math.floor((os.clock() - startedAt) * 1000 + 0.5)
+		return { ok = true, result = snapshot }
 	elseif cmd.type == "search_instances" then
 		local root = resolve(p.root or "game") or game
 		local query = p.query and string.lower(tostring(p.query)) or nil
@@ -9150,6 +12305,10 @@ local lastPoll = 0
 local isPolling = false
 local pollCount = 0
 local pollConn = nil
+-- v0.2.0: a command executes in its own task; polls continue with busy=1 so the
+-- bridge keeps seeing this context alive during long server-side yields.
+local busyCommand = false
+local lastPollStatus = nil
 
 -- Preallocated header tables: no per-poll / per-frame allocation.
 local pollHeaders = authHeaders() or {}
@@ -9180,11 +12339,12 @@ local function sendDiag(event, extra)
 end
 
 local function reprobe()
-	for _, port in ipairs(CANDIDATES) do
-		if tryHeartbeat(port) then
-			base = urlFor(port)
-			return true
-		end
+	local port, how = resolveBridge()
+	if port then
+		base = urlFor(port)
+		basePort = port
+		sendDiag("resolve", { port = port, how = how })
+		return true
 	end
 	return false
 end
@@ -9197,22 +12357,57 @@ local function handleBody(body)
 	local cmd = decoded and decoded.command or nil
 	if cmd and cmd.id then
 		-- A bad command handler must NOT kill the loop.
-		local okExec, result = pcall(execute, cmd)
-		if not okExec then
-			sendDiag("handler_error", { cmdType = tostring(cmd.type), err = tostring(result) })
-			result = { ok = false, err = "handler error: " .. tostring(result) }
+		local result
+		local nowMs = DateTime.now().UnixTimestampMillis
+		if type(cmd.expectedTargetId) == "string" and cmd.expectedTargetId ~= TARGET_ID then
+			result = {
+				ok = false,
+				err = ("command target mismatch: expected %s, current %s")
+					:format(cmd.expectedTargetId, TARGET_ID),
+			}
+		elseif type(cmd.expiresAtMs) == "number" and cmd.expiresAtMs <= nowMs then
+			result = {
+				ok = false,
+				err = ("command expired before execution at %d (now %d)")
+					:format(cmd.expiresAtMs, nowMs),
+			}
 		end
-		if result and result.ok == false then
-			warn(("[MCP agent] command %q failed: %s"):format(tostring(cmd.type), tostring(result.err)))
+		local function finish(finalResult)
+			if type(finalResult) ~= "table" then
+				finalResult = { ok = false, err = "handler returned no result table" }
+			end
+			if finalResult.ok == false then
+				warn(("[MCP agent] command %q failed: %s"):format(tostring(cmd.type), tostring(finalResult.err)))
+			end
+			finalResult.id = cmd.id
+			local postBase = base
+			pcall(function()
+				HttpService:RequestAsync({
+					Url = (postBase or "") .. "/response",
+					Method = "POST",
+					Headers = responseHeaders,
+					Body = HttpService:JSONEncode(finalResult),
+				})
+			end)
 		end
-		result.id = cmd.id
-		pcall(function()
-			HttpService:RequestAsync({
-				Url = base .. "/response",
-				Method = "POST",
-				Headers = responseHeaders,
-				Body = HttpService:JSONEncode(result),
-			})
+		if result then
+			finish(result)
+			return
+		end
+		-- Execute in a separate task: the poll scheduler keeps running (busy=1)
+		-- so a long-yielding server command cannot make the bridge drop us.
+		busyCommand = true
+		task.spawn(function()
+			local okExec, resultOrErr = pcall(execute, cmd)
+			local finalResult
+			if okExec then
+				finalResult = resultOrErr
+			else
+				sendDiag("handler_error", { cmdType = tostring(cmd.type), err = tostring(resultOrErr) })
+				finalResult = { ok = false, err = "handler error: " .. tostring(resultOrErr) }
+			end
+			finish(finalResult)
+			busyCommand = false
 		end)
 	end
 end
@@ -9235,10 +12430,12 @@ local function doPoll()
 			sendDiag("connect", { base = base })
 		end
 		local res = HttpService:RequestAsync({
-			Url = base .. "/poll?context=" .. CONTEXT,
+			Url = base .. "/poll?context=" .. CONTEXT .. "&targetId=" .. HttpService:UrlEncode(TARGET_ID)
+				.. (if busyCommand then "&busy=1" else ""),
 			Method = "GET",
 			Headers = pollHeaders,
 		})
+		lastPollStatus = res.StatusCode
 		if not (res.Success or res.StatusCode == 503) then
 			error("poll HTTP status " .. tostring(res.StatusCode))
 		end
@@ -9259,8 +12456,20 @@ local function doPoll()
 			warn("[MCP agent] poll error on " .. tostring(base) .. ": " .. tostring(err))
 			lastReported = "dropped"
 		end
-		sendDiag("poll_error", { err = tostring(err) }) -- base still set here, so this reaches the bridge
+		sendDiag("poll_error", { err = tostring(err), status = lastPollStatus }) -- base still set here, so this reaches the bridge
+		-- v0.2.0 graceful handoff: 409 (leased to another live Studio window), 401
+		-- (token mismatch) and 400 (protocol mismatch) are NOT transient. Park that
+		-- port and let resolveBridge() find the bridge that actually owns this
+		-- window instead of hammering the wrong one every backoff tick.
+		if basePort and (lastPollStatus == 409 or lastPollStatus == 401 or lastPollStatus == 400) then
+			rejectedUntil[basePort] = os.clock() + REJECT_COOLDOWN
+			warn(("[MCP agent] bridge :%d refused this Studio window (HTTP %d); parked for %ds, re-resolving")
+				:format(basePort, lastPollStatus, REJECT_COOLDOWN))
+			sendDiag("bridge_rejected", { port = basePort, status = lastPollStatus })
+		end
+		lastPollStatus = nil
 		base = nil
+		basePort = nil
 		backoff = math.min(backoff * 2, BACKOFF_MAX)
 	end
 	isPolling = false -- UNCONDITIONAL: an error must never leave the scheduler stuck
@@ -9301,7 +12510,7 @@ return SOURCE
 ]]></ProtectedString>
    </Properties>
   </Item>
-  <Item class="ModuleScript" referent="RBX8">
+  <Item class="ModuleScript" referent="RBX12">
    <Properties>
     <string name="Name">ClientAgentSource</string>
     <ProtectedString name="Source"><![CDATA[-- Returns the client-agent source as a string. Written into a LocalScript
@@ -9324,6 +12533,9 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local LogService = game:GetService("LogService")
 local Players = game:GetService("Players")
+local StudioTestService = game:GetService("StudioTestService")
+local GuiService = game:GetService("GuiService")
+local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
 local relay = ReplicatedStorage:WaitForChild("NikMCP_ClientRelay", 30)
@@ -9333,16 +12545,31 @@ if not relay then
 	return
 end
 
+pcall(function()
+	relay:FireServer("ready")
+	relay:FireServer("qaReady")
+end)
+
 -- Compact serializer (only the tagged shapes client_query needs); matches the
 -- server agent's conventions so the bridge/tooling sees one consistent shape.
 local function serialize(v)
 	local t = typeof(v)
 	if t == "Vector3" then
 		return { __t = "Vector3", x = v.X, y = v.Y, z = v.Z }
+	elseif t == "Vector2" then
+		return { __t = "Vector2", x = v.X, y = v.Y }
 	elseif t == "CFrame" then
 		return { __t = "CFrame", comps = { v:GetComponents() } }
 	elseif t == "Color3" then
 		return { __t = "Color3", r = v.R, g = v.G, b = v.B }
+	elseif t == "UDim2" then
+		return {
+			__t = "UDim2",
+			xs = v.X.Scale,
+			xo = v.X.Offset,
+			ys = v.Y.Scale,
+			yo = v.Y.Offset,
+		}
 	end
 	return v
 end
@@ -9427,6 +12654,344 @@ local function queryGuiTree(args)
 	return guiWalk(playerGui, 0, maxDepth)
 end
 
+local function guiSummary(inst, depth, maxDepth)
+	local node = {
+		name = inst.Name,
+		className = inst.ClassName,
+		visible = inst:IsA("GuiObject") and inst.Visible or nil,
+		enabled = inst:IsA("ScreenGui") and inst.Enabled or nil,
+		active = inst:IsA("GuiObject") and inst.Active or nil,
+		absolutePosition = inst:IsA("GuiObject") and serialize(inst.AbsolutePosition) or nil,
+		absoluteSize = inst:IsA("GuiObject") and serialize(inst.AbsoluteSize) or nil,
+		position = inst:IsA("GuiObject") and serialize(inst.Position) or nil,
+		size = inst:IsA("GuiObject") and serialize(inst.Size) or nil,
+		anchorPoint = inst:IsA("GuiObject") and serialize(inst.AnchorPoint) or nil,
+		zIndex = inst:IsA("GuiObject") and inst.ZIndex or nil,
+		text = (inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox")) and inst.Text or nil,
+		image = (inst:IsA("ImageLabel") or inst:IsA("ImageButton")) and inst.Image or nil,
+	}
+	if depth < maxDepth then
+		local kids = {}
+		for _, c in ipairs(inst:GetChildren()) do
+			if c:IsA("GuiObject") or c:IsA("LayerCollector") then
+				table.insert(kids, guiSummary(c, depth + 1, maxDepth))
+			end
+		end
+		if #kids > 0 then
+			node.children = kids
+		end
+	end
+	return node
+end
+
+local function resolvePlayerGuiPath(path)
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	if not playerGui then
+		return nil, "no PlayerGui"
+	end
+	local current = playerGui
+	local raw = tostring(path or "")
+	if string.find(string.lower(raw), "coregui", 1, true) then
+		return nil, "CoreGui paths are not allowed"
+	end
+	raw = string.gsub(raw, "^PlayerGui%.", "")
+	raw = string.gsub(raw, "^game%.Players%.LocalPlayer%.PlayerGui%.", "")
+	if raw == "" or raw == "PlayerGui" then
+		return playerGui
+	end
+	for segment in string.gmatch(raw, "[^%.]+") do
+		local child = current:FindFirstChild(segment)
+		if not child then
+			return nil, "path not found: " .. tostring(path)
+		end
+		current = child
+	end
+	return current
+end
+
+local function queryGuiObject(args)
+	if type(args) ~= "table" or type(args.path) ~= "string" then
+		return { err = "gui_object requires args.path" }
+	end
+	local inst, err = resolvePlayerGuiPath(args.path)
+	if not inst then
+		return { err = err }
+	end
+	local maxDepth = type(args.maxDepth) == "number" and args.maxDepth or 1
+	return guiSummary(inst, 0, maxDepth)
+end
+
+local function isEffectivelyVisible(inst, playerGui)
+	local node = inst
+	while node and node ~= playerGui do
+		if node:IsA("GuiObject") and not node.Visible then
+			return false
+		elseif node:IsA("LayerCollector") and not node.Enabled then
+			return false
+		end
+		node = node.Parent
+	end
+	return true
+end
+
+local function findScreenGui(inst)
+	local node = inst
+	while node do
+		if node:IsA("ScreenGui") then
+			return node
+		end
+		node = node.Parent
+	end
+	return nil
+end
+
+local function rectFor(inst)
+	local pos = inst.AbsolutePosition
+	local size = inst.AbsoluteSize
+	return {
+		x = pos.X,
+		y = pos.Y,
+		w = size.X,
+		h = size.Y,
+		right = pos.X + size.X,
+		bottom = pos.Y + size.Y,
+	}
+end
+
+local function rectIntersection(a, b)
+	local width = math.min(a.right, b.right) - math.max(a.x, b.x)
+	local height = math.min(a.bottom, b.bottom) - math.max(a.y, b.y)
+	if width <= 0 or height <= 0 then
+		return 0
+	end
+	return width * height
+end
+
+local function constraintState(inst)
+	return {
+		aspectRatio = inst:FindFirstChildWhichIsA("UIAspectRatioConstraint") ~= nil,
+		size = inst:FindFirstChildWhichIsA("UISizeConstraint") ~= nil,
+		textSize = inst:FindFirstChildWhichIsA("UITextSizeConstraint") ~= nil,
+		scale = inst:FindFirstChildWhichIsA("UIScale") ~= nil,
+	}
+end
+
+local function queryUiRegression(args)
+	args = type(args) == "table" and args or {}
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	if not playerGui then
+		return { err = "no PlayerGui" }
+	end
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return { err = "no CurrentCamera" }
+	end
+	task.wait(math.clamp(tonumber(args.settleSeconds) or 0.5, 0, 3))
+	local viewport = camera.ViewportSize
+	local minTouch = math.clamp(tonumber(args.minTouchTarget) or 44, 24, 80)
+	local maxObjects = math.clamp(math.floor(tonumber(args.maxObjects) or 1500), 1, 5000)
+	local maxFindings = math.clamp(math.floor(tonumber(args.maxFindings) or 500), 1, 2000)
+	local maxOverlapPairs = math.clamp(math.floor(tonumber(args.maxOverlapPairs) or 5000), 1, 50000)
+	local findings = { critical = {}, warning = {}, info = {} }
+	local screens = {}
+	local objects = {}
+	local interactive = {}
+	local totalCandidates = 0
+	local function add(severity, row)
+		if #findings.critical + #findings.warning + #findings.info < maxFindings then
+			table.insert(findings[severity], row)
+		end
+	end
+	local insetTopLeft = Vector2.zero
+	local insetBottomRight = Vector2.zero
+	pcall(function()
+		insetTopLeft, insetBottomRight = GuiService:GetGuiInset()
+	end)
+	for _, screen in ipairs(playerGui:GetChildren()) do
+		if screen:IsA("ScreenGui") then
+			local insetName = nil
+			local okInset, insetValue = pcall(function()
+				return screen.ScreenInsets
+			end)
+			if okInset and insetValue then
+				insetName = insetValue.Name
+			end
+			table.insert(screens, {
+				path = screen:GetFullName(),
+				enabled = screen.Enabled,
+				displayOrder = screen.DisplayOrder,
+				screenInsets = insetName,
+				ignoreGuiInset = screen.IgnoreGuiInset,
+				zIndexBehavior = screen.ZIndexBehavior.Name,
+			})
+			if screen.Enabled and (insetName == "None" or screen.IgnoreGuiInset) then
+				add("warning", {
+					path = screen:GetFullName(),
+					issueType = "safe_area_not_reserved",
+					detail = "Enabled ScreenGui does not reserve Core UI/device safe area.",
+					recommendation = "Use CoreUISafeInsets or TopbarSafeInsets unless edge-to-edge layout is intentional.",
+				})
+			end
+		end
+	end
+	for _, inst in ipairs(playerGui:GetDescendants()) do
+		if inst:IsA("GuiObject") then
+			totalCandidates += 1
+			if #objects < maxObjects and isEffectivelyVisible(inst, playerGui) then
+				local rect = rectFor(inst)
+				local screen = findScreenGui(inst)
+				local constraints = constraintState(inst)
+				local row = {
+					instance = inst,
+					path = inst:GetFullName(),
+					className = inst.ClassName,
+					rect = rect,
+					screenPath = screen and screen:GetFullName() or nil,
+					zIndex = inst.ZIndex,
+					active = inst.Active,
+					selectable = inst.Selectable,
+					position = serialize(inst.Position),
+					size = serialize(inst.Size),
+					constraints = constraints,
+				}
+				table.insert(objects, row)
+				if inst:IsA("GuiButton") or inst.Active or inst.Selectable then
+					table.insert(interactive, row)
+				end
+				if rect.w <= 0 or rect.h <= 0 then
+					add("critical", {
+						path = row.path,
+						issueType = "zero_size",
+						detail = ("AbsoluteSize is %.1fx%.1f."):format(rect.w, rect.h),
+						recommendation = "Fix parent sizing, constraints, or visibility state.",
+					})
+				elseif rect.right <= 0 or rect.bottom <= 0 or rect.x >= viewport.X or rect.y >= viewport.Y then
+					add("critical", {
+						path = row.path,
+						issueType = "fully_offscreen",
+						rect = rect,
+						recommendation = "Move or scale the object inside the live viewport.",
+					})
+				elseif rect.x < 0 or rect.y < 0 or rect.right > viewport.X or rect.bottom > viewport.Y then
+					add("warning", {
+						path = row.path,
+						issueType = "partially_offscreen",
+						rect = rect,
+						recommendation = "Inspect anchors, scale, and safe-area handling on this device.",
+					})
+				end
+				local parent = inst.Parent
+				while parent and parent ~= playerGui do
+					if parent:IsA("GuiObject") and parent.ClipsDescendants then
+						local parentRect = rectFor(parent)
+						if rect.x < parentRect.x or rect.y < parentRect.y
+							or rect.right > parentRect.right or rect.bottom > parentRect.bottom then
+							add("warning", {
+								path = row.path,
+								relatedPath = parent:GetFullName(),
+								issueType = "clipped_by_ancestor",
+								recommendation = "Resize/reposition the child or adjust the intended clipping container.",
+							})
+							break
+						end
+					end
+					parent = parent.Parent
+				end
+				if (inst:IsA("GuiButton") or inst.Active) and (rect.w < minTouch or rect.h < minTouch) then
+					add("warning", {
+						path = row.path,
+						issueType = "tiny_touch_target",
+						detail = ("Interactive target is %.1fx%.1f; minimum is %d."):format(rect.w, rect.h, minTouch),
+						recommendation = "Increase the active hit area without inflating the visual unnecessarily.",
+					})
+				end
+				local size = inst.Size
+				local heavyX = size.X.Scale == 0 and math.abs(size.X.Offset) > math.max(24, viewport.X * 0.12)
+				local heavyY = size.Y.Scale == 0 and math.abs(size.Y.Offset) > math.max(24, viewport.Y * 0.12)
+				if (heavyX or heavyY) and not constraints.size and not constraints.scale then
+					add("warning", {
+						path = row.path,
+						issueType = "heavy_offset_sizing",
+						detail = "Large fixed Offset sizing has no UISizeConstraint or UIScale support.",
+						recommendation = "Use scale-led sizing plus constraints for cross-device stability.",
+					})
+				elseif size.X.Offset ~= 0 or size.Y.Offset ~= 0 then
+					add("info", {
+						path = row.path,
+						issueType = "offset_component_present",
+						detail = "Size contains Offset components.",
+						recommendation = "Confirm the fixed pixels are intentional on phone, tablet, and desktop.",
+					})
+				end
+				if (inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox"))
+					and inst.TextScaled and not constraints.textSize then
+					add("warning", {
+						path = row.path,
+						issueType = "textscaled_without_constraint",
+						recommendation = "Add UITextSizeConstraint to prevent unreadably small or oversized text.",
+					})
+				end
+			end
+		end
+	end
+	local overlapPairsChecked = 0
+	local overlapTruncated = false
+	for i = 1, #interactive do
+		for j = i + 1, #interactive do
+			overlapPairsChecked += 1
+			if overlapPairsChecked > maxOverlapPairs then
+				overlapTruncated = true
+				break
+			end
+			local a = interactive[i]
+			local b = interactive[j]
+			if a.screenPath == b.screenPath
+				and not a.instance:IsDescendantOf(b.instance)
+				and not b.instance:IsDescendantOf(a.instance) then
+				local intersection = rectIntersection(a.rect, b.rect)
+				local smaller = math.min(a.rect.w * a.rect.h, b.rect.w * b.rect.h)
+				if smaller > 0 and intersection / smaller >= 0.25 and a.zIndex == b.zIndex then
+					add("warning", {
+						paths = { a.path, b.path },
+						issueType = "interactive_overlap",
+						overlapRatio = intersection / smaller,
+						recommendation = "Separate the hit targets or establish intentional z-order and input priority.",
+					})
+				end
+			end
+		end
+		if overlapTruncated then break end
+	end
+	local totalFindings = #findings.critical + #findings.warning + #findings.info
+	return {
+		evidenceType = "live_state_and_layout",
+		screenshot = {
+			supported = false,
+			reason = "NikMCP's fixed client protocol returns layout state only; it does not capture client pixels.",
+		},
+		viewport = { width = viewport.X, height = viewport.Y },
+		guiInset = {
+			topLeft = serialize(insetTopLeft),
+			bottomRight = serialize(insetBottomRight),
+		},
+		screenGuis = screens,
+		summary = {
+			totalCandidates = totalCandidates,
+			objectsInspected = #objects,
+			objectsTruncated = totalCandidates > #objects,
+			interactiveObjects = #interactive,
+			overlapPairsChecked = overlapPairsChecked,
+			overlapPairsTruncated = overlapTruncated,
+			critical = #findings.critical,
+			warning = #findings.warning,
+			info = #findings.info,
+			totalFindings = totalFindings,
+			findingsTruncated = totalFindings >= maxFindings,
+		},
+		findings = findings,
+	}
+end
+
 local function queryLocalPlayer()
 	local char = LocalPlayer.Character
 	local position, humanoidState, health = nil, nil, nil
@@ -9448,23 +13013,814 @@ local function queryPing()
 	return { ping = LocalPlayer:GetNetworkPing() }
 end
 
+local SCENE_ANALYSIS_METHODS = {
+	instanceComposition = "GetInstanceCompositionAsync",
+	scriptMemory = "GetScriptMemoryAsync",
+	unparentedInstances = "GetUnparentedInstancesAsync",
+	triangleComposition = "GetTriangleCompositionAsync",
+	animationMemory = "GetAnimationMemoryAsync",
+	audioMemory = "GetAudioMemoryAsync",
+}
+
+local DEFAULT_SCENE_ANALYSIS_MODES = {
+	"instanceComposition",
+	"scriptMemory",
+	"unparentedInstances",
+	"triangleComposition",
+	"animationMemory",
+	"audioMemory",
+}
+
+local function analysisText(value, state, limit)
+	local text = tostring(value)
+	local allowed = math.min(limit or #text, math.max(0, state.maxChars - state.chars))
+	if #text > allowed then
+		text = string.sub(text, 1, allowed)
+		state.truncated = true
+	end
+	state.chars += #text
+	return text
+end
+
+local function sanitizeAnalysisValue(value, state, depth)
+	if state.nodes >= state.maxNodes then
+		state.truncated = true
+		return { __truncated = "node_limit" }
+	end
+	if depth > state.maxDepth then
+		state.truncated = true
+		return { __truncated = "depth_limit" }
+	end
+	if state.chars >= state.maxChars then
+		state.truncated = true
+		return { __truncated = "character_budget" }
+	end
+	state.nodes += 1
+	local valueType = typeof(value)
+	if valueType == "nil" or valueType == "boolean" then
+		return value
+	elseif valueType == "number" then
+		state.chars += 24
+		if value ~= value or value == math.huge or value == -math.huge then
+			return tostring(value)
+		end
+		return value
+	elseif valueType == "string" then
+		return analysisText(value, state, 4096)
+	elseif valueType == "Instance" then
+		local okPath, fullPath = pcall(function()
+			return value:GetFullName()
+		end)
+		return {
+			__t = "Instance",
+			className = analysisText(value.ClassName, state, 128),
+			name = analysisText(value.Name, state, 256),
+			path = analysisText(okPath and fullPath or value.Name, state, 2048),
+			parented = value.Parent ~= nil,
+		}
+	elseif valueType == "EnumItem" then
+		return {
+			__t = "EnumItem",
+			enum = analysisText(tostring(value.EnumType), state, 128),
+			name = analysisText(value.Name, state, 128),
+		}
+	elseif valueType == "table" then
+		if state.seen[value] then
+			state.truncated = true
+			return { __truncated = "cycle_or_shared_table" }
+		end
+		state.seen[value] = true
+		local out = {}
+		for key, child in pairs(value) do
+			if state.nodes >= state.maxNodes or state.chars >= state.maxChars then
+				state.truncated = true
+				out.__truncated = "analysis_budget"
+				break
+			end
+			local safeKey = analysisText(key, state, 256)
+			out[safeKey] = sanitizeAnalysisValue(child, state, depth + 1)
+		end
+		return out
+	end
+	local scalar = serialize(value)
+	if type(scalar) == "table" then
+		return sanitizeAnalysisValue(scalar, state, depth + 1)
+	end
+	return analysisText(scalar, state, 2048)
+end
+
+local function captureSceneAnalysis(args)
+	args = type(args) == "table" and args or {}
+	local okService, serviceOrErr = pcall(function()
+		return game:GetService("SceneAnalysisService")
+	end)
+	if not okService or not serviceOrErr then
+		return {
+			err = "SceneAnalysisService is unavailable in this Studio build: " .. tostring(serviceOrErr),
+		}
+	end
+	local requested = args.include or args.modes or DEFAULT_SCENE_ANALYSIS_MODES
+	if type(requested) ~= "table" or #requested < 1 then
+		return { err = "scene analysis include must contain at least one supported mode" }
+	end
+	local selected = {}
+	local seenModes = {}
+	for _, rawMode in ipairs(requested) do
+		local mode = tostring(rawMode)
+		if not SCENE_ANALYSIS_METHODS[mode] then
+			return { err = "unsupported scene analysis mode: " .. mode }
+		end
+		if not seenModes[mode] then
+			seenModes[mode] = true
+			table.insert(selected, mode)
+		end
+	end
+	local maxOutputBytes = math.clamp(math.floor(tonumber(args.maxOutputBytes) or 250000), 10000, 1000000)
+	local state = {
+		nodes = 0,
+		chars = 0,
+		maxNodes = math.clamp(math.floor(tonumber(args.maxNodes) or 5000), 100, 20000),
+		maxDepth = math.clamp(math.floor(tonumber(args.maxDepth) or 10), 2, 16),
+		maxChars = math.floor(maxOutputBytes * 0.65),
+		truncated = false,
+		seen = {},
+	}
+	local result = {
+		context = "client",
+		requestedModes = selected,
+		results = {},
+	}
+	local modeStatuses = {}
+	for _, mode in ipairs(selected) do
+		local beforeNodes = state.nodes
+		local beforeChars = state.chars
+		local methodName = SCENE_ANALYSIS_METHODS[mode]
+		local okMode, rawOrErr = pcall(function()
+			return serviceOrErr[methodName](serviceOrErr)
+		end)
+		local row
+		if okMode then
+			row = {
+				ok = true,
+				data = sanitizeAnalysisValue(rawOrErr, state, 0),
+			}
+		else
+			row = {
+				ok = false,
+				err = analysisText(rawOrErr, state, 2048),
+			}
+		end
+		row.nodesUsed = state.nodes - beforeNodes
+		row.charactersUsed = state.chars - beforeChars
+		result.results[mode] = row
+		modeStatuses[mode] = {
+			ok = row.ok,
+			nodesUsed = row.nodesUsed,
+			charactersUsed = row.charactersUsed,
+			err = row.err,
+		}
+	end
+	result.summary = {
+		nodesVisited = state.nodes,
+		charactersKept = state.chars,
+		truncated = state.truncated,
+		maxNodes = state.maxNodes,
+		maxDepth = state.maxDepth,
+		maxOutputBytes = maxOutputBytes,
+	}
+	local okEncode, encoded = pcall(function()
+		return game:GetService("HttpService"):JSONEncode(result)
+	end)
+	if okEncode and #encoded <= maxOutputBytes then
+		result.summary.encodedBytes = #encoded
+		return result
+	end
+	result.results = modeStatuses
+	result.summary.truncated = true
+	result.summary.dataOmitted = true
+	result.summary.reason = okEncode and "encoded output exceeded maxOutputBytes" or ("JSON encoding failed: " .. tostring(encoded))
+	return result
+end
+
+local sceneAnalysisBusy = false
+
+local function captureSceneAnalysisBounded(args)
+	if sceneAnalysisBusy then
+		return { err = "a previous client scene analysis is still running" }
+	end
+	sceneAnalysisBusy = true
+	local slot = { done = false, ok = false, result = nil }
+	local worker = task.spawn(function()
+		local okCapture, resultOrErr = pcall(captureSceneAnalysis, args)
+		slot.ok = okCapture
+		slot.result = resultOrErr
+		slot.done = true
+		sceneAnalysisBusy = false
+	end)
+	local timeoutSec = math.clamp(tonumber(args and args.timeoutSec) or 20, 0.1, 60)
+	local waited = 0
+	while not slot.done and waited < timeoutSec do
+		task.wait(0.05)
+		waited += 0.05
+	end
+	if not slot.done then
+		local cancelOk, cancelErr = pcall(function()
+			task.cancel(worker)
+		end)
+		if cancelOk then
+			sceneAnalysisBusy = false
+		end
+		return {
+			err = ("client scene analysis timed out after %.1fs; worker cancellation=%s%s")
+				:format(
+					timeoutSec,
+					tostring(cancelOk),
+					if cancelOk then "" else " (" .. tostring(cancelErr) .. ")"
+				),
+		}
+	end
+	if not slot.ok then
+		return { err = tostring(slot.result) }
+	end
+	return slot.result
+end
+
+local function inputStepKind(step)
+	return tostring(step.type or step.kind or step.action or "")
+end
+
+local function keyStepAction(step)
+	local action = step.keyAction or step.mode
+	if action == nil and (step.type == "key" or step.kind == "key") then
+		action = step.action
+	end
+	return tostring(action or "tap")
+end
+
+local function finiteNumber(raw, label)
+	local value = tonumber(raw)
+	if not value or value ~= value or value == math.huge or value == -math.huge then
+		error(label .. " must be a finite number", 0)
+	end
+	return value
+end
+
+local function inputScreenPoint(step)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		error("no CurrentCamera", 0)
+	end
+	local position
+	local targetPath = nil
+	local requestedPath = step.target or step.path
+	if type(requestedPath) == "string" and requestedPath ~= "" then
+		local target, targetErr = resolvePlayerGuiPath(requestedPath)
+		if not target then
+			error(targetErr, 0)
+		end
+		if not target:IsA("GuiObject") then
+			error("input target must resolve to a GuiObject under PlayerGui", 0)
+		end
+		local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+		if not playerGui or not isEffectivelyVisible(target, playerGui) then
+			error("input target is not effectively visible", 0)
+		end
+		if target.AbsoluteSize.X <= 0 or target.AbsoluteSize.Y <= 0 then
+			error("input target has zero AbsoluteSize", 0)
+		end
+		position = target.AbsolutePosition + (target.AbsoluteSize / 2)
+		targetPath = target:GetFullName()
+	else
+		position = Vector2.new(
+			finiteNumber(step.x, "x"),
+			finiteNumber(step.y, "y")
+		)
+	end
+	local viewport = camera.ViewportSize
+	if position.X < 0 or position.Y < 0 or position.X >= viewport.X or position.Y >= viewport.Y then
+		error(("input position %.1f, %.1f is outside viewport %.1f x %.1f"):format(
+			position.X,
+			position.Y,
+			viewport.X,
+			viewport.Y
+		), 0)
+	end
+	return position, targetPath
+end
+
+local function mouseButton(raw)
+	local name = tostring(raw or "MouseButton1")
+	local button = Enum.UserInputType[name]
+	if name ~= "MouseButton1" and name ~= "MouseButton2" and name ~= "MouseButton3" then
+		error("button must be MouseButton1, MouseButton2, or MouseButton3", 0)
+	end
+	return button, name
+end
+
+local function assertGuiStep(step)
+	if type(step.path) ~= "string" or step.path == "" then
+		error("assert_gui requires path", 0)
+	end
+	local inst, pathErr = resolvePlayerGuiPath(step.path)
+	if not inst then
+		error(pathErr, 0)
+	end
+	local property = tostring(step.property or "")
+	local actual
+	if property == "visible" then
+		if not inst:IsA("GuiObject") then error("visible requires a GuiObject", 0) end
+		actual = inst.Visible
+	elseif property == "effectiveVisible" then
+		if not inst:IsA("GuiObject") then error("effectiveVisible requires a GuiObject", 0) end
+		local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+		actual = playerGui ~= nil and isEffectivelyVisible(inst, playerGui)
+	elseif property == "enabled" then
+		if not inst:IsA("LayerCollector") then error("enabled requires a LayerCollector", 0) end
+		actual = inst.Enabled
+	elseif property == "active" then
+		if not inst:IsA("GuiObject") then error("active requires a GuiObject", 0) end
+		actual = inst.Active
+	elseif property == "selectable" then
+		if not inst:IsA("GuiObject") then error("selectable requires a GuiObject", 0) end
+		actual = inst.Selectable
+	elseif property == "selected" then
+		actual = GuiService.SelectedObject == inst
+	elseif property == "text" then
+		if not (inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox")) then
+			error("text requires a text GuiObject", 0)
+		end
+		actual = inst.Text
+	elseif property == "className" then
+		actual = inst.ClassName
+	else
+		error("assert_gui property must be visible, effectiveVisible, enabled, active, selectable, selected, text, or className", 0)
+	end
+	local expected = step.equals
+	if expected == nil and step.value ~= nil then
+		expected = step.value
+	end
+	if actual ~= expected then
+		error(("assert_gui failed for %s.%s: expected %s, got %s"):format(
+			inst:GetFullName(),
+			property,
+			tostring(expected),
+			tostring(actual)
+		), 0)
+	end
+	return {
+		path = inst:GetFullName(),
+		property = property,
+		expected = serialize(expected),
+		actual = serialize(actual),
+	}
+end
+
+local function queryInputSequence(args)
+	args = type(args) == "table" and args or {}
+	local steps = args.steps
+	if type(steps) ~= "table" or #steps < 1 then
+		return { ok = false, err = "input_sequence requires a non-empty steps array" }
+	end
+	if #steps > 40 then
+		return { ok = false, err = "input_sequence supports at most 40 steps" }
+	end
+	local timeoutSec = math.clamp(tonumber(args.timeoutSec) or 30, 1, 30)
+	local scheduledSeconds = 0
+	for _, step in ipairs(steps) do
+		if type(step) ~= "table" then
+			return { ok = false, err = "each input step must be an object" }
+		end
+		local kind = inputStepKind(step)
+		if kind == "wait" then
+			scheduledSeconds += tonumber(step.seconds or step.durationSec) or 0
+		elseif kind == "key" and keyStepAction(step) == "tap" then
+			scheduledSeconds += tonumber(step.holdSeconds) or 0.05
+		elseif kind == "click" then
+			scheduledSeconds += tonumber(step.holdSeconds) or 0.05
+		end
+	end
+	if scheduledSeconds > timeoutSec then
+		return {
+			ok = false,
+			err = ("scheduled waits/holds total %.2fs, exceeding timeoutSec %.2fs"):format(scheduledSeconds, timeoutSec),
+		}
+	end
+	local okVirtual, virtualOrErr = pcall(function()
+		return UserInputService:CreateVirtualInput()
+	end)
+	if not okVirtual or not virtualOrErr then
+		return {
+			ok = false,
+			err = "UserInputService:CreateVirtualInput() is unavailable: " .. tostring(virtualOrErr),
+		}
+	end
+	local virtualInput = virtualOrErr
+	local startedAt = os.clock()
+	local deadline = startedAt + timeoutSec
+	local evidence = {}
+	local pressedKeys = {}
+	local pressedButtons = {}
+	local cleanup = { keysReleased = {}, buttonsReleased = {}, errors = {} }
+	local function cleanupInputs()
+		for keyCode, keyName in pairs(pressedKeys) do
+			local okRelease, releaseErr = pcall(function()
+				virtualInput:SendKey(false, keyCode, false)
+			end)
+			if okRelease then
+				table.insert(cleanup.keysReleased, keyName)
+			else
+				table.insert(cleanup.errors, tostring(releaseErr))
+			end
+		end
+		for buttonName, row in pairs(pressedButtons) do
+			local okRelease, releaseErr = pcall(function()
+				virtualInput:SendMouseButton(row.position, row.button, false, row.repeatCount or 0)
+			end)
+			if okRelease then
+				table.insert(cleanup.buttonsReleased, buttonName)
+			else
+				table.insert(cleanup.errors, tostring(releaseErr))
+			end
+		end
+	end
+	local failedIndex = nil
+	local failedError = nil
+	for index, step in ipairs(steps) do
+		if os.clock() >= deadline then
+			failedIndex = index
+			failedError = "input sequence timeout reached"
+			break
+		end
+		local stepStarted = os.clock()
+		local kind = inputStepKind(step)
+		local okStep, detailOrErr = pcall(function()
+			if kind == "wait" then
+				local seconds = finiteNumber(step.seconds or step.durationSec, "wait seconds")
+				if seconds < 0 or seconds > 5 then
+					error("wait seconds must be between 0 and 5", 0)
+				end
+				if os.clock() + seconds > deadline then
+					error("wait would exceed input sequence timeout", 0)
+				end
+				task.wait(seconds)
+				return { seconds = seconds }
+			elseif kind == "key" then
+				local keyName = tostring(step.keyCode or step.key or "")
+				if keyName == "" then error("key step requires keyCode", 0) end
+				local keyCode = Enum.KeyCode[keyName]
+				if not keyCode or keyCode == Enum.KeyCode.Unknown then
+					error("invalid keyCode: " .. keyName, 0)
+				end
+				local action = keyStepAction(step)
+				if action ~= "tap" and action ~= "down" and action ~= "up" then
+					error("key action must be tap, down, or up", 0)
+				end
+				if action == "down" then
+					virtualInput:SendKey(true, keyCode, false)
+					pressedKeys[keyCode] = keyName
+				elseif action == "up" then
+					virtualInput:SendKey(false, keyCode, false)
+					pressedKeys[keyCode] = nil
+				else
+					local holdSeconds = finiteNumber(step.holdSeconds or 0.05, "key holdSeconds")
+					if holdSeconds < 0 or holdSeconds > 2 then
+						error("key holdSeconds must be between 0 and 2", 0)
+					end
+					if os.clock() + holdSeconds > deadline then
+						error("key tap would exceed input sequence timeout", 0)
+					end
+					virtualInput:SendKey(true, keyCode, false)
+					pressedKeys[keyCode] = keyName
+					task.wait(holdSeconds)
+					virtualInput:SendKey(false, keyCode, false)
+					pressedKeys[keyCode] = nil
+				end
+				return { keyCode = keyName, action = action }
+			elseif kind == "move" then
+				local position, targetPath = inputScreenPoint(step)
+				virtualInput:SendMousePosition(position)
+				return { position = serialize(position), targetPath = targetPath }
+			elseif kind == "click" then
+				local position, targetPath = inputScreenPoint(step)
+				local button, buttonName = mouseButton(step.button)
+				local holdSeconds = finiteNumber(step.holdSeconds or 0.05, "click holdSeconds")
+				local repeatCount = finiteNumber(step.repeatCount or 0, "click repeatCount")
+				if holdSeconds < 0 or holdSeconds > 2 then
+					error("click holdSeconds must be between 0 and 2", 0)
+				end
+				if repeatCount < 0 or repeatCount > 3 or repeatCount ~= math.floor(repeatCount) then
+					error("click repeatCount must be an integer between 0 and 3", 0)
+				end
+				if os.clock() + holdSeconds > deadline then
+					error("click would exceed input sequence timeout", 0)
+				end
+				virtualInput:SendMousePosition(position)
+				virtualInput:SendMouseButton(position, button, true, repeatCount)
+				pressedButtons[buttonName] = {
+					button = button,
+					position = position,
+					repeatCount = repeatCount,
+				}
+				task.wait(holdSeconds)
+				virtualInput:SendMouseButton(position, button, false, repeatCount)
+				pressedButtons[buttonName] = nil
+				return {
+					position = serialize(position),
+					targetPath = targetPath,
+					button = buttonName,
+					repeatCount = repeatCount,
+				}
+			elseif kind == "text" then
+				if type(step.text) ~= "string" then error("text step requires a string", 0) end
+				if #step.text > 4000 then error("text input is capped at 4000 bytes", 0) end
+				virtualInput:SendTextInput(step.text)
+				return { bytes = #step.text }
+			elseif kind == "pointer" then
+				local position, targetPath = inputScreenPoint(step)
+				local wheel = finiteNumber(step.wheel or 0, "pointer wheel")
+				local pinch = finiteNumber(step.pinch or 0, "pointer pinch")
+				local panX = 0
+				local panY = 0
+				if type(step.pan) == "table" then
+					panX = finiteNumber(step.pan.x or step.pan[1] or 0, "pointer pan.x")
+					panY = finiteNumber(step.pan.y or step.pan[2] or 0, "pointer pan.y")
+				else
+					panX = finiteNumber(step.panX or 0, "pointer panX")
+					panY = finiteNumber(step.panY or 0, "pointer panY")
+				end
+				if math.abs(wheel) > 100 then error("pointer wheel must be between -100 and 100", 0) end
+				if math.abs(pinch) > 100 then error("pointer pinch must be between -100 and 100", 0) end
+				if math.abs(panX) > 2000 or math.abs(panY) > 2000 then
+					error("pointer pan components must be between -2000 and 2000", 0)
+				end
+				if wheel == 0 and pinch == 0 and panX == 0 and panY == 0 then
+					error("pointer requires a non-zero wheel, pan, or pinch value", 0)
+				end
+				local pointerAction = {
+					Wheel = wheel,
+					Pan = Vector2.new(panX, panY),
+					Pinch = pinch,
+				}
+				virtualInput:SendPointerAction(position, pointerAction)
+				return {
+					position = serialize(position),
+					targetPath = targetPath,
+					wheel = wheel,
+					pan = serialize(pointerAction.Pan),
+					pinch = pinch,
+				}
+			elseif kind == "assert_gui" then
+				return assertGuiStep(step)
+			end
+			error("unsupported input step type: " .. kind, 0)
+		end)
+		local row = {
+			index = index,
+			type = kind,
+			ok = okStep,
+			durationMs = math.floor((os.clock() - stepStarted) * 1000 + 0.5),
+		}
+		if okStep then
+			row.detail = detailOrErr
+		else
+			row.err = "virtual input step failed (CoreGui focus/overlap and invalid input state are engine-rejected): "
+				.. tostring(detailOrErr)
+		end
+		table.insert(evidence, row)
+		if not okStep then
+			failedIndex = index
+			failedError = row.err
+			break
+		end
+	end
+	cleanupInputs()
+	if failedIndex then
+		return {
+			ok = false,
+			err = failedError,
+			failedStep = failedIndex,
+			completedSteps = failedIndex - 1,
+			durationMs = math.floor((os.clock() - startedAt) * 1000 + 0.5),
+			steps = evidence,
+			cleanup = cleanup,
+		}
+	end
+	return {
+		ok = true,
+		completedSteps = #steps,
+		durationMs = math.floor((os.clock() - startedAt) * 1000 + 0.5),
+		steps = evidence,
+		cleanup = cleanup,
+	}
+end
+
+-- v0.2.0: activate a named GuiButton without coordinates. Evidence-first: we
+-- listen for the button's own Activated signal and report whether it fired.
+-- click  = official VirtualInput mouse press/release at the live center
+-- gamepad = GuiService.SelectedObject + virtual ButtonA tap (Activated fires on
+--		   the selected GuiButton), SelectedObject restored afterwards
+local function queryActivateGui(args)
+	args = type(args) == "table" and args or {}
+	local path = args.path
+	if type(path) ~= "string" or path == "" then
+		return { err = "activate_gui requires path" }
+	end
+	local inst, pathErr = resolvePlayerGuiPath(path)
+	if not inst then
+		return { err = pathErr }
+	end
+	if not inst:IsA("GuiButton") then
+		return { err = ("activate_gui target must be a GuiButton (got %s at %s)"):format(inst.ClassName, inst:GetFullName()) }
+	end
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	if not playerGui or not isEffectivelyVisible(inst, playerGui) then
+		return { err = "target GuiButton is not effectively visible: " .. inst:GetFullName() }
+	end
+	local method = tostring(args.method or "auto")
+	if method ~= "auto" and method ~= "click" and method ~= "gamepad" then
+		return { err = "method must be auto, click, or gamepad" }
+	end
+	local holdSeconds = math.clamp(tonumber(args.holdSeconds) or 0.05, 0, 2)
+	local waitSec = math.clamp(tonumber(args.waitForActivatedSec) or 0.75, 0.05, 5)
+	local okVirtual, virtualOrErr = pcall(function()
+		return UserInputService:CreateVirtualInput()
+	end)
+	if not okVirtual or not virtualOrErr then
+		return { err = "UserInputService:CreateVirtualInput() is unavailable: " .. tostring(virtualOrErr) }
+	end
+	local virtualInput = virtualOrErr
+	local function snapshot()
+		local state = {
+			visible = inst.Visible,
+			active = inst.Active,
+			selectable = inst.Selectable,
+			absolutePosition = serialize(inst.AbsolutePosition),
+			absoluteSize = serialize(inst.AbsoluteSize),
+			selected = GuiService.SelectedObject == inst,
+		}
+		if inst:IsA("TextButton") then
+			state.text = inst.Text
+		end
+		pcall(function()
+			state.guiState = tostring((inst :: any).GuiState)
+		end)
+		return state
+	end
+	local activatedCount = 0
+	local clickCount = 0
+	local activatedConn = inst.Activated:Connect(function()
+		activatedCount += 1
+	end)
+	local clickConn = inst.MouseButton1Click:Connect(function()
+		clickCount += 1
+	end)
+	local function waitActivated()
+		local t0 = os.clock()
+		while activatedCount == 0 and os.clock() - t0 < waitSec do
+			task.wait(0.05)
+		end
+		return activatedCount > 0
+	end
+	local function tryClick()
+		local position = inst.AbsolutePosition + (inst.AbsoluteSize / 2)
+		local camera = workspace.CurrentCamera
+		if camera then
+			local viewport = camera.ViewportSize
+			if position.X < 0 or position.Y < 0 or position.X >= viewport.X or position.Y >= viewport.Y then
+				return { method = "click", ok = false, err = "button center is outside the viewport", position = serialize(position) }
+			end
+		end
+		local okSend, sendErr = pcall(function()
+			virtualInput:SendMousePosition(position)
+			virtualInput:SendMouseButton(position, Enum.UserInputType.MouseButton1, true, 0)
+			task.wait(holdSeconds)
+			virtualInput:SendMouseButton(position, Enum.UserInputType.MouseButton1, false, 0)
+		end)
+		if not okSend then
+			pcall(function()
+				virtualInput:SendMouseButton(position, Enum.UserInputType.MouseButton1, false, 0)
+			end)
+			return { method = "click", ok = false, err = tostring(sendErr), position = serialize(position) }
+		end
+		return { method = "click", ok = waitActivated(), position = serialize(position) }
+	end
+	local function tryGamepad()
+		local previous = GuiService.SelectedObject
+		local okSend, sendErr = pcall(function()
+			GuiService.SelectedObject = inst
+			task.wait(0.05)
+			virtualInput:SendKey(true, Enum.KeyCode.ButtonA, false)
+			task.wait(holdSeconds)
+			virtualInput:SendKey(false, Enum.KeyCode.ButtonA, false)
+		end)
+		local fired = okSend and waitActivated() or false
+		pcall(function()
+			virtualInput:SendKey(false, Enum.KeyCode.ButtonA, false)
+			GuiService.SelectedObject = previous
+		end)
+		if not okSend then
+			return { method = "gamepad", ok = false, err = tostring(sendErr) }
+		end
+		return { method = "gamepad", ok = fired }
+	end
+	local before = snapshot()
+	local attempts = {}
+	if method == "click" or method == "auto" then
+		table.insert(attempts, tryClick())
+	end
+	if activatedCount == 0 and (method == "gamepad" or method == "auto") then
+		table.insert(attempts, tryGamepad())
+	end
+	local after = snapshot()
+	activatedConn:Disconnect()
+	clickConn:Disconnect()
+	local expectation = nil
+	if type(args.expect) == "table" then
+		local afterSec = math.clamp(tonumber(args.expect.afterSec) or 0.25, 0, 5)
+		if afterSec > 0 then
+			task.wait(afterSec)
+		end
+		local okAssert, detailOrErr = pcall(assertGuiStep, args.expect)
+		expectation = if okAssert then { ok = true, detail = detailOrErr } else { ok = false, err = tostring(detailOrErr) }
+	end
+	local fired = activatedCount > 0
+	local result = {
+		path = inst:GetFullName(),
+		className = inst.ClassName,
+		method = method,
+		activatedFired = fired,
+		activatedCount = activatedCount,
+		mouseButton1ClickCount = clickCount,
+		attempts = attempts,
+		before = before,
+		after = after,
+		expectation = expectation,
+	}
+	if not fired then
+		result.err = "GuiButton.Activated did not fire for " .. inst:GetFullName()
+			.. " (tried " .. tostring(#attempts) .. " method(s); is the button covered, inactive, or outside the viewport?)"
+	elseif expectation and not expectation.ok then
+		result.err = "activated, but expectation failed: " .. tostring(expectation.err)
+	end
+	return result
+end
+
 relay.OnClientEvent:Connect(function(kind, id, name, args)
+	if kind == "qaLeave" then
+		local canLeave = false
+		local okCan, canResult = pcall(function()
+			return StudioTestService:CanLeaveTest()
+		end)
+		local canError = nil
+		if okCan then
+			canLeave = canResult == true
+		else
+			canError = tostring(canResult)
+		end
+		pcall(function()
+			relay:FireServer("qaLeaveAck", id, {
+				accepted = canLeave,
+				error = canError,
+			})
+		end)
+		if canLeave then
+			task.defer(function()
+				pcall(function()
+					StudioTestService:LeaveTest()
+				end)
+			end)
+		end
+		return
+	end
 	if kind ~= "query" then
 		return
 	end
 	local ok, result = pcall(function()
-		if name == "fps" then
+		if name == "activate_gui" then
+			return queryActivateGui(args)
+		elseif name == "fps" then
 			return queryFps()
 		elseif name == "camera" then
 			return queryCamera()
 		elseif name == "gui_tree" then
 			return queryGuiTree(args)
+		elseif name == "gui_object" then
+			return queryGuiObject(args)
+		elseif name == "ui_regression" then
+			return queryUiRegression(args)
 		elseif name == "local_player" then
 			return queryLocalPlayer()
 		elseif name == "ping" then
 			return queryPing()
+		elseif name == "input_sequence" then
+			return queryInputSequence(args)
+		elseif name == "scene_analysis_snapshot" then
+			return captureSceneAnalysisBounded(args)
 		else
-			return { err = "unknown query '" .. tostring(name) .. "'; valid: fps, camera, gui_tree, local_player, ping" }
+			return {
+				err = "unknown query '" .. tostring(name)
+					.. "'; valid: fps, camera, gui_tree, gui_object, ui_regression, local_player, ping, input_sequence, activate_gui, scene_analysis_snapshot",
+			}
 		end
 	end)
 	if not ok then

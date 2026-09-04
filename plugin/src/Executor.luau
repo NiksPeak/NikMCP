@@ -20,6 +20,10 @@ local Stats = game:GetService("Stats")
 local StarterPlayer = game:GetService("StarterPlayer")
 local Serializer = require(script.Parent.Serializer)
 local ClientAgentSource = require(script.Parent.ClientAgentSource)
+local EnvironmentTools = require(script.Parent.EnvironmentTools)
+local AssetGuardTools = require(script.Parent.AssetGuardTools)
+local QATools = require(script.Parent.QATools)
+local AgentTools = require(script.Parent.AgentTools)
 -- Bucket 2 (project understanding) + Bucket 3 (style/art direction) analysis
 -- helpers live in their own ModuleScript so Executor's top-level scope stays
 -- under Luau's 200-local bytecode-compiler limit. See AnalysisTools.luau's
@@ -91,7 +95,7 @@ end
 seedConsole()
 -- Playtest log ring (feeds get_playtest_output). Only fills while capturing
 -- (set by playtest_control start/stop) so it isolates a single playtest run.
-local PLAYTEST_CAP = 1000
+local PLAYTEST_CAP = 3000 -- v0.2.0: larger edit-side ring so soak-test noise evicts less
 local playtestRing: { { text: string, level: string, t: number } } = {}
 local playtestCapturing = false
 -- Lifecycle tracking for get_playtest_status + the auto-stop safety net. Only
@@ -101,6 +105,9 @@ local playtestCapturing = false
 local playtestStartedAt: number? = nil
 local playtestLastActivity: number = 0
 local playtestMode: string? = nil
+local playtestSessionSeq = 0
+local playtestSessionId: string? = nil
+local RUNTIME_AGENT_NAME = "MCP_RuntimeAgent"
 local function pushPlaytest(text: string, level: string, t: number)
 	if not playtestCapturing then
 		return
@@ -526,43 +533,32 @@ local function syncGetSources(paths: { string }): any
 	return { ok = true, result = out }
 end
 
--- Apply many sources inside ONE ChangeHistory recording (one undo step).
--- Best-effort per item; the recording is still finalized (Commit if anything
--- applied, Cancel if nothing did).
-local function syncSetSources(items: { { path: string, source: string } }): any
-	if RunService:IsRunning() then
-		return { ok = false, err = "sync_set_sources is edit-context only (stop the playtest first)" }
+-- Apply an already conflict-checked disk import through the same conditional,
+-- rollback-verified transaction used by apply_script_patchset. Roblox does not
+-- include LuaSourceContainer source changes in ChangeHistoryService undo.
+local function syncSetSources(items: { { path: string, source: string, expectedHash: string } }): any
+	local response = AgentTools.applyScriptPatchset({
+		confirm = true,
+		items = items,
+	})
+	if not response.ok then
+		return response
 	end
-	if type(items) ~= "table" or #items == 0 then
-		return { ok = false, err = "items array required" }
-	end
+
 	local results = {}
-	local anyApplied = false
-	local recording = ChangeHistoryService:TryBeginRecording("import_scripts")
-	for _, it in ipairs(items) do
-		local inst = it and it.path and resolvePath(it.path)
-		if not inst or not inst:IsA("LuaSourceContainer") then
-			table.insert(results, { path = it and it.path or "?", ok = false, err = "not found or not a script" })
-		elseif type(it.source) ~= "string" then
-			table.insert(results, { path = it.path, ok = false, err = "source missing" })
-		else
-			local newSource = it.source
-			local ok, err = pcall(function()
-				ScriptEditorService:UpdateSourceAsync(inst, function()
-					return newSource
-				end)
-			end)
-			table.insert(results, { path = it.path, ok = ok, err = if ok then nil else tostring(err) })
-			anyApplied = anyApplied or ok
-		end
+	for index, item in ipairs(items) do
+		local evidence = response.result and response.result.items and response.result.items[index]
+		table.insert(results, {
+			path = item.path,
+			ok = evidence ~= nil and evidence.afterHash == evidence.desiredHash,
+			err = if evidence then nil else "transaction result omitted item evidence",
+		})
 	end
-	if recording then
-		ChangeHistoryService:FinishRecording(
-			recording,
-			anyApplied and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel
-		)
-	end
-	return { ok = true, result = results }
+	return {
+		ok = true,
+		result = results,
+		transaction = response.result,
+	}
 end
 
 local function getPlaceInfo(): any
@@ -1108,26 +1104,43 @@ local function playtestControl(p: any): any
 		if RunService:IsRunning() or playtestStartedAt ~= nil then
 			return { ok = false, err = "a playtest/simulation is already running" }
 		end
-		if mode ~= "run" and mode ~= "play" then
-			return { ok = false, err = "playtest_control: mode must be 'run' or 'play'" }
+		if mode ~= "run" and mode ~= "play" and mode ~= "multiplayer" then
+			return { ok = false, err = "playtest_control: mode must be 'run', 'play', or 'multiplayer'" }
 		end
 		playtestRing = {}
 		playtestCapturing = true
 		playtestMode = mode
+		playtestSessionSeq += 1
+		playtestSessionId = tostring(os.time()) .. "-" .. tostring(playtestSessionSeq)
 		if p.numPlayers ~= nil then
 			pcall(function()
 				TestService.NumberOfPlayers = math.clamp(tonumber(p.numPlayers) or 1, 1, 8)
 			end)
 		end
 		injectPlaytestStopListener()
-		if mode == "play" then
-			-- Play mode only -- run mode has no client, period.
+		local runtimeAgent = ServerScriptService:FindFirstChild(RUNTIME_AGENT_NAME)
+		if runtimeAgent then
+			runtimeAgent:SetAttribute("McpRuntimeSessionId", playtestSessionId)
+			-- v0.2.0: plain-substring pin pattern; the runtime agent keeps every
+			-- matching output line in a separate ring that noise cannot evict.
+			runtimeAgent:SetAttribute(
+				"McpPinPattern",
+				if type(p.pinPattern) == "string" and p.pinPattern ~= "" then p.pinPattern else nil
+			)
+		end
+		if mode == "play" or mode == "multiplayer" then
+			-- Play/multiplayer only -- run mode has no client, period.
 			injectClientAgent()
 		end
 		local launchErr: string? = nil
 		task.spawn(function()
 			local ok, err = pcall(function()
-				if mode == "play" then
+				if mode == "multiplayer" then
+					return StudioTestService:ExecuteMultiplayerTestAsync(
+						math.clamp(tonumber(p.numPlayers) or 1, 1, 8),
+						p.testArgs
+					)
+				elseif mode == "play" then
 					return StudioTestService:ExecutePlayModeAsync({})
 				end
 				return StudioTestService:ExecuteRunModeAsync({})
@@ -1139,6 +1152,7 @@ local function playtestControl(p: any): any
 			playtestCapturing = false
 			playtestStartedAt = nil
 			playtestMode = nil
+			playtestSessionId = nil
 			cleanupPlaytestStopListener()
 			pcall(cleanupClientAgent)
 		end)
@@ -1147,9 +1161,14 @@ local function playtestControl(p: any): any
 		if launchErr ~= nil then
 			playtestCapturing = false
 			playtestMode = nil
+			playtestSessionId = nil
 			cleanupPlaytestStopListener()
 			pcall(cleanupClientAgent)
-			local fn = (mode == "play") and "ExecutePlayModeAsync" or "ExecuteRunModeAsync"
+			local fn = if mode == "multiplayer"
+				then "ExecuteMultiplayerTestAsync"
+				elseif mode == "play"
+				then "ExecutePlayModeAsync"
+				else "ExecuteRunModeAsync"
 			return { ok = false, err = "StudioTestService:" .. fn .. " failed: " .. launchErr }
 		end
 		playtestStartedAt = os.time()
@@ -1171,6 +1190,7 @@ local function playtestControl(p: any): any
 		playtestCapturing = false
 		playtestStartedAt = nil
 		playtestMode = nil
+		playtestSessionId = nil
 		cleanupPlaytestStopListener()
 		pcall(cleanupClientAgent)
 		return {
@@ -1189,7 +1209,7 @@ local function getPlaytestOutput(p: any): any
 	if p.drain ~= false then
 		playtestRing = {}
 	end
-	local result: { [string]: any } = { lines = lines, capturing = playtestCapturing, count = #lines, client = {} }
+	local result: { [string]: any } = { lines = lines, capturing = playtestCapturing, count = #lines, client = {}, pinned = {} }
 	if playtestMode ~= "play" then
 		result.note = "run mode has no client"
 	end
@@ -1217,10 +1237,16 @@ local function getPlaytestStatus(): any
 		ok = true,
 		result = {
 			running = simRunning,
+			runServiceIsRunning = simRunning,
+			dataModelState = "edit",
 			mode = playtestMode,
 			startedAtUnix = playtestStartedAt,
 			durationSec = duration,
 			players = players,
+			placeName = game.Name,
+			placeId = game.PlaceId,
+			universeId = game.GameId,
+			runtimeSessionId = playtestSessionId,
 		},
 	}
 end
@@ -3264,6 +3290,19 @@ AnalysisTools.init({
 	readEditorSource = readEditorSource,
 	CollectionService = CollectionService,
 })
+EnvironmentTools.init({
+	resolvePath = resolvePath,
+	recorded = recorded,
+})
+AssetGuardTools.init({
+	resolvePath = resolvePath,
+	recorded = recorded,
+	readEditorSource = readEditorSource,
+})
+AgentTools.init({
+	resolvePath = resolvePath,
+	readEditorSource = readEditorSource,
+})
 
 -- Dispatch one command table -> result table.
 -- (enable_playtest_agent is handled in the plugin entry, not here.)
@@ -3317,6 +3356,10 @@ function Executor.execute(cmd: { type: string, payload: any }): any
 		return tagInstance(p.path, p.tag, false)
 	elseif cmd.type == "insert_asset" then
 		return insertAsset(p.assetId, p.parentPath)
+	elseif cmd.type == "guarded_asset_scan" then
+		return AssetGuardTools.scan(p)
+	elseif cmd.type == "guarded_asset_insert" then
+		return AssetGuardTools.insert(p)
 	-- experimental
 	elseif cmd.type == "capture_viewport" then
 		return captureViewport()
@@ -3360,6 +3403,10 @@ function Executor.execute(cmd: { type: string, payload: any }): any
 		return syncGetSources(p.paths or {})
 	elseif cmd.type == "sync_set_sources" then
 		return syncSetSources(p.items or {})
+	elseif cmd.type == "apply_script_patchset" then
+		return AgentTools.applyScriptPatchset(p)
+	elseif cmd.type == "capture_script_profile" then
+		return AgentTools.captureScriptProfile(p)
 	-- undo/redo + mass ops
 	elseif cmd.type == "undo" then
 		return undo()
@@ -3457,6 +3504,23 @@ function Executor.execute(cmd: { type: string, payload: any }): any
 		return alignInstances(p)
 	elseif cmd.type == "measure_distance" then
 		return measureDistance(p)
+	-- Blender environment import / audit / recoverable backup tools.
+	elseif cmd.type == "assemble_imported_chunks" then
+		return EnvironmentTools.assembleImportedChunks(p)
+	elseif cmd.type == "audit_environment" then
+		return EnvironmentTools.auditEnvironment(p)
+	elseif cmd.type == "inspect_texture_health" then
+		return EnvironmentTools.inspectTextureHealth(p)
+	elseif cmd.type == "qa_device_snapshot" then
+		return QATools.deviceSnapshot()
+	elseif cmd.type == "qa_device_apply" then
+		return QATools.deviceApply(p)
+	elseif cmd.type == "qa_device_restore" then
+		return QATools.deviceRestore(p)
+	elseif cmd.type == "backup_selection" then
+		return EnvironmentTools.backupSelection(p)
+	elseif cmd.type == "restore_backup" then
+		return EnvironmentTools.restoreBackup(p)
 	-- Bucket 2: project understanding (moved to AnalysisTools.luau -- see its header)
 	elseif cmd.type == "remote_inventory" then
 		return AnalysisTools.remoteInventory(p)

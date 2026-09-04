@@ -1,4 +1,27 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// config.json was read/written CWD-relative, which silently dropped the entire
+// file whenever the server was spawned from somewhere other than the repo (an
+// MCP client sets cwd to the user's project dir) -- the port fell back to the
+// default and rocreate.apiKey read as "not configured" while sitting right
+// there on disk. Resolve the installed package's own copy (dist/../config.json,
+// src/../config.json under ts-node), and still let an explicit cwd copy win so
+// per-project overrides keep working.
+const PKG_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+// NIKMCP_CONFIG_PATH wins over everything: it is the ONLY safe way for a test (or
+// a sandboxed run) to redirect the writer. Without it, a chdir-based test writes
+// its dummy key straight into the real repo config -- which is exactly how a live
+// Open Cloud key got clobbered once.
+export function configPath(): string {
+  const override = process.env.NIKMCP_CONFIG_PATH;
+  if (override && override.trim()) return resolve(override.trim());
+  const cwdCfg = resolve("config.json");
+  if (existsSync(cwdCfg)) return cwdCfg;
+  return join(PKG_ROOT, "config.json");
+}
 
 export interface AppConfig {
   port: number; // base port; the bridge binds the first free one in [port, port+portRange)
@@ -42,7 +65,7 @@ export const HOST = "127.0.0.1";
 export function resolveConfig(argv: string[] = process.argv.slice(2)): AppConfig {
   let fileCfg: Partial<AppConfig> = {};
   try {
-    fileCfg = JSON.parse(readFileSync("config.json", "utf8")) as Partial<AppConfig>;
+    fileCfg = JSON.parse(readFileSync(configPath(), "utf8")) as Partial<AppConfig>;
   } catch {
     // no config.json — fine
   }
@@ -115,9 +138,10 @@ export function setRoCreateApiKey(apiKey: string): void {
   const key = apiKey.trim();
   if (!key) throw new Error("api key required");
 
+  const target = configPath();
   let fileCfg: Record<string, unknown> = {};
-  if (existsSync("config.json")) {
-    const parsed = JSON.parse(readFileSync("config.json", "utf8")) as unknown;
+  if (existsSync(target)) {
+    const parsed = JSON.parse(readFileSync(target, "utf8")) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error("config.json must contain a JSON object");
     }
@@ -131,9 +155,15 @@ export function setRoCreateApiKey(apiKey: string): void {
   rocreate.apiKey = key;
   fileCfg.rocreate = rocreate;
 
-  const tmp = `config.json.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  // Write the temp file NEXT TO the target, not into the cwd: renameSync across
+  // volumes fails (EXDEV), and the target is now usually on a different drive
+  // than wherever the client happened to spawn us.
+  const tmp = join(
+    dirname(target),
+    `config.json.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  );
   writeFileSync(tmp, JSON.stringify(fileCfg, null, 2) + "\n");
-  renameSync(tmp, "config.json");
+  renameSync(tmp, target);
 }
 
 function parsePortFlag(argv: string[]): number | undefined {

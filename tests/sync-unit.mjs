@@ -18,6 +18,8 @@ import {
   decideImport,
   unifiedDiff,
   MANIFEST_NAME,
+  isProtectedSyncPath,
+  rebaseManifest,
 } from "../dist/sync.js";
 
 let n = 0;
@@ -203,5 +205,69 @@ check("empty source: valid, hashes to the FNV offset basis", () => {
   const plan = planExport([entry("ReplicatedStorage.Empty", "ModuleScript")]);
   assert.strictEqual(plan.files.length, 1);
 });
+
+// --- v0.2.0: bridge-managed scripts are never synced ---------------------------
+check("isProtectedSyncPath flags NikMCP-injected scripts only", () => {
+  assert.strictEqual(isProtectedSyncPath("ServerScriptService.MCP_RuntimeAgent"), true);
+  assert.strictEqual(isProtectedSyncPath("StarterPlayer.StarterPlayerScripts.NikMCP_ClientAgent"), true);
+  assert.strictEqual(isProtectedSyncPath("ServerScriptService.__MCP_CommandListener"), true);
+  assert.strictEqual(isProtectedSyncPath("ServerScriptService.RoundService"), false);
+  assert.strictEqual(isProtectedSyncPath("ReplicatedStorage.MCP_RuntimeAgentHelper"), false);
+});
+
+// --- v0.2.0: manifest rebase never touches content, only baselines -------------
+function rebaseFixture() {
+  const manifest = {
+    roots: ["ServerScriptService"],
+    exportedAt: "",
+    placeName: "",
+    files: {
+      "A.server.luau": { dataModelPath: "ServerScriptService.A", className: "Script", hash: "aaaa0000" },
+      "B.server.luau": { dataModelPath: "ServerScriptService.B", className: "Script", hash: "bbbb0000" },
+      "C.server.luau": { dataModelPath: "ServerScriptService.C", className: "Script", hash: "cccc0000" },
+      "D.server.luau": { dataModelPath: "ServerScriptService.D", className: "Script", hash: "dddd0000" },
+    },
+  };
+  const rows = [
+    // stale manifest: disk == studio, baseline behind -> conflict by hash
+    { relPath: "A.server.luau", dataModelPath: "ServerScriptService.A", state: "conflict", diskHash: "aaaa1111", studioHash: "aaaa1111" },
+    // whitespace-only difference, detected upstream
+    { relPath: "B.server.luau", dataModelPath: "ServerScriptService.B", state: "clean", diskHash: "bbbb1111", studioHash: "bbbb2222", whitespaceEqual: true },
+    // real conflict
+    { relPath: "C.server.luau", dataModelPath: "ServerScriptService.C", state: "conflict", diskHash: "cccc1111", studioHash: "cccc2222" },
+    // missing in studio
+    { relPath: "D.server.luau", dataModelPath: "ServerScriptService.D", state: "missingInStudio", diskHash: "dddd1111", studioHash: null },
+  ];
+  return { manifest, rows };
+}
+
+check("rebaseManifest accept:equal rebases only convergent rows", () => {
+  const { manifest, rows } = rebaseFixture();
+  const out = rebaseManifest(manifest, rows, "equal");
+  assert.deepStrictEqual(out.rebased.map((r) => r.relPath), ["A.server.luau", "B.server.luau"]);
+  assert.strictEqual(manifest.files["A.server.luau"].hash, "aaaa1111");
+  assert.strictEqual(manifest.files["B.server.luau"].hash, "bbbb2222", "whitespace-equal takes the Studio hash");
+  assert.strictEqual(manifest.files["C.server.luau"].hash, "cccc0000", "real conflict untouched");
+  assert.strictEqual(manifest.files["D.server.luau"].hash, "dddd0000", "missing side skipped");
+  assert.ok(out.skipped.some((r) => r.relPath === "C.server.luau" && /differ/.test(r.reason)));
+});
+
+check("rebaseManifest accept:studio / accept:disk honor the paths allowlist", () => {
+  const { manifest, rows } = rebaseFixture();
+  const out = rebaseManifest(manifest, rows, "studio", new Set(["ServerScriptService.C"]));
+  assert.deepStrictEqual(out.rebased.map((r) => r.to), ["cccc2222"]);
+  assert.strictEqual(manifest.files["A.server.luau"].hash, "aaaa0000", "outside allowlist untouched");
+  const out2 = rebaseManifest(manifest, rows, "disk", new Set(["C.server.luau", "D.server.luau"]));
+  assert.deepStrictEqual(out2.rebased.map((r) => [r.relPath, r.to]), [["C.server.luau", "cccc1111"], ["D.server.luau", "dddd1111"]]);
+});
+
+check("rebaseManifest skips rows whose baseline already matches", () => {
+  const { manifest, rows } = rebaseFixture();
+  manifest.files["A.server.luau"].hash = "aaaa1111";
+  const out = rebaseManifest(manifest, [rows[0]], "equal");
+  assert.strictEqual(out.rebased.length, 0);
+  assert.ok(out.skipped[0].reason.includes("already matches"));
+});
+
 
 console.log(`sync-unit self-check: PASS (${n} cases)`);
