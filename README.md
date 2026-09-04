@@ -507,7 +507,9 @@ pick a port outside that set, add it to `CANDIDATE_PORTS` in `plugin/src/Config.
 - Cross-port `/invoke` calls require a private per-user routing capability. Every queued command carries an exact target id and wall-clock expiry; timed-out commands are removed and Studio refuses stale or wrong-window work.
 
 ## Status / scope
-v0.2.0 (September 3, 2026) is built from a working agent's ranked pain list: token-cheap script
+v0.2.0 (September 3, 2026) also gives the Studio dock a full makeover (brand bar with version
+badge and pulsing status pill, sliding segmented tabs, card-based Status/Settings/Activity/RoCreate
+views, session stats footer). It is built from a working agent's ranked pain list: token-cheap script
 edits (`edit_script`, `get_script_source` windows, `write_script sourceFile`), automatic pre-write
 backups, the `run_harness` macro, loadstring-free `server_query`, `client_activate`, filtered and
 pinned playtest output, `import_scripts` allowlist/force with protected bridge scripts,
